@@ -36,27 +36,31 @@ for (pkg in required_pkgs) {
 # 2. CONFIGURATION & DIRECTORY MANAGEMENT
 # =========================================================================
 
-# --- Primary Directory Paths ---
-dir_base_root  <- "C:/Users/Jennifer.McWhorter/Documents"
-path_toolbox   <- file.path(dir_base_root, "Scripts/2026/DMQC_chla/Bioptics_DMQC")
-dir_data_root  <- file.path(dir_base_root, "Data/2026")
-dir_plot_base  <- file.path(dir_base_root, "Plots/2026/DMQC")
+# --- Main Base Directory (Single Root for Inputs and Outputs) ---
+dir_main_root <- "C:/Users/Jennifer.McWhorter/Documents/GitHub/DMQC_CHLA_DOXY"
 
-# --- Structured Output Directories ---
-dir_profs        <- file.path(path_toolbox, "Tables/profs")
-dir_tables       <- file.path(path_toolbox, "Tables")
+# --- Structured Output & Intermediate Directories based on Main Path ---
+dir_functions    <- file.path(dir_main_root, "Functions")
+dir_output       <- file.path(dir_main_root, "Output")
+dir_plot_base    <- file.path(dir_main_root, "Plots")
+dir_script       <- file.path(dir_main_root, "Script")
+dir_tables       <- file.path(dir_main_root, "Tables")
+dir_profs        <- file.path(dir_main_root, "Tables/profs")
+
+# Auxiliary & External Input Directories rerouted to Main Root
+dir_data_root    <- file.path(dir_main_root, "Data")
 dir_woa          <- file.path(dir_data_root, "WOA")
-combo_output_dir <- file.path(dir_data_root, "DMQC_output/COMBO_CHLA_DOXY_DMODE")
+combo_output_dir <- file.path(dir_output, "COMBO_CHLA_DOXY_DMODE")
 
 # Create local storage directories if they do not exist
-for (d in c(dir_profs, dir_tables, dir_woa, combo_output_dir)) {
+for (d in c(dir_functions, dir_output, dir_plot_base, dir_script, dir_tables, dir_profs, dir_data_root, dir_woa, combo_output_dir)) {
   if (!dir.exists(d)) dir.create(d, recursive = TRUE)
 }
 
 # Source local function scripts
-func.sources <- list.files(file.path(path_toolbox, 'Functions/'), pattern = "*.R")
+func.sources <- list.files(dir_functions, pattern = "\\.R$", full.names = TRUE)
 for (f in func.sources) {
-  source(file.path(path_toolbox, 'Functions', f))
+  source(f)
 }
 
 # --- IN-MEMORY DICTIONARY MAPPING FOR LAUNCH DATES ---
@@ -76,7 +80,7 @@ launch_date_dict <- tibble::tribble(
 )
 
 # --- Load Calibration Data ---
-calib_csv_path <- file.path(dir_data_root, "Bittig2018_DOXY/Jul2026_inair_output_binflags5.csv")
+calib_csv_path <- file.path(dir_data_root, "Tables/Jul2026_inair_output_binflags5.csv")
 
 calib_df <- read.csv(calib_csv_path) %>%
   mutate(float_ids = as.numeric(float_ids)) %>%
@@ -463,7 +467,7 @@ for (woko in float_ids) {
       
       meta_file <- nc_open(meta_path, readunlim = FALSE, write = FALSE)
       params <- ncvar_get(meta_file, "PARAMETER") 
-      index_meta <- grep("CHLA                                ", params)
+      index_meta <- grep("CHLA                            ", params)
       scale_chla <- as.numeric(paste(sub(".*SCALE_CHLA=([0-9.]+);.*", "\\1", 
                                          ncvar_get(meta_file, "PREDEPLOYMENT_CALIB_COEFFICIENT")[index_meta])))
       dark_chla <- as.numeric(paste(sub(".*DARK_CHLA=([0-9]+);.*", "\\1", 
@@ -819,7 +823,7 @@ for (woko in float_ids) {
       CHLA_FINAL = ifelse(float_num %in% target_floats, CHLA_NoLUT, CHLA_LUT),
       
       base_qc = case_when(
-        float_num %in% target_floats              ~ 2,
+        float_num %in% target_floats               ~ 2,
         !is.na(physio_ratio) & physio_ratio != 2 ~ 1,
         TRUE                                      ~ 2
       ),
@@ -866,6 +870,9 @@ for (woko in float_ids) {
       qc_flags_chla[df_cyc$CHLA_QC %in% c("4", 4)] <- 4
       qc_flags_chla[is.na(chla_v)]                  <- 9
       
+      # Apply PRES_QC flag propagation (If PRES_QC == 9, set parameter QC flag to 9)
+      qc_flags_chla[df_cyc$PRES_QC %in% c("9", 9)] <- 9
+      
       # --------------------------------------------------
       # B. CHLA_FLUORESCENCE QC & ADJUSTED QC EXECUTION
       # --------------------------------------------------
@@ -886,6 +893,9 @@ for (woko in float_ids) {
       qc_flags_fluo[df_cyc$PRES_QC %in% c("4", 4)] <- 4
       qc_flags_fluo[is.na(fluo_v)]                 <- 9
       
+      # Apply PRES_QC flag propagation (If PRES_QC == 9, set parameter QC flag to 9)
+      qc_flags_fluo[df_cyc$PRES_QC %in% c("9", 9)] <- 9
+      
       # Derived CHLA_FLUORESCENCE_ADJUSTED_QC:
       # Evaluates overall dark quality. If 5 deep profiles (MED) available, assign 1, else 2
       qc_flags_fluo_adj <- ifelse(length(min_first_five) >= 5, 1, 2)
@@ -894,6 +904,9 @@ for (woko in float_ids) {
       # Carry forward raw flags >= 4
       qc_flags_fluo_adj[qc_flags_fluo >= 4] <- qc_flags_fluo[qc_flags_fluo >= 4]
       qc_flags_fluo_adj[is.na(df_cyc$CHLA_FLUORESCENCE_ADJUSTED)] <- 9
+      
+      # Apply PRES_QC flag propagation (If PRES_QC == 9, set parameter QC flag to 9)
+      qc_flags_fluo_adj[df_cyc$PRES_QC %in% c("9", 9)] <- 9
       
       # Assign computed QC columns to frame
       df_cyc$CHLA_FINAL_QC                 <- qc_flags_chla
@@ -1051,6 +1064,9 @@ for (woko in float_ids) {
       
       # Carry forward missing value flag (9)
       qc_flags[is.na(v)] <- 9
+      
+      # Apply PRES_QC flag propagation (If PRES_QC == 9, set parameter QC flag to 9)
+      qc_flags[df_cyc$PRES_QC %in% c("9", 9)] <- 9
       
       df_cyc$DOXY_FINAL_QC <- qc_flags
       return(df_cyc)
