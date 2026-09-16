@@ -80,7 +80,7 @@ launch_date_dict <- tibble::tribble(
 )
 
 # --- Load Calibration Data ---
-calib_csv_path <- file.path(dir_data_root, "Tables/Jul2026_inair_output_binflags5.csv")
+calib_csv_path <- file.path(dir_tables, "Jul2026_inair_output_binflags5.csv")
 
 calib_df <- read.csv(calib_csv_path) %>%
   mutate(float_ids = as.numeric(float_ids)) %>%
@@ -113,8 +113,8 @@ lons          <- c(-98, -59)
 lats          <- c(8, 29)
 
 # --- Specific File Inputs ---
-path_lut_nc     <- file.path(dir_data_root, "DMQC_chla/127630.nc")
-path_bottle_val <- file.path(dir_data_root, "Float_validation/Master_Vali_24_July_2025.csv")
+path_lut_nc     <- file.path(dir_data_root, "LUT/127630.nc")
+path_bottle_val <- file.path(dir_data_root, "Bottle_samples/Master_Vali_24_July_2025.csv")
 woa_file        <- file.path(dir_woa, "woa_all_o00_01.nc")
 
 # --- Web URLs for Data Ingestion ---
@@ -891,7 +891,7 @@ for (woko in float_ids) {
       
       # Inherit Pressure QC failures (PRES_QC == 4) or missing values
       qc_flags_fluo[df_cyc$PRES_QC %in% c("4", 4)] <- 4
-      qc_flags_fluo[is.na(fluo_v)]                 <- 9
+      qc_flags_fluo[is.na(fluo_v)]                  <- 9
       
       # Apply PRES_QC flag propagation (If PRES_QC == 9, set parameter QC flag to 9)
       qc_flags_fluo[df_cyc$PRES_QC %in% c("9", 9)] <- 9
@@ -909,8 +909,8 @@ for (woko in float_ids) {
       qc_flags_fluo_adj[df_cyc$PRES_QC %in% c("9", 9)] <- 9
       
       # Assign computed QC columns to frame
-      df_cyc$CHLA_FINAL_QC                 <- qc_flags_chla
-      df_cyc$CHLA_FLUORESCENCE_QC          <- qc_flags_fluo
+      df_cyc$CHLA_FINAL_QC                  <- qc_flags_chla
+      df_cyc$CHLA_FLUORESCENCE_QC           <- qc_flags_fluo
       df_cyc$CHLA_FLUORESCENCE_ADJUSTED_QC  <- qc_flags_fluo_adj
       
       return(df_cyc)
