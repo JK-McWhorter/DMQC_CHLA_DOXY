@@ -1,7 +1,7 @@
-### BGC-Argo CHLA & DOXY Corrections + WOA/Bittig DMQC Oxygen Pipeline
+### BGC-Argo CHLA & DOXY Corrections DMQC Pipeline
 ### Integrated DMQC processing for all listed float IDs
 ### Created by Jen McWhorter and Marin Cornec
-### Last updated 15-Sep-2026
+### Last updated 16-Sep-2026
 
 # DOXY drift was not applied to floats that were deployed at the end of May 2026, limited profiles for analysis 
 ## flags 
@@ -49,11 +49,10 @@ dir_profs        <- file.path(dir_main_root, "Tables/profs")
 
 # Auxiliary & External Input Directories rerouted to Main Root
 dir_data_root    <- file.path(dir_main_root, "Data")
-dir_woa          <- file.path(dir_data_root, "WOA")
 combo_output_dir <- file.path(dir_output, "COMBO_CHLA_DOXY_DMODE")
 
 # Create local storage directories if they do not exist
-for (d in c(dir_functions, dir_output, dir_plot_base, dir_script, dir_tables, dir_profs, dir_data_root, dir_woa, combo_output_dir)) {
+for (d in c(dir_functions, dir_output, dir_plot_base, dir_script, dir_tables, dir_profs, dir_data_root, combo_output_dir)) {
   if (!dir.exists(d)) dir.create(d, recursive = TRUE)
 }
 
@@ -115,12 +114,9 @@ lats          <- c(8, 29)
 # --- Specific File Inputs ---
 path_lut_nc     <- file.path(dir_data_root, "LUT/127630.nc")
 path_bottle_val <- file.path(dir_data_root, "Bottle_samples/Master_Vali_24_July_2025.csv")
-woa_file        <- file.path(dir_woa, "woa_all_o00_01.nc")
 
 # --- Web URLs for Data Ingestion ---
 url_argo_index <- "ftp://ftp.ifremer.fr/ifremer/argo/argo_bio-profile_index.txt"
-woa23_url      <- "https://www.ncei.noaa.gov/thredds-ocean/fileServer/woa23/DATA/oxygen/netcdf/all/1.00/woa23_all_o00_01.nc"
-woa18_url      <- "https://data.nodc.noaa.gov/woa/WOA18/DATA/oxygen/netcdf/all/1.00/woa18_all_o00_01.nc"
 
 # Standard Argo QC Flag Color Mapping
 qc_color_scale <- c(
@@ -175,59 +171,6 @@ if (file.exists(path_bottle_val)) {
 } else {
   warning("Bottle validation file not found at path: ", path_bottle_val)
   Bottle_Vali <- data.frame(Float_num = numeric(0), DOXY_bottle = numeric(0), PRES = numeric(0))
-}
-
-# Download WOA Oxygen Data if necessary
-if (!file.exists(woa_file) || file.size(woa_file) == 0) {
-  message("--> Downloading World Ocean Atlas (WOA) Oxygen Data...")
-  tryCatch({
-    message("    Attempting download from WOA23 server...")
-    download.file(url = url_argo_index, destfile = woa_file, mode = "wb", quiet = FALSE) # Fallback handling if needed
-    message("    WOA23 download successful.")
-  }, error = function(e) {
-    warning("    WOA23 download failed. Attempting fallback to WOA18: ", e$message)
-    tryCatch({
-      download.file(url = woa18_url, destfile = woa_file, mode = "wb", quiet = FALSE)
-      message("    WOA18 download successful.")
-    }, error = function(e2) {
-      stop("    Error: Unable to download WOA dataset from NOAA servers: ", e2$message)
-    })
-  })
-} else {
-  message("--> World Ocean Atlas NetCDF file already present locally at: ", woa_file)
-}
-
-# Load WOA Grid into Memory
-woa_nc    <- nc_open(woa_file)
-woa_lon   <- ncvar_get(woa_nc, "lon")
-woa_lat   <- ncvar_get(woa_nc, "lat")
-woa_depth <- ncvar_get(woa_nc, "depth")
-woa_var_name <- if ("o_an" %in% names(woa_nc$var)) "o_an" else names(woa_nc$var)[1]
-woa_o2       <- ncvar_get(woa_nc, woa_var_name)
-nc_close(woa_nc)
-
-if (length(dim(woa_o2)) == 4) {
-  woa_o2 <- woa_o2[, , , 1]
-}
-
-# Helper function to query nearest WOA oxygen profile
-get_nearest_woa_profile <- function(target_lat, target_lon) {
-  if (is.na(target_lat) || is.na(target_lon)) return(NULL)
-  
-  target_lon_adj <- ifelse(target_lon < 0, target_lon + 360, target_lon)
-  woa_lon_adj    <- ifelse(woa_lon < 0, woa_lon + 360, woa_lon)
-  
-  idx_lon <- which.min(abs(woa_lon_adj - target_lon_adj))
-  idx_lat <- which.min(abs(woa_lat - target_lat))
-  
-  o2_prof <- woa_o2[idx_lon, idx_lat, ]
-  
-  tibble(
-    PRES_ADJUSTED = woa_depth,
-    Oxygen        = o2_prof,
-    Mode          = "WOA"
-  ) %>%
-    filter(!is.na(Oxygen))
 }
 
 # =========================================================================
@@ -851,6 +794,7 @@ for (woko in float_ids) {
       qc_flags_chla[range_fail_chla] <- 4
       
       # 2. Spike Test: residual > 5.0 mg/m3 threshold
+      spike_fail_chla <- rep(FALSE, n_obs)
       if (n_obs >= 3) {
         v_prev <- c(NA, chla_v[1:(n_obs - 1)])
         v_next <- c(chla_v[2:n_obs], NA)
@@ -870,8 +814,9 @@ for (woko in float_ids) {
       qc_flags_chla[df_cyc$CHLA_QC %in% c("4", 4)] <- 4
       qc_flags_chla[is.na(chla_v)]                  <- 9
       
-      # Apply PRES_QC flag propagation (If PRES_QC == 9, set parameter QC flag to 9)
-      qc_flags_chla[df_cyc$PRES_QC %in% c("9", 9)] <- 9
+      # Apply PRES_QC flag propagation (If PRES_QC == 9, assign PRES_QC value directly)
+      pres_qc_9_mask <- df_cyc$PRES_QC %in% c("9", 9)
+      qc_flags_chla[pres_qc_9_mask] <- df_cyc$PRES_QC[pres_qc_9_mask]
       
       # --------------------------------------------------
       # B. CHLA_FLUORESCENCE QC & ADJUSTED QC EXECUTION
@@ -886,15 +831,15 @@ for (woko in float_ids) {
       # Stuck Value Test for Fluorescence
       valid_v_fluo <- fluo_v[!is.na(fluo_v)]
       if (length(valid_v_fluo) > 1 && length(unique(valid_v_fluo)) == 1) {
-        qc_flags_fluo[!is.na(fluo_v)] <- 4
+        qc_flags_fluo[!is.na(valid_v_fluo)] <- 4
       }
       
       # Inherit Pressure QC failures (PRES_QC == 4) or missing values
       qc_flags_fluo[df_cyc$PRES_QC %in% c("4", 4)] <- 4
       qc_flags_fluo[is.na(fluo_v)]                  <- 9
       
-      # Apply PRES_QC flag propagation (If PRES_QC == 9, set parameter QC flag to 9)
-      qc_flags_fluo[df_cyc$PRES_QC %in% c("9", 9)] <- 9
+      # Apply PRES_QC flag propagation (If PRES_QC == 9, assign PRES_QC value directly)
+      qc_flags_fluo[pres_qc_9_mask] <- df_cyc$PRES_QC[pres_qc_9_mask]
       
       # Derived CHLA_FLUORESCENCE_ADJUSTED_QC:
       # Evaluates overall dark quality. If 5 deep profiles (MED) available, assign 1, else 2
@@ -905,8 +850,8 @@ for (woko in float_ids) {
       qc_flags_fluo_adj[qc_flags_fluo >= 4] <- qc_flags_fluo[qc_flags_fluo >= 4]
       qc_flags_fluo_adj[is.na(df_cyc$CHLA_FLUORESCENCE_ADJUSTED)] <- 9
       
-      # Apply PRES_QC flag propagation (If PRES_QC == 9, set parameter QC flag to 9)
-      qc_flags_fluo_adj[df_cyc$PRES_QC %in% c("9", 9)] <- 9
+      # Apply PRES_QC flag propagation (If PRES_QC == 9, assign PRES_QC value directly)
+      qc_flags_fluo_adj[pres_qc_9_mask] <- df_cyc$PRES_QC[pres_qc_9_mask]
       
       # Assign computed QC columns to frame
       df_cyc$CHLA_FINAL_QC                  <- qc_flags_chla
@@ -923,7 +868,7 @@ for (woko in float_ids) {
     )))
   
   # ==============================================================================
-  # MASTER BGC-ARGO DMQC OXYGEN ADJUSTMENT & WOA COMPARISON PIPELINE
+  # MASTER BGC-ARGO DMQC OXYGEN ADJUSTMENT PIPELINE
   # ==============================================================================
   
   # Perform Option A: left_join calibration metadata to profile data by float_id
@@ -1015,7 +960,7 @@ for (woko in float_ids) {
   
   if (nrow(hook_corrections_log) > 0) {
     cat("\n------------------------------------------------------------------------------\n")
-    cat("  HOOK FLAGGED AS BAD (QC = 4) FOR DEEPEST PRES LEVEL (> 2 THRESHOLD)\n")
+    cat("   HOOK FLAGGED AS BAD (QC = 4) FOR DEEPEST PRES LEVEL (> 2 THRESHOLD)\n")
     cat("------------------------------------------------------------------------------\n")
     print(hook_corrections_log)
   } else {
@@ -1042,12 +987,13 @@ for (woko in float_ids) {
       qc_flags[range_fail] <- 4
       
       # 2. Spike Test: residual > 50 micromol/kg threshold
+      spike_fail <- rep(FALSE, n_obs)
       if (n_obs >= 3) {
         v_prev <- c(NA, v[1:(n_obs - 1)])
         v_next <- c(v[2:n_obs], NA)
         
         spike_val <- abs(v - 0.5 * (v_prev + v_next)) - 0.5 * abs(v_next - v_prev)
-        spike_fail <- !is.na(spike_val) & (spike_val > 50)
+        spike_fail <- !is.na(spike_val) & (spike_fail > 50)
         qc_flags[spike_fail] <- 4
       }
       
@@ -1065,8 +1011,9 @@ for (woko in float_ids) {
       # Carry forward missing value flag (9)
       qc_flags[is.na(v)] <- 9
       
-      # Apply PRES_QC flag propagation (If PRES_QC == 9, set parameter QC flag to 9)
-      qc_flags[df_cyc$PRES_QC %in% c("9", 9)] <- 9
+      # Apply PRES_QC flag propagation (If PRES_QC == 9, assign PRES_QC value directly)
+      pres_qc_9_mask_doxy <- df_cyc$PRES_QC %in% c("9", 9)
+      qc_flags[pres_qc_9_mask_doxy] <- df_cyc$PRES_QC[pres_qc_9_mask_doxy]
       
       df_cyc$DOXY_FINAL_QC <- qc_flags
       return(df_cyc)
@@ -1074,11 +1021,11 @@ for (woko in float_ids) {
     ungroup() %>%
     select(-any_of(c("HOOK_FLAG_4")))
   
-  # Dynamic Aesthetics Mapping
-  mode_levels <- c("R-mode", "A-mode", "D-mode", "WOA", "Bottle")
-  color_mapping    <- c("R-mode" = "#5C4033", "A-mode" = "#FF7F00", "D-mode" = "#33A02C", "WOA" = "#000000", "Bottle" = "#000000")
-  linetype_mapping <- c("R-mode" = "solid",   "A-mode" = "solid",   "D-mode" = "solid",   "WOA" = "dashed",  "Bottle" = "blank")
-  shape_mapping    <- c("R-mode" = NA,        "A-mode" = NA,        "D-mode" = NA,        "WOA" = NA,        "Bottle" = 16)
+  # Dynamic Aesthetics Mapping (Excludes WOA)
+  mode_levels <- c("R-mode", "A-mode", "D-mode", "Bottle")
+  color_mapping    <- c("R-mode" = "#5C4033", "A-mode" = "#FF7F00", "D-mode" = "#33A02C", "Bottle" = "#000000")
+  linetype_mapping <- c("R-mode" = "solid",   "A-mode" = "solid",   "D-mode" = "solid",   "Bottle" = "blank")
+  shape_mapping    <- c("R-mode" = NA,        "A-mode" = NA,        "D-mode" = NA,        "Bottle" = 16)
   
   # Clean Bottle Validation Dataset
   df_bottle_clean <- Bottle_Vali %>%
@@ -1194,15 +1141,10 @@ for (woko in float_ids) {
       select(PRES_ADJUSTED, Oxygen, Mode) %>%
       filter(!is.na(Oxygen) & !is.na(PRES_ADJUSTED))
     
-    woa_prof <- get_nearest_woa_profile(target_lat = cyc_lat, target_lon = cyc_lon)
-    if (!is.null(woa_prof)) {
-      woa_prof <- woa_prof %>% mutate(Mode = factor("WOA", levels = mode_levels))
-    }
-    
     df_plot_combined <- if (cyc == 1) {
-      bind_rows(df_cycle_clean, woa_prof, df_bottle_clean)
+      bind_rows(df_cycle_clean, df_bottle_clean)
     } else {
-      bind_rows(df_cycle_clean, woa_prof)
+      df_cycle_clean
     }
     
     df_plot_combined <- df_plot_combined %>% arrange(Mode, PRES_ADJUSTED)
@@ -1247,8 +1189,8 @@ for (woko in float_ids) {
           override.aes = list(
             shape     = shape_mapping,
             linetype  = linetype_mapping,
-            linewidth = c(0.8, 0.8, 0.8, 0.8, 0),
-            size      = c(NA, NA, NA, NA, 2.5)
+            linewidth = c(0.8, 0.8, 0.8, 0),
+            size      = c(NA, NA, NA, 2.5)
           )
         ),
         linetype = "none",
@@ -1264,73 +1206,6 @@ for (woko in float_ids) {
       height   = 7,
       dpi      = 300
     )
-  }
-  
-  # --- SURFACE O2 COMPARISON TO WOA ---
-  surface_results <- map_dfr(all_cycles, function(cyc) {
-    df_cyc <- df_all %>% filter(CYCLE_NUMBER == cyc)
-    if (nrow(df_cyc) == 0) return(NULL)
-    
-    cyc_lat <- df_cyc$LATITUDE[1]
-    cyc_lon <- df_cyc$LONGITUDE[1]
-    
-    woa_prof <- get_nearest_woa_profile(target_lat = cyc_lat, target_lon = cyc_lon)
-    if (is.null(woa_prof) || nrow(woa_prof) == 0) return(NULL)
-    
-    woa_surf_row <- woa_prof %>% filter(PRES_ADJUSTED <= 20) %>% slice_min(PRES_ADJUSTED, n = 1)
-    if (nrow(woa_surf_row) == 0) woa_surf_row <- woa_prof %>% slice_min(PRES_ADJUSTED, n = 1)
-    woa_surf_o2 <- woa_surf_row$Oxygen[1]
-    
-    df_surf <- df_cyc %>% filter(PRES_ADJUSTED <= 20 & !is.na(PRES_ADJUSTED) & !is.na(DOXY))
-    if (nrow(df_surf) == 0) df_surf <- df_cyc %>% filter(!is.na(PRES_ADJUSTED) & !is.na(DOXY))
-    if (nrow(df_surf) == 0) return(NULL)
-    
-    shallowest_idx <- which.min(df_surf$PRES_ADJUSTED)
-    surf_obs <- df_surf[shallowest_idx, ]
-    
-    mode_values <- tibble(
-      Category = c("R-mode", "A-mode", "D-mode"),
-      O2_Value = c(surf_obs$DOXY[1], surf_obs$DOXY_ADJUSTED[1], surf_obs$DOXY_CALCULATED_ADJ[1])
-    ) %>%
-      filter(!is.na(O2_Value)) %>%
-      mutate(Abs_Diff_to_WOA = abs(O2_Value - woa_surf_o2))
-    
-    if (nrow(mode_values) == 0) return(NULL)
-    
-    best_match <- mode_values %>% slice_min(Abs_Diff_to_WOA, n = 1) %>% slice(1)
-    
-    tibble(
-      CYCLE_NUMBER        = cyc,
-      LATITUDE            = round(cyc_lat, 3),
-      LONGITUDE           = round(cyc_lon, 3),
-      PRES_SURFACE        = surf_obs$PRES_ADJUSTED[1],
-      WOA_Surface_O2      = round(woa_surf_o2, 2),
-      Closest_Category    = as.character(best_match$Category[1]),
-      Closest_O2_Value    = round(best_match$O2_Value[1], 2),
-      Min_Abs_Diff_to_WOA = round(best_match$Abs_Diff_to_WOA[1], 2),
-      R_mode_O2           = round(surf_obs$DOXY[1], 2),
-      A_mode_O2           = round(surf_obs$DOXY_ADJUSTED[1], 2),
-      D_mode_O2           = round(surf_obs$DOXY_CALCULATED_ADJ[1], 2)
-    )
-  })
-  
-  # Summary Tally Execution
-  if (nrow(surface_results) > 0 && "Closest_Category" %in% names(surface_results)) {
-    summary_tally <- surface_results %>%
-      group_by(Closest_Category) %>%
-      summarise(
-        Cycle_Count   = n(),
-        Percentage    = round((n() / nrow(surface_results)) * 100, 1),
-        Mean_Abs_Diff = round(mean(Min_Abs_Diff_to_WOA, na.rm = TRUE), 2)
-      ) %>%
-      arrange(desc(Cycle_Count))
-    
-    cat("\n------------------------------------------------------------------------------\n")
-    cat("  WOA SURFACE O2 CLOSEST MODE CATEGORIZATION SUMMARY FOR FLOAT:", float_id, "\n")
-    cat("------------------------------------------------------------------------------\n\n")
-    print(knitr::kable(summary_tally, format = "simple"))
-  } else {
-    warning("No valid surface comparisons could be generated for Float ", float_id)
   }
   
   # ==============================================================================
