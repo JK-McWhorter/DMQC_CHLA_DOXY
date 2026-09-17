@@ -800,7 +800,7 @@ for (woko in float_ids) {
         v_next <- c(chla_v[2:n_obs], NA)
         
         spike_val <- abs(chla_v - 0.5 * (v_prev + v_next)) - 0.5 * abs(v_next - v_prev)
-        spike_fail_chla <- !is.na(spike_val) & (spike_val > 5.0)
+        spike_fail_chla <- !is.na(spike_val) & (spike_fail_chla > 5.0)
         qc_flags_chla[spike_fail_chla] <- 4
       }
       
@@ -852,6 +852,11 @@ for (woko in float_ids) {
       
       # Apply PRES_QC flag propagation (If PRES_QC == 9, assign PRES_QC value directly)
       qc_flags_fluo_adj[pres_qc_9_mask] <- df_cyc$PRES_QC[pres_qc_9_mask]
+      
+      # --------------------------------------------------
+      # C. OVERRIDE: PROPAGATE MISSING QC (9) FROM FLUORESCENCE TO CHLA_FINAL
+      # --------------------------------------------------
+      qc_flags_chla[qc_flags_fluo %in% c("9", 9)] <- 9
       
       # Assign computed QC columns to frame
       df_cyc$CHLA_FINAL_QC                  <- qc_flags_chla
