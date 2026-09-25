@@ -32,33 +32,6 @@ for (pkg in required_pkgs) {
   }
 }
 
-# --- HELPER FUNCTION FOR SAFE ARGO QC EXTRACTION ---
-extract_argo_qc <- function(nc_obj, var_name, expected_length) {
-  if (!var_name %in% names(nc_obj$var)) {
-    return(rep(9, expected_length)) # Default to 9 (Missing Value) if QC variable is absent
-  }
-  
-  qc_raw <- ncvar_get(nc_obj, var_name)
-  
-  # Extract first profile dimension if multi-column/matrix
-  if (is.matrix(qc_raw) || length(dim(qc_raw)) > 1) {
-    qc_raw <- qc_raw[, 1]
-  }
-  
-  qc_str <- paste(as.character(qc_raw), collapse = "")
-  qc_chars <- unlist(strsplit(qc_str, ""))
-  qc_numeric <- suppressWarnings(as.numeric(qc_chars))
-  
-  # Ensure output length matches expected profile pressure levels
-  if (length(qc_numeric) > expected_length) {
-    qc_numeric <- qc_numeric[1:expected_length]
-  } else if (length(qc_numeric) < expected_length) {
-    qc_numeric <- c(qc_numeric, rep(NA, expected_length - length(qc_numeric)))
-  }
-  
-  return(qc_numeric)
-}
-
 # =========================================================================
 # 2. CONFIGURATION & DIRECTORY MANAGEMENT
 # =========================================================================
@@ -105,36 +78,21 @@ launch_date_dict <- tibble::tribble(
   7901009,    "2023-06-05 10:30:00"
 )
 
-# --- Load Calibration Data with Fallback Protection ---
+# --- Load Calibration Data ---
 calib_csv_path <- file.path(dir_tables, "Jul2026_inair_output_binflags5.csv")
 
-if (file.exists(calib_csv_path)) {
-  calib_df <- read.csv(calib_csv_path) %>%
-    mutate(float_ids = as.numeric(float_ids)) %>%
-    select(-any_of("LAUNCH_DATE")) %>%
-    left_join(launch_date_dict, by = "float_ids") %>%
-    mutate(
-      launch_date = lubridate::ymd_hms(launch_date_str, tz = "UTC")
-    ) %>%
-    rename(
-      doxy_slope = SLOPE,
-      doxy_drift = DRIFT
-    ) %>%
-    select(float_ids, doxy_slope, doxy_drift, launch_date)
-  
-  float_ids <- unique(calib_df$float_ids)
-} else {
-  warning("Calibration CSV file not found at: ", calib_csv_path, "\nDefaulting to floats listed in launch_date_dict.")
-  calib_df <- launch_date_dict %>%
-    mutate(
-      launch_date = lubridate::ymd_hms(launch_date_str, tz = "UTC"),
-      doxy_slope = 1.0,
-      doxy_drift = 0.0
-    ) %>%
-    select(float_ids, doxy_slope, doxy_drift, launch_date)
-  
-  float_ids <- unique(calib_df$float_ids)
-}
+calib_df <- read.csv(calib_csv_path) %>%
+  mutate(float_ids = as.numeric(float_ids)) %>%
+  select(-any_of("LAUNCH_DATE")) %>%
+  left_join(launch_date_dict, by = "float_ids") %>%
+  mutate(
+    launch_date = lubridate::ymd_hms(launch_date_str, tz = "UTC")
+  ) %>%
+  rename(
+    doxy_slope = SLOPE,
+    doxy_drift = DRIFT
+  ) %>%
+  select(float_ids, doxy_slope, doxy_drift, launch_date)
 
 # --- DIAGNOSTIC PRINT: VERIFY PARSED LAUNCH DATES PER FLOAT ID ---
 cat("\n==============================================================================\n")
@@ -143,11 +101,8 @@ cat("===========================================================================
 print(knitr::kable(calib_df %>% select(float_ids, launch_date, doxy_slope, doxy_drift), format = "simple"))
 cat("==============================================================================\n\n")
 
-# Verify float_ids exists before proceeding
-if (length(float_ids) == 0 || is.null(float_ids)) {
-  stop("ERROR: float_ids is empty. Please check calibration CSV input or launch_date_dict.")
-}
-
+# Extract processing targets and dates
+float_ids     <- calib_df$float_ids
 target_floats <- c(6999992, 4903904, 1902800, 4903624) # Restricted strictly for CHLA No_LUT
 today_str     <- format(Sys.Date(), "%Y-%m-%d")
 
@@ -260,8 +215,6 @@ for (woko in float_ids) {
     if (is.na(time_index[kiwi])) { print("Time=NA"); next } 
     
     www <- substr(prof_id[kiwi], 3, 13)
-    cyc_str <- str_remove(substr(www, 9, 11), "^0+")
-    
     profile_bio <- NULL
     profile_physic <- NULL
     
@@ -329,168 +282,205 @@ for (woko in float_ids) {
       next
     }
     
-    # --- RETAIN ALL PRES LEVELS FROM D/R FILES (INCLUDING FILL / NA VALUES) ---
-    pres_raw_phy <- as.vector(ncvar_get(profile_physic, "PRES"))
-    pres_raw_bio <- if ("PRES" %in% names(profile_bio$var)) as.vector(ncvar_get(profile_bio, "PRES")) else NULL
+    # Extract pressure and oceanographic variables
+    pres <- as.vector(ncvar_get(profile_physic, "PRES"))
+    pres_qc <- NULL
+    col_vec<-NULL
+    parameters <- ncvar_get(profile_bio, "STATION_PARAMETERS")
     
-    # --- DIAGNOSTIC PRINT: MISSING PRES LEVELS IN CYCLE 1 (PHYSICAL R/D & BIO BD/BR FILES) ---
-    if (cyc_str %in% c("1", "001")) {
-      cat(sprintf("\n==============================================================================\n"))
-      cat(sprintf("   CYCLE 1 MISSING PRES CHECK | Float ID: %s\n", active_wmo))
-      cat(sprintf("==============================================================================\n"))
-      
-      # Check physical profile file (R or D)
-      missing_phy_idx <- which(is.na(pres_raw_phy) | pres_raw_phy >= 9999)
-      if (length(missing_phy_idx) > 0) {
-        cat(sprintf("  --> Physical Profile File (D/R): %d missing/FillValue PRES levels found at index positions: %s\n", 
-                    length(missing_phy_idx), paste(missing_phy_idx, collapse = ", ")))
+    for (ik in 1:dim(ncvar_get(profile_physic, "PRES_QC"))) {
+      pres_qc <- paste(pres_qc, ncvar_get(profile_physic, "PRES_QC")[ik], sep = "")
+      if (length(grep("CHLA", parameters[, ik])) > 0 || length(grep("DOXY", parameters[, ik])) > 0) {
+        col_vec <- c(col_vec,rep("CHLA_DOXY", nchar(ncvar_get(profile_physic, "PRES_QC")[ik])))
       } else {
-        cat("  --> Physical Profile File (D/R): 0 missing/FillValue PRES levels detected.\n")
+        col_vec <- c(col_vec,rep("OTHER", nchar(ncvar_get(profile_physic, "PRES_QC")[ik])))
       }
-      
-      # Check bio profile file (BD or BR)
-      if (!is.null(pres_raw_bio)) {
-        missing_bio_idx <- which(is.na(pres_raw_bio) | pres_raw_bio >= 9999)
-        if (length(missing_bio_idx) > 0) {
-          cat(sprintf("  --> Bio Profile File (BD/BR):    %d missing/FillValue PRES levels found at index positions: %s\n", 
-                      length(missing_bio_idx), paste(missing_bio_idx, collapse = ", ")))
-        } else {
-          cat("  --> Bio Profile File (BD/BR):    0 missing/FillValue PRES levels detected.\n")
-        }
-      } else {
-        cat("  --> Bio Profile File (BD/BR):    PRES variable not found in file.\n")
-      }
-      cat(sprintf("==============================================================================\n\n"))
     }
+    pres_qc <- as.numeric(unlist(strsplit(pres_qc, "")))
     
-    n_levels <- length(pres_raw_phy)
     
-    # Linearly interpolate missing/FillValue pressure points strictly to maintain complete profile geometry
-    pres <- pres_raw_phy
-    if (length(which(!is.na(pres))) >= 2) {
-      pres <- approx(x = seq_along(pres), y = pres, xout = seq_along(pres), rule = 2)$y
-    }
-    
-    # Extract PRES_QC matching full physical profile
-    if ("PRES_QC" %in% names(profile_physic$var)) {
-      pres_qc <- extract_argo_qc(profile_physic, "PRES_QC", n_levels)
-    } else if ("PRES_QC" %in% names(profile_bio$var)) {
-      pres_qc <- extract_argo_qc(profile_bio, "PRES_QC", n_levels)
-    } else {
-      pres_qc <- rep(1, n_levels)
-    }
-    
-    # Mark original Fill Value / NA pressure levels with QC flag = 9
-    pres_qc[is.na(pres_raw_phy)] <- 9
-    
-    temp <- rep(NA, n_levels); temp_qc <- rep(NA, n_levels)
-    sal  <- rep(NA, n_levels); sal_qc  <- rep(NA, n_levels)
+    temp <- rep(NA, length(pres)); temp_qc <- rep(NA, length(pres))
+    sal  <- rep(NA, length(pres)); sal_qc  <- rep(NA, length(pres))
     
     if ("TEMP" %in% names(profile_physic$var)) {
       temp <- as.vector(ncvar_get(profile_physic, "TEMP"))
-      temp_qc <- extract_argo_qc(profile_physic, "TEMP_QC", n_levels)
+      temp_qc_str <- NULL
+      for (ik in 1:dim(ncvar_get(profile_physic, "TEMP_QC"))) {
+        temp_qc_str <- paste(temp_qc_str, ncvar_get(profile_physic, "TEMP_QC")[ik], sep = "")
+      }
+      temp_qc <- as.numeric(unlist(strsplit(temp_qc_str, "")))
     }
     
     if ("PSAL" %in% names(profile_physic$var)) {
       sal <- as.vector(ncvar_get(profile_physic, "PSAL"))
-      sal_qc <- extract_argo_qc(profile_physic, "PSAL_QC", n_levels)
+      sal_qc_str <- NULL
+      for (ik in 1:dim(ncvar_get(profile_physic, "PSAL_QC"))) {
+        sal_qc_str <- paste(sal_qc_str, ncvar_get(profile_physic, "PSAL_QC")[ik], sep = "")
+      }
+      sal_qc <- as.numeric(unlist(strsplit(sal_qc_str, "")))
     }
     
     # Calculate Mixed Layer Depth (MLD)
     MLD <- NA
-    valid_p_mask <- !(pres_qc %in% c(3, 4, 9))
+    pres_mld <- as.vector(ncvar_get(profile_physic, "PRES"))
+    pres_qc_mld <- NULL
+    for (ik in 1:dim(ncvar_get(profile_physic, "PRES_QC"))) {
+      pres_qc_mld <- paste(pres_qc_mld, ncvar_get(profile_physic, "PRES_QC")[ik], sep = "")
+    }
+    for (jj in 1:nchar(pres_qc_mld)) {
+      if (substr(pres_qc_mld, jj, jj) == 3 || substr(pres_qc_mld, jj, jj) == 4) {
+        pres_mld[jj] <- NA
+      }
+    }
     
-    if (sum(valid_p_mask, na.rm = TRUE) > 15 && max(pres[valid_p_mask], na.rm = TRUE) > 250) {
-      temp_all_mld <- temp
-      sal_all_mld  <- sal
-      
-      temp_all_mld[!valid_p_mask] <- NA
-      sal_all_mld[!valid_p_mask]  <- NA
-      
-      for (wii in seq_along(sal_all_mld)) {
-        if (is.na(sal_all_mld[wii]) || is.na(temp_all_mld[wii])) {
-          sal_all_mld[wii]  <- NA
-          temp_all_mld[wii] <- NA
+    if (length(which(!is.na(pres_mld))) > 15 && max(pres_mld, na.rm = TRUE) > 250) {
+      temp_get_mld <- as.vector(ncvar_get(profile_physic, "TEMP"))
+      temp_qc_mld <- NULL
+      for (ik in 1:dim(ncvar_get(profile_physic, "TEMP_QC"))) {
+        temp_qc_mld <- paste(temp_qc_mld, ncvar_get(profile_physic, "TEMP_QC")[ik], sep = "")
+      }
+      temp_all_mld <- temp_get_mld
+      for (jj in 1:nchar(temp_qc_mld)) {
+        if (substr(temp_qc_mld, jj, jj) == 3 || substr(temp_qc_mld, jj, jj) == 4) {
+          temp_all_mld[jj] <- NA
         }
       }
       
-      sigma_all <- swSigmaTheta(sal_all_mld, temp_all_mld, pres)
-      pres_sigma <- pres[which(!is.na(pres) & !is.na(sigma_all))]
-      sigma <- sigma_all[which(!is.na(pres) & !is.na(sigma_all))]
+      sal_get_mld <- as.vector(ncvar_get(profile_physic, "PSAL"))
+      sal_qc_mld <- NULL
+      for (ik in 1:dim(ncvar_get(profile_physic, "PSAL_QC"))) {
+        sal_qc_mld <- paste(sal_qc_mld, ncvar_get(profile_physic, "PSAL_QC")[ik], sep = "")
+      }
+      sal_all_mld <- sal_get_mld
+      for (jj in 1:nchar(sal_qc_mld)) {
+        if (substr(sal_qc_mld, jj, jj) == 3 || substr(sal_qc_mld, jj, jj) == 4) {
+          sal_all_mld[jj] <- NA
+        }
+      }
+      
+      for (wii in 1:length(sal_all_mld)) {
+        if (is.na(sal_all_mld[wii]) || is.na(temp_all_mld[wii])) {
+          sal_all_mld[wii] <- NA; temp_all_mld[wii] <- NA
+        }
+      }
+      
+      sigma_all <- swSigmaTheta(sal_all_mld, temp_all_mld, pres_mld)
+      pres_sigma <- pres_mld[which(!is.na(pres_mld) & !is.na(sigma_all))]
+      sigma <- sigma_all[which(!is.na(pres_mld) & !is.na(sigma_all))]
       sigma <- sigma[order(pres_sigma)]
       pres_sigma <- pres_sigma[order(pres_sigma)]
       
-      if (length(sigma) > 0) {
-        dep_sigma <- swDepth(pres_sigma, lat_val)
-        MLD <- MLD_calc(sigma, dep_sigma)
-      }
+      dep_sigma <- swDepth(pres_sigma, lat_val)
+      MLD <- MLD_calc(sigma, dep_sigma)
     }
     
-    # Safely extract BGC parameters without dropping levels
-    helper_get_bgc_var <- function(nc_obj, var_name, target_pres) {
-      if (!var_name %in% names(nc_obj$var)) return(rep(NA, length(target_pres)))
-      v_raw <- as.vector(ncvar_get(nc_obj, var_name))
-      p_raw <- as.vector(ncvar_get(nc_obj, "PRES"))
-      if (length(v_raw) == length(target_pres)) {
-        return(v_raw)
-      } else {
-        # Interpolate BGC variables strictly onto physical pressure grid
-        valid_idx <- which(!is.na(p_raw) & !is.na(v_raw))
-        if (length(valid_idx) >= 2) {
-          return(approx(x = p_raw[valid_idx], y = v_raw[valid_idx], xout = target_pres, rule = 2)$y)
-        } else {
-          return(rep(NA, length(target_pres)))
-        }
-      }
-    }
-    
-    chl      <- helper_get_bgc_var(profile_bio, "CHLA", pres)
-    chl_qc   <- extract_argo_qc(profile_bio, "CHLA_QC", n_levels)
-    chl_adj  <- helper_get_bgc_var(profile_bio, "CHLA_ADJUSTED", pres)
-    fluo     <- helper_get_bgc_var(profile_bio, "FLUORESCENCE_CHLA", pres)
-    fluo_qc  <- extract_argo_qc(profile_bio, "FLUORESCENCE_CHLA_QC", n_levels)
-    bbp      <- helper_get_bgc_var(profile_bio, "BBP700", pres)
-    bbp_qc   <- extract_argo_qc(profile_bio, "BBP700_QC", n_levels)
-    doxy     <- helper_get_bgc_var(profile_bio, "DOXY", pres)
-    doxy_qc  <- extract_argo_qc(profile_bio, "DOXY_QC", n_levels)
-    doxy_adj <- helper_get_bgc_var(profile_bio, "DOXY_ADJUSTED", pres)
-    doxy_adj_qc <- extract_argo_qc(profile_bio, "DOXY_ADJUSTED_QC", n_levels)
+    # Extract Chlorophyll, Fluorescence, BBP700, and Oxygen
+    chl <- rep(NA, length(pres)); chl_qc <- rep(NA, length(pres))
+    chl_adj <- rep(NA, length(pres)) # Ingest raw CHLA_ADJUSTED from profile_bio if present
+    bbp <- rep(NA, length(pres)); bbp_qc <- rep(NA, length(pres))
+    fluo <- rep(NA, length(pres)); fluo_qc <- rep(NA, length(pres))
+    doxy <- rep(NA, length(pres)); doxy_qc <- rep(NA, length(pres))
+    doxy_adj <- rep(NA, length(pres)); doxy_adj_qc <- rep(NA, length(pres))
     scale_chla <- NA; dark_chla <- NA
     
+    if ("CHLA" %in% names(profile_bio$var)) {
+      chl <- as.vector(ncvar_get(profile_bio, "CHLA"))
+      chl_qc_v <- NULL
+      for (ik in 1:dim(ncvar_get(profile_bio, "CHLA_QC"))) {
+        chl_qc_v <- paste(chl_qc_v, ncvar_get(profile_bio, "CHLA_QC")[ik], sep = "")
+      }
+      chl_qc <- NULL
+      for (jj in 1:nchar(chl_qc_v)) {
+        chl_qc <- c(chl_qc, ifelse(substr(chl_qc_v, jj, jj) == " ", NA, substr(chl_qc_v, jj, jj)))
+      }
+    }
+    
+    if ("CHLA_ADJUSTED" %in% names(profile_bio$var)) {
+      chl_adj <- as.vector(ncvar_get(profile_bio, "CHLA_ADJUSTED"))
+    }
+    
     if ("FLUORESCENCE_CHLA" %in% names(profile_bio$var)) {
-      meta_file  <- nc_open(meta_path, readunlim = FALSE, write = FALSE)
-      params     <- ncvar_get(meta_file, "PARAMETER") 
-      index_meta <- grep("CHLA                            ", params)
-      scale_chla <- as.numeric(paste(sub(".*SCALE_CHLA=([0-9.]+);.*", "\\1", 
+      fluo <- as.vector(ncvar_get(profile_bio, "FLUORESCENCE_CHLA"))
+      fluo_qc_v <- NULL
+      for (ik in 1:dim(ncvar_get(profile_bio, "FLUORESCENCE_CHLA_QC"))) {
+        fluo_qc_v <- paste(fluo_qc_v, ncvar_get(profile_bio, "FLUORESCENCE_CHLA_QC")[ik], sep = "")
+      }
+      fluo_qc <- NULL
+      for (jj in 1:nchar(fluo_qc_v)) {
+        fluo_qc <- c(fluo_qc, ifelse(substr(fluo_qc_v, jj, jj) == " ", NA, substr(fluo_qc_v, jj, jj)))
+      }
+      
+      meta_file <- nc_open(meta_path, readunlim = FALSE, write = FALSE)
+      params <- ncvar_get(meta_file, "PARAMETER") 
+      index_meta <- grep("^CHLA\\s*$", params)
+      scale_chla <- as.numeric(paste(sub(".*SCALE_CHLA=([-+]?[0-9]*\\.?[0-9]+);.*", "\\1", 
                                          ncvar_get(meta_file, "PREDEPLOYMENT_CALIB_COEFFICIENT")[index_meta])))
-      dark_chla  <- as.numeric(paste(sub(".*DARK_CHLA=([0-9]+);.*", "\\1", 
-                                         ncvar_get(meta_file, "PREDEPLOYMENT_CALIB_COEFFICIENT")[index_meta])))
+      dark_chla <- as.numeric(paste(sub(".*DARK_CHLA=([-+]?[0-9]*\\.?[0-9]+);.*", "\\1", 
+                                        ncvar_get(meta_file, "PREDEPLOYMENT_CALIB_COEFFICIENT")[index_meta])))
       nc_close(meta_file)
     }
     
-    # --- CONSTRUCT DATA_SUB WITHOUT DROPPING ANY PRES LEVELS ---
-    data_sub <- data.frame(
-      PRES = pres, PRES_QC = pres_qc,
-      CHLA = chl, CHLA_QC = chl_qc, CHLA_ADJUSTED = chl_adj,
-      FLUO_CHLA = fluo, FLUO_CHLA_QC = fluo_qc,
-      BBP700 = bbp, BBP700_QC = bbp_qc,
-      DOXY = doxy, DOXY_QC = doxy_qc,
-      DOXY_ADJUSTED = doxy_adj, DOXY_ADJUSTED_QC = doxy_adj_qc
-    )
+    if ("BBP700" %in% names(profile_bio$var)) {
+      bbp <- as.vector(ncvar_get(profile_bio, "BBP700"))
+      bbp_qc_v <- NULL
+      for (ik in 1:dim(ncvar_get(profile_bio, "BBP700_QC"))) {
+        bbp_qc_v <- paste(bbp_qc_v, ncvar_get(profile_bio, "BBP700_QC")[ik], sep = "")
+      }
+      bbp_qc <- NULL
+      for (jj in 1:nchar(bbp_qc_v)) {
+        bbp_qc <- c(bbp_qc, ifelse(substr(bbp_qc_v, jj, jj) == " ", NA, substr(bbp_qc_v, jj, jj)))
+      }
+    }
     
-    # Sort by pressure without filtering out any rows
-    data_sub <- data_sub[order(data_sub$PRES), ]
+    if ("DOXY" %in% names(profile_bio$var)) {
+      doxy <- as.vector(ncvar_get(profile_bio, "DOXY"))
+      doxy_qc_v <- NULL
+      for (ik in 1:dim(ncvar_get(profile_bio, "DOXY_QC"))) {
+        doxy_qc_v <- paste(doxy_qc_v, ncvar_get(profile_bio, "DOXY_QC")[ik], sep = "")
+      }
+      doxy_qc <- NULL
+      for (jj in 1:nchar(doxy_qc_v)) {
+        doxy_qc <- c(doxy_qc, ifelse(substr(doxy_qc_v, jj, jj) == " ", NA, substr(doxy_qc_v, jj, jj)))
+      }
+    }
     
-    data_sub$TIME <- time_val
-    data_sub$LONGITUDE <- lon_val
-    data_sub$LATITUDE  <- lat_val
-    data_sub$CYCLE_NUMBER <- cyc_str
-    data_sub$float_num <- substr(www, 1, 7)
-    data_sub$MLD <- MLD
-    data_sub$DARK_FLUO  <- dark_chla
-    data_sub$SCALE_FLUO <- scale_chla
+    if ("DOXY_ADJUSTED" %in% names(profile_bio$var)) {
+      doxy_adj <- as.vector(ncvar_get(profile_bio, "DOXY_ADJUSTED"))
+      doxy_adj_qc_v <- NULL
+      for (ik in 1:dim(ncvar_get(profile_bio, "DOXY_ADJUSTED_QC"))) {
+        doxy_adj_qc_v <- paste(doxy_adj_qc_v, ncvar_get(profile_bio, "DOXY_ADJUSTED_QC")[ik], sep = "")
+      }
+      doxy_adj_qc <- NULL
+      for (jj in 1:nchar(doxy_adj_qc_v)) {
+        doxy_adj_qc <- c(doxy_adj_qc, ifelse(substr(doxy_adj_qc_v, jj, jj) == " ", NA, substr(doxy_adj_qc_v, jj, jj)))
+      }
+    }
     
-    float_data <- rbind(float_data, data_sub)
+    # Retain observations with valid CHLA OR valid DOXY
+    if (any(!is.na(chl)) || any(!is.na(doxy))) {
+      data_sub <- data.frame(
+        PRES = pres, PRES_QC = pres_qc,
+        CHLA = chl, CHLA_QC = chl_qc, CHLA_ADJUSTED = chl_adj,
+        FLUO_CHLA = fluo, FLUO_CHLA_QC = fluo_qc,
+        BBP700 = bbp, BBP700_QC = bbp_qc,
+        DOXY = doxy, DOXY_QC = doxy_qc,
+        DOXY_ADJUSTED = doxy_adj, DOXY_ADJUSTED_QC = doxy_adj_qc
+      )
+      
+      data_sub <- data_sub[which(col_vec=="CHLA_DOXY"), ]
+      data_sub <- data_sub[order(data_sub$PRES), ]
+      
+      data_sub$TIME <- time_val
+      data_sub$LONGITUDE <- lon_val
+      data_sub$LATITUDE  <- lat_val
+      data_sub$CYCLE_NUMBER <- str_remove(substr(www, 9, 11), "^0+") 
+      data_sub$float_num <- substr(www, 1, 7)
+      data_sub$MLD <- MLD
+      data_sub$DARK_FLUO  <- dark_chla
+      data_sub$SCALE_FLUO <- scale_chla
+      
+      float_data <- rbind(float_data, data_sub)
+    }
     
     nc_close(profile_bio)
     nc_close(profile_physic)
@@ -522,7 +512,7 @@ for (woko in float_ids) {
     geom_point(aes(y = PRES, x = CHLA_QC, color = float_num)) +
     theme_bw() + ggtitle('CHLA_QC_flags by depth') + 
     scale_y_reverse(limits = c(2000, 5)) + labs(colour = "WMO", x = "QC flags", y = "Pres [mbar]") +
-    scale_x_continuous(breaks = c(1, 2, 3, 4, 5, 6, 8, 9)) +
+    scale_x_continuous(breaks = c(1, 2, 3, 4, 5, 6, 8)) +
     theme(axis.text.x = element_text(size = 15), axis.title.x = element_text(size = 15), 
           axis.text.y = element_text(size = 15), axis.title.y = element_text(size = 15), 
           legend.text = element_text(size = 15), legend.title = element_text(size = 15), 
@@ -812,7 +802,7 @@ for (woko in float_ids) {
         v_next <- c(chla_v[2:n_obs], NA)
         
         spike_val <- abs(chla_v - 0.5 * (v_prev + v_next)) - 0.5 * abs(v_next - v_prev)
-        spike_fail_chla <- !is.na(spike_val) & (spike_fail_chla > 5.0)
+        spike_fail_chla <- !is.na(spike_val) & (spike_val > 5.0)
         qc_flags_chla[spike_fail_chla] <- 4
       }
       
@@ -843,7 +833,7 @@ for (woko in float_ids) {
       # Stuck Value Test for Fluorescence
       valid_v_fluo <- fluo_v[!is.na(fluo_v)]
       if (length(valid_v_fluo) > 1 && length(unique(valid_v_fluo)) == 1) {
-        qc_flags_fluo[!is.na(valid_v_fluo)] <- 4
+        qc_flags_fluo[!is.na(fluo_v)] <- 4
       }
       
       # Inherit Pressure QC failures (PRES_QC == 4) or missing values
@@ -864,11 +854,6 @@ for (woko in float_ids) {
       
       # Apply PRES_QC flag propagation (If PRES_QC == 9, assign PRES_QC value directly)
       qc_flags_fluo_adj[pres_qc_9_mask] <- df_cyc$PRES_QC[pres_qc_9_mask]
-      
-      # --------------------------------------------------
-      # C. OVERRIDE: PROPAGATE MISSING QC (9) FROM FLUORESCENCE TO CHLA_FINAL
-      # --------------------------------------------------
-      qc_flags_chla[qc_flags_fluo %in% c("9", 9)] <- 9
       
       # Assign computed QC columns to frame
       df_cyc$CHLA_FINAL_QC                  <- qc_flags_chla
@@ -1010,7 +995,7 @@ for (woko in float_ids) {
         v_next <- c(v[2:n_obs], NA)
         
         spike_val <- abs(v - 0.5 * (v_prev + v_next)) - 0.5 * abs(v_next - v_prev)
-        spike_fail <- !is.na(spike_val) & (spike_fail > 50)
+        spike_fail <- !is.na(spike_val) & (spike_val > 50)
         qc_flags[spike_fail] <- 4
       }
       
