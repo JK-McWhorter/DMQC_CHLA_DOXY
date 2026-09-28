@@ -19,6 +19,7 @@ import netCDF4 as nc
 import numpy as np
 import pandas as pd
 
+
 # Mapping of WMO Float IDs to instrument types
 # FLOAT_TYPES = {
     # 4903622: "aoml_apex",
@@ -142,6 +143,7 @@ def write_history_chla(bgc_file, iprof_idx):
 def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
     """
     Set PARAMETER_DATA_MODE and DATA_MODE synchronously across all N_PROF profiles.
+    Ensures no profile in 'D' mode contains parameters in 'R' mode.
     """
     n_prof = bgc_file.dimensions["N_PROF"].size
     n_param = bgc_file.dimensions["N_PARAM"].size
@@ -155,7 +157,6 @@ def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
             param_mat = param_mat.filled(b' ')
 
         if iprof == iprof_idx:
-            # Set target profile DATA_MODE to 'D'
             data_mode[iprof] = 'D'
             for j in range(n_param):
                 param_str = "".join([c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c) for c in param_mat[j]]).strip()
@@ -164,11 +165,12 @@ def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
                 elif param_str and pdm[iprof, j] == 'R':
                     pdm[iprof, j] = 'A'
         else:
-            # Preserve Real-Time / unadjusted status for secondary profiles if not in 'D'
-            if data_mode[iprof] != 'D':
+            # If profile is 'D', ensure no parameter is 'R'
+            if data_mode[iprof] == 'D':
                 for j in range(n_param):
-                    if pdm[iprof, j] == 'D':
-                        pdm[iprof, j] = 'R'
+                    param_str = "".join([c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c) for c in param_mat[j]]).strip()
+                    if param_str and pdm[iprof, j] == 'R':
+                        pdm[iprof, j] = 'A'
 
     bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
     bgc_file.variables["DATA_MODE"][:] = data_mode
@@ -512,7 +514,7 @@ def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
 
 
 def write_parameter_data_mode_doxy(ds, profile_idx, mode_char="D"):
-    """Update PARAMETER_DATA_MODE and DATA_MODE to D for DOXY while preserving secondary profiles."""
+    """Update PARAMETER_DATA_MODE and DATA_MODE to D for DOXY while ensuring non-'D' profiles remain clean."""
     n_prof = ds.dimensions["N_PROF"].size
     params = ds.variables["STATION_PARAMETERS"][:]
     pdm = ds.variables["PARAMETER_DATA_MODE"][:]
@@ -539,11 +541,11 @@ def write_parameter_data_mode_doxy(ds, profile_idx, mode_char="D"):
                     elif pdm.ndim == 1:
                         pdm[doxy_idx] = mode_char
             else:
-                # Ensure secondary profile parameter mode doesn't conflict with its DATA_MODE
-                if data_mode[iprof] != 'D':
-                    for doxy_idx in doxy_indices:
-                        if pdm.ndim == 2 and pdm[iprof, doxy_idx] == 'D':
-                            pdm[iprof, doxy_idx] = 'R'
+                # If secondary profile is marked 'D', ensure parameters are not marked 'R'
+                if data_mode[iprof] == 'D':
+                    for j, s in enumerate(param_strings):
+                        if s and pdm[iprof, j] == 'R':
+                            pdm[iprof, j] = 'A'
 
     ds.variables["PARAMETER_DATA_MODE"][:] = pdm
     ds.variables["DATA_MODE"][:] = data_mode
@@ -666,9 +668,10 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
             data_mode = ds.variables["DATA_MODE"][:]
             for iprof in range(n_prof):
                 if iprof != profile_idx and data_mode[iprof] == 'R':
-                    clean_fill_vals = np.ma.masked_values(np.full(n_levels, 99999.0, dtype='float32'), 99999.0)
+                    prof_levels = ds.variables["PRES"].shape[0]
+                    clean_fill_vals = np.ma.masked_values(np.full(prof_levels, 99999.0, dtype='float32'), 99999.0)
                     ds.variables["DOXY_ADJUSTED"][:, iprof] = clean_fill_vals
-                    ds.variables["DOXY_ADJUSTED_QC"][:, iprof] = nc.stringtochar(np.full(n_levels, ' ', dtype='S1'))
+                    ds.variables["DOXY_ADJUSTED_QC"][:, iprof] = nc.stringtochar(np.full(prof_levels, ' ', dtype='S1'))
                     if "DOXY_ADJUSTED_ERROR" in var_names:
                         ds.variables["DOXY_ADJUSTED_ERROR"][:, iprof] = clean_fill_vals
         else:
