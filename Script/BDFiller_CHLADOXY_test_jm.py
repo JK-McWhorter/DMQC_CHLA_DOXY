@@ -21,20 +21,27 @@ import netCDF4 as nc
 import numpy as np
 import pandas as pd
 
-# List of WMO Float IDs to process
-WMO_FLOAT_IDS = [
-    4903622,
-    2904010,
-    2904011,
-    4903624,
-    4903625,
-    4903904,
-    6999992,
-    7902327,
-    3902693,
-    1902800,
-    7901009,
-]
+# Mapping of WMO Float IDs to instrument types
+# FLOAT_TYPES = {
+    # 4903622: "aoml_apex",
+    # 2904010: "aoml_apex",
+    # 2904011: "aoml_apex",
+    # 4903624: "aoml_apex",
+    # 4903625: "aoml_apex",
+    # 4903904: "aoml_navis",
+    # 6999992: "aoml_navis",
+    # 7902327: "aoml_navis",
+    # 3902693: "aoml_apex",
+    # 1902800: "aoml_apex",
+    # 7901009: "aoml_navis",
+# }
+
+FLOAT_TYPES = {
+    1902800: "aoml_apex",
+}
+
+# Derived list of WMO Float IDs to process
+WMO_FLOAT_IDS = list(FLOAT_TYPES.keys())
 
 # Common Configuration Defaults
 comment_dmqc_operator_chla = "PRIMARY | https://orcid.org/0009-0006-7862-6267 | Brandon Navarro, NOAA/AOML;"
@@ -135,18 +142,38 @@ def write_history_chla(bgc_file, iprof_idx):
     )
 
 
-def write_parameter_data_mode_chla(bgc_file, iprof_idx):
-    """Set PARAMETER_DATA_MODE to D for CHLA."""
-    ParameterList = bgc_file.variables["STATION_PARAMETERS"][iprof_idx].data.astype(str)
-    PDMarray = bgc_file.variables["PARAMETER_DATA_MODE"][iprof_idx, :]
+def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
+    """
+    Set PARAMETER_DATA_MODE to D for CHLA and ensure consistency across
+    all N_PROF entries to avoid DATA_MODE vs PARAMETER_DATA_MODE mismatches.
+    """
+    n_prof = bgc_file.dimensions["N_PROF"].size
+    n_param = bgc_file.dimensions["N_PARAM"].size
 
-    for j in range(bgc_file.dimensions["N_PARAM"].size):
-        PARAMstr = ''.join(ParameterList[j])
-        if PARAMstr[:4] == "CHLA":
-            PDMarray[j] = parameter_data_mode
+    pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
+    data_mode = bgc_file.variables["DATA_MODE"][:]
 
-    bgc_file.variables["PARAMETER_DATA_MODE"][iprof_idx, :] = PDMarray
-    bgc_file.variables["DATA_MODE"][iprof_idx] = 'D'
+    for iprof in range(n_prof):
+        param_mat = bgc_file.variables["STATION_PARAMETERS"][iprof]
+        if isinstance(param_mat, np.ma.MaskedArray):
+            param_mat = param_mat.filled(b' ')
+
+        for j in range(n_param):
+            param_str = "".join([c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c) for c in param_mat[j]]).strip()
+            if param_str.startswith("CHLA"):
+                pdm[iprof, j] = parameter_data_mode
+
+        if iprof == iprof_idx:
+            data_mode[iprof] = 'D'
+
+        if data_mode[iprof] == 'D':
+            for j in range(n_param):
+                param_str = "".join([c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c) for c in param_mat[j]]).strip()
+                if param_str and pdm[iprof, j] == 'R':
+                    pdm[iprof, j] = 'A'
+
+    bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
+    bgc_file.variables["DATA_MODE"][:] = data_mode
 
 
 def get_profile_qc_grade(qc_masked_array):
@@ -158,6 +185,8 @@ def get_profile_qc_grade(qc_masked_array):
 
     valid_qcs = []
     for q in unmasked_vals:
+        if isinstance(q, np.ma.core.MaskedConstant) or q is np.ma.masked:
+            continue
         s = q.decode('utf-8').strip() if isinstance(q, bytes) else str(q).strip()
         if s != '' and s != '9':
             valid_qcs.append(s)
@@ -487,10 +516,18 @@ def write_parameter_data_mode_doxy(ds, profile_idx, mode_char="D"):
 
     if params.ndim == 3:
         prof_params = params[profile_idx, :, :]
-        param_strings = [
-            "".join([c.decode("utf-8", errors="ignore") for c in row]).strip()
-            for row in prof_params
-        ]
+        if isinstance(prof_params, np.ma.MaskedArray):
+            prof_params = prof_params.filled(b' ')
+
+        param_strings = []
+        for row in prof_params:
+            row_chars = []
+            for c in row:
+                if isinstance(c, bytes):
+                    row_chars.append(c.decode("utf-8", errors="ignore"))
+                else:
+                    row_chars.append(str(c))
+            param_strings.append("".join(row_chars).strip())
 
         doxy_indices = [idx for idx, s in enumerate(param_strings) if s.startswith("DOXY")]
         for doxy_idx in doxy_indices:
@@ -527,10 +564,14 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
         params = ds.variables["STATION_PARAMETERS"][:]
         if params.ndim == 3:
             prof_params = params[profile_idx, :, :]
-            param_strings = [
-                "".join([c.decode("utf-8", errors="ignore") for c in row]).strip()
-                for row in prof_params
-            ]
+            if isinstance(prof_params, np.ma.MaskedArray):
+                prof_params = prof_params.filled(b' ')
+
+            param_strings = []
+            for row in prof_params:
+                row_chars = [c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c) for c in row]
+                param_strings.append("".join(row_chars).strip())
+
             doxy_indices = [idx for idx, s in enumerate(param_strings) if s.startswith("DOXY")]
 
             if doxy_indices:
@@ -553,54 +594,84 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
 
 
 def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
-    """Populate DOXY, DOXY_ADJUSTED, and QC variables from CSV."""
+    """
+    Populate DOXY, DOXY_ADJUSTED (from DOXY_FINAL), and QC variables (from DOXY_FINAL_QC).
+    """
     var_names = ds.variables.keys()
     pres_nc_full = ds.variables["PRES"][:]
     pres_nc = pres_nc_full[:, profile_idx] if pres_nc_full.ndim > 1 else pres_nc_full
 
-    cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)]
+    n_levels = len(pres_nc)
+    cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)].copy()
 
     if cycle_df.empty:
         print(f"Warning: No matching CSV rows found for cycle {target_cycle}")
         doxy_adj = ds.variables["DOXY_ADJUSTED"][:] if "DOXY_ADJUSTED" in var_names else ds.variables["DOXY"][:]
         return doxy_adj[:, profile_idx] if doxy_adj.ndim > 1 else doxy_adj
 
-    doxy_full = ds.variables["DOXY"][:]
-    doxy_vector = doxy_full[:, profile_idx].copy() if doxy_full.ndim > 1 else doxy_full.copy()
+    # Initialize target vectors with standard fill values
+    doxy_vector = np.full(n_levels, 99999.0, dtype='float32')
+    doxy_adj_vector = np.full(n_levels, 99999.0, dtype='float32')
+    doxy_qc = np.full(n_levels, '9', dtype='U1')
+    doxy_adj_qc = np.full(n_levels, '9', dtype='U1')
 
-    if "DOXY_ADJUSTED" in var_names:
-        doxy_adj_full = ds.variables["DOXY_ADJUSTED"][:]
-        doxy_adj_vector = doxy_adj_full[:, profile_idx].copy() if doxy_adj_full.ndim > 1 else doxy_adj_full.copy()
-    else:
-        doxy_adj_vector = doxy_vector.copy()
-
-    doxy_adj_qc = np.full(len(doxy_adj_vector), " ", dtype="U1")
-
-    for i, p_val in enumerate(pres_nc):
+    for i in range(n_levels):
+        p_val = pres_nc[i]
         if np.isnan(p_val) or np.ma.is_masked(p_val):
             continue
 
-        matches = cycle_df[np.abs(cycle_df["PRES"] - p_val) < 0.01]
+        # Match CSV depth level by pressure
+        matches = cycle_df[np.isclose(cycle_df["PRES"].astype(float), float(p_val), atol=0.05)]
         if not matches.empty:
             row = matches.iloc[0]
-            doxy_vector[i] = row["DOXY"]
-            doxy_adj_vector[i] = row["DOXY_FINAL"]
-            doxy_adj_qc[i] = str(row["DOXY_FINAL_QC"])
 
-    doxy_qc = np.full(len(doxy_vector), " ", dtype="U1")
-    valid_mask = ~np.isnan(doxy_vector) & ~np.ma.is_masked(doxy_vector)
-    doxy_qc[valid_mask] = "1"
+            # Populate raw DOXY and DOXY QC
+            if pd.notna(row.get("DOXY")):
+                doxy_vector[i] = np.float32(row["DOXY"])
+                doxy_qc[i] = '1'
 
-    if doxy_full.ndim > 1:
-        ds.variables["DOXY"][:, profile_idx] = doxy_vector
-        ds.variables["DOXY_ADJUSTED"][:, profile_idx] = doxy_adj_vector
-        ds.variables["DOXY_QC"][:, profile_idx] = nc.stringtochar(doxy_qc.astype("S1"))
-        ds.variables["DOXY_ADJUSTED_QC"][:, profile_idx] = nc.stringtochar(doxy_adj_qc.astype("S1"))
-    else:
-        ds.variables["DOXY"][:] = doxy_vector
-        ds.variables["DOXY_ADJUSTED"][:] = doxy_adj_vector
-        ds.variables["DOXY_QC"][:] = nc.stringtochar(doxy_qc.astype("S1"))
-        ds.variables["DOXY_ADJUSTED_QC"][:] = nc.stringtochar(doxy_adj_qc.astype("S1"))
+            # Populate DOXY_ADJUSTED from DOXY_FINAL
+            raw_doxy_final = row.get("DOXY_FINAL")
+            if pd.notna(raw_doxy_final) and raw_doxy_final != 99999.0:
+                doxy_adj_vector[i] = np.float32(raw_doxy_final)
+
+            # Populate DOXY_ADJUSTED_QC from DOXY_FINAL_QC
+            raw_qc = row.get("DOXY_FINAL_QC")
+            if pd.notna(raw_qc):
+                doxy_adj_qc[i] = str(int(raw_qc))
+
+    # Convert numeric outputs to masked arrays (masking fill_value 99999.0)
+    doxy_vector_ma = np.ma.masked_values(doxy_vector, 99999.0)
+    doxy_adj_vector_ma = np.ma.masked_values(doxy_adj_vector, 99999.0)
+
+    if doxy_full_dim := ("DOXY" in var_names):
+        doxy_full = ds.variables["DOXY"][:]
+        if doxy_full.ndim > 1:
+            ds.variables["DOXY"][:, profile_idx] = doxy_vector_ma
+            ds.variables["DOXY_QC"][:, profile_idx] = nc.stringtochar(doxy_qc.astype("S1"))
+        else:
+            ds.variables["DOXY"][:] = doxy_vector_ma
+            ds.variables["DOXY_QC"][:] = nc.stringtochar(doxy_qc.astype("S1"))
+
+    if "DOXY_ADJUSTED" in var_names:
+        doxy_adj_full = ds.variables["DOXY_ADJUSTED"][:]
+        if doxy_adj_full.ndim > 1:
+            ds.variables["DOXY_ADJUSTED"][:, profile_idx] = doxy_adj_vector_ma
+            ds.variables["DOXY_ADJUSTED_QC"][:, profile_idx] = nc.stringtochar(doxy_adj_qc.astype("S1"))
+
+            # Fill secondary profiles (N_PROF > 1) with '9' to satisfy Argo NetCDF specs
+            n_prof = ds.dimensions["N_PROF"].size
+            for iprof in range(n_prof):
+                if iprof != profile_idx:
+                    adj_qc_prof = ds.variables["DOXY_ADJUSTED_QC"][:, iprof]
+                    if hasattr(adj_qc_prof, 'filled'):
+                        adj_qc_prof = adj_qc_prof.filled(b' ')
+                    qc_chars = [c.decode('utf-8', errors='ignore') if isinstance(c, bytes) else str(c) for c in adj_qc_prof]
+                    fixed_qc = np.array(['9' if (c in [' ', '']) else c for c in qc_chars], dtype='S1')
+                    ds.variables["DOXY_ADJUSTED_QC"][:, iprof] = nc.stringtochar(fixed_qc)
+        else:
+            ds.variables["DOXY_ADJUSTED"][:] = doxy_adj_vector_ma
+            ds.variables["DOXY_ADJUSTED_QC"][:] = nc.stringtochar(doxy_adj_qc.astype("S1"))
 
     return doxy_adj_vector
 
@@ -729,7 +800,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
         float_df = csv_data[csv_data["FLOAT_NUM"] == floatid]
 
         try:
-            inst_float = "aoml_apex"
+            inst_float = FLOAT_TYPES.get(floatid, "aoml_apex")
             profile_DOXY_qc = "A"
 
             if inst_float == "aoml_apex":
@@ -762,7 +833,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                     continue
 
                 bgc_filename = matched_files[0]
-                print(f"Processing DOXY for Cycle {target_cycle}: {os.path.basename(bgc_filename)}")
+                print(f"Processing DOXY for Cycle {target_cycle} ({inst_float.upper()}): {os.path.basename(bgc_filename)}")
 
                 w_bgc_filename = create_working_doxy_bd_file(bgc_filename, final_doxy_out_dir)
 
