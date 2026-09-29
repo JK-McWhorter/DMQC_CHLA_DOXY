@@ -824,18 +824,44 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
 
 
 def write_DOXY_adjusted_error(
-    ds, profile_idx, err_mbar, psal, temp, pres, dens, doxy_adj
+    ds, profile_idx, err_mbar, pres_phys, dens_phys, pres_bgc, doxy_adj
 ):
-  """Calculate and assign DOXY_ADJUSTED_ERROR in µmol/kg."""
+  """Calculate and assign DOXY_ADJUSTED_ERROR in µmol/kg aligned strictly to BGC PRES levels."""
   print(f"[DEBUG] Substep 6: Calculating and writing DOXY_ADJUSTED_ERROR...")
-  valid_idx = ~np.isnan(psal) & ~np.isnan(doxy_adj) & (doxy_adj != 99999.0)
-  doxy_adj_error = np.full(len(psal), 99999.0, dtype="float32")
 
-  err_umol_L = err_mbar * 1.00
-  doxy_adj_error[valid_idx] = err_umol_L
-  doxy_adj_error_umol_kg = (doxy_adj_error * 1000.0) / dens
-  doxy_adj_error_ma = np.ma.masked_values(doxy_adj_error_umol_kg, 99999.0)
+  n_levels = len(pres_bgc)
+  doxy_adj_error_ma = np.ma.masked_all((n_levels,), dtype="float32")
 
+  # 1. Identify valid physical levels for density interpolation
+  valid_phys = ~np.isnan(pres_phys) & ~np.isnan(dens_phys) & (dens_phys > 0)
+
+  if np.any(valid_phys):
+    # Interpolate physical density onto exact BGC pressure levels (pres_bgc)
+    dens_bgc_interp = np.interp(
+        pres_bgc,
+        pres_phys[valid_phys],
+        dens_phys[valid_phys],
+        left=np.nan,
+        right=np.nan,
+    )
+
+    # 2. Identify valid BGC levels matching DOXY_ADJUSTED data
+    valid_bgc = (
+        ~np.isnan(pres_bgc)
+        & ~np.isnan(doxy_adj)
+        & (doxy_adj != 99999.0)
+        & ~np.isnan(dens_bgc_interp)
+        & (dens_bgc_interp > 0)
+    )
+
+    # Convert error: µmol/L -> µmol/kg on BGC pressure grid
+    err_umol_L = err_mbar * 1.00
+    err_umol_kg = (err_umol_L * 1000.0) / dens_bgc_interp
+
+    # Populate valid BGC levels
+    doxy_adj_error_ma[valid_bgc] = err_umol_kg[valid_bgc]
+
+  # 3. Write into NetCDF variable with shape safety
   n_prof = ds.dimensions["N_PROF"].size
   doxy_adj_err_var = ds.variables["DOXY_ADJUSTED_ERROR"]
 
@@ -1076,37 +1102,67 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
           iprof_phys = get_iprof_phys(pres_phys_raw, pres_bgc, iprof_doxy)
 
           # Extract 1D physical arrays safely
-          if phys_data["psal"].ndim > 1:
-            psal_col = phys_data["psal"][iprof_phys, :] if phys_data["psal"].shape[0] > iprof_phys else phys_data["psal"][:, iprof_phys]
+          if pres_phys_raw.ndim > 1:
+            pres_phys_col = pres_phys_raw[iprof_phys, :] if pres_phys_raw.shape[0] > iprof_phys else pres_phys_raw[:, iprof_phys]
           else:
-            psal_col = phys_data["psal"]
+            pres_phys_col = pres_phys_raw
 
-          if phys_data["temp"].ndim > 1:
-            temp_col = phys_data["temp"][iprof_phys, :] if phys_data["temp"].shape[0] > iprof_phys else phys_data["temp"][:, iprof_phys]
+          if phys_data["dens"].ndim > 1:
+            dens_phys_col = phys_data["dens"][iprof_phys, :] if phys_data["dens"].shape[0] > iprof_phys else phys_data["dens"][:, iprof_phys]
           else:
-            temp_col = phys_data["temp"]
+            dens_phys_col = phys_data["dens"]
 
           if pres_bgc.ndim > 1:
             pres_col = pres_bgc[iprof_doxy, :] if pres_bgc.shape[0] > iprof_doxy else pres_bgc[:, iprof_doxy]
           else:
             pres_col = pres_bgc
 
-          if phys_data["dens"].ndim > 1:
-            dens_col = phys_data["dens"][iprof_phys, :] if phys_data["dens"].shape[0] > iprof_phys else phys_data["dens"][:, iprof_phys]
-          else:
-            dens_col = phys_data["dens"]
-
-          # 6. DOXY Error Calculation
+          # 6. DOXY Error Calculation (aligned strictly to pres_col)
           write_DOXY_adjusted_error(
               ds,
               iprof_doxy,
               DOXY_adj_err,
-              psal_col,
-              temp_col,
+              pres_phys_col,
+              dens_phys_col,
               pres_col,
-              dens_col,
               doxy_adjusted,
           )
+
+          # Print DOXY_ADJUSTED and PRES values at index levels 510 and 511 for Cycle 5
+          if target_cycle == 5:
+            doxy_adj_vals = ds.variables["DOXY_ADJUSTED"][:]
+            pres_vals = ds.variables["PRES"][:]
+
+            if doxy_adj_vals.ndim > 1:
+              doxy_adj_prof = (
+                  doxy_adj_vals[iprof_doxy, :]
+                  if doxy_adj_vals.shape[0] > iprof_doxy
+                  else doxy_adj_vals[:, iprof_doxy]
+              )
+            else:
+              doxy_adj_prof = doxy_adj_vals
+
+            if pres_vals.ndim > 1:
+              pres_prof = (
+                  pres_vals[iprof_doxy, :]
+                  if pres_vals.shape[0] > iprof_doxy
+                  else pres_vals[:, iprof_doxy]
+              )
+            else:
+              pres_prof = pres_vals
+
+            print("\n--- Cycle 5 Output Verification (Indices 510 & 511) ---")
+            for idx in [510, 511]:
+              if idx < len(doxy_adj_prof):
+                p_val = pres_prof[idx]
+                doxy_val = doxy_adj_prof[idx]
+                print(f"Index {idx} -> PRES: {p_val}, DOXY_ADJUSTED: {doxy_val}")
+              else:
+                print(
+                    f"Index {idx} is out of bounds for profile length"
+                    f" {len(doxy_adj_prof)}"
+                )
+            print("----------------------------------------------------\n")
 
           ds.close()
 
