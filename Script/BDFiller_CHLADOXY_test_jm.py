@@ -14,7 +14,6 @@ import sys
 import traceback
 from datetime import datetime as dt, timezone
 
-import gsw
 import netCDF4
 import netCDF4 as nc
 import numpy as np
@@ -66,399 +65,399 @@ parameter_data_mode = "D"
 
 
 def create_working_bd_file(filename):
-  """Create a working copy of the B file with a leading 'w_' in the name."""
-  path, name = os.path.split(filename)
-  bd_name = name.replace("BR", "BD")
-  w_filename = os.path.join(path, f"w_{bd_name}")
-  shutil.copyfile(filename, w_filename)
-  return w_filename
+    """Create a working copy of the B file with a leading 'w_' in the name."""
+    path, name = os.path.split(filename)
+    bd_name = name.replace("BR", "BD")
+    w_filename = os.path.join(path, f"w_{bd_name}")
+    shutil.copyfile(filename, w_filename)
+    return w_filename
 
 
 def get_profile_chla(filename):
-  """Extract the profile index from filename, return as int."""
-  profile = filename[-6:-3]
-  return int(profile)
+    """Extract the profile index from filename, return as int."""
+    profile = filename[-6:-3]
+    return int(profile)
 
 
 def organize_b_files(bd_files, br_files):
-  """Sort B*nc files by profile. If both BR and BD exist, prefer BD."""
-  ptr_bd = 0
-  ptr_br = 0
+    """Sort B*nc files by profile. If both BR and BD exist, prefer BD."""
+    ptr_bd = 0
+    ptr_br = 0
 
-  max_br = get_profile_chla(br_files[-1]) if br_files else 0
-  max_bd = get_profile_chla(bd_files[-1]) if bd_files else 0
-  max_prof = max(max_bd, max_br)
+    max_br = get_profile_chla(br_files[-1]) if br_files else 0
+    max_bd = get_profile_chla(bd_files[-1]) if bd_files else 0
+    max_prof = max(max_bd, max_br)
 
-  sorted_b_files = []
-  for idx in range(1, max_prof + 1):
-    file_found = False
-    for ptr in range(ptr_bd, len(bd_files)):
-      if get_profile_chla(bd_files[ptr]) == idx:
-        sorted_b_files.append(bd_files[ptr])
-        ptr_bd = ptr + 1
-        file_found = True
-        break
-    if not file_found:
-      for ptr in range(ptr_br, len(br_files)):
-        if get_profile_chla(br_files[ptr]) == idx:
-          sorted_b_files.append(br_files[ptr])
-          ptr_br = ptr + 1
-          break
-  return sorted_b_files
+    sorted_b_files = []
+    for idx in range(1, max_prof + 1):
+        file_found = False
+        for ptr in range(ptr_bd, len(bd_files)):
+            if get_profile_chla(bd_files[ptr]) == idx:
+                sorted_b_files.append(bd_files[ptr])
+                ptr_bd = ptr + 1
+                file_found = True
+                break
+        if not file_found:
+            for ptr in range(ptr_br, len(br_files)):
+                if get_profile_chla(br_files[ptr]) == idx:
+                    sorted_b_files.append(br_files[ptr])
+                    ptr_br = ptr + 1
+                    break
+    return sorted_b_files
 
 
 def update_history_chla(nc_ds, dct, iprof_idx):
-  """Update HISTORY array entries natively using netCDF4."""
-  hix = nc_ds.dimensions["N_HISTORY"].size
-  for name, value in dct.items():
-    if name in nc_ds.variables:
-      char_len = nc_ds.dimensions[nc_ds[name].dimensions[-1]].size
-      padded_val = str(value).ljust(char_len)[:char_len]
-      nc_ds[name][hix, iprof_idx, :] = nc.stringtochar(
-          np.array(padded_val, dtype=f"S{char_len}")
-      )
+    """Update HISTORY array entries natively using netCDF4."""
+    hix = nc_ds.dimensions["N_HISTORY"].size
+    for name, value in dct.items():
+        if name in nc_ds.variables:
+            char_len = nc_ds.dimensions[nc_ds[name].dimensions[-1]].size
+            padded_val = str(value).ljust(char_len)[:char_len]
+            nc_ds[name][hix, iprof_idx, :] = nc.stringtochar(
+                np.array(padded_val, dtype=f"S{char_len}")
+            )
 
 
 def write_history_chla(bgc_file, iprof_idx):
-  """Write global attributes and HISTORY variables for CHLA."""
-  bgc_file.history = datetime.datetime.utcnow().strftime(
-      "%Y-%m-%dT%H:%M:%SZ creation"
-  )
-  bgc_file.setncattr("comment_dmqc_operator", comment_dmqc_operator_chla)
+    """Write global attributes and HISTORY variables for CHLA."""
+    bgc_file.history = datetime.datetime.utcnow().strftime(
+        "%Y-%m-%dT%H:%M:%SZ creation"
+    )
+    bgc_file.setncattr("comment_dmqc_operator", comment_dmqc_operator_chla)
 
-  history_step = "ARSQ"
-  history_action = "IP"
-  UTCcurrent = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    history_step = "ARSQ"
+    history_action = "IP"
+    UTCcurrent = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
 
-  update_history_chla(
-      bgc_file,
-      {
-          "HISTORY_INSTITUTION": history_institution,
-          "HISTORY_STEP": history_step,
-          "HISTORY_SOFTWARE": history_software_chla,
-          "HISTORY_SOFTWARE_RELEASE": history_software_release_chla,
-          "HISTORY_REFERENCE": history_reference_chla,
-          "HISTORY_DATE": UTCcurrent,
-          "HISTORY_ACTION": history_action,
-          "HISTORY_PARAMETER": history_parameter_chla,
-      },
-      iprof_idx,
-  )
+    update_history_chla(
+        bgc_file,
+        {
+            "HISTORY_INSTITUTION": history_institution,
+            "HISTORY_STEP": history_step,
+            "HISTORY_SOFTWARE": history_software_chla,
+            "HISTORY_SOFTWARE_RELEASE": history_software_release_chla,
+            "HISTORY_REFERENCE": history_reference_chla,
+            "HISTORY_DATE": UTCcurrent,
+            "HISTORY_ACTION": history_action,
+            "HISTORY_PARAMETER": history_parameter_chla,
+        },
+        iprof_idx,
+    )
 
-  bgc_file.variables["DATE_UPDATE"][:] = nc.stringtochar(
-      np.array(UTCcurrent, dtype="S14")
-  )
+    bgc_file.variables["DATE_UPDATE"][:] = nc.stringtochar(
+        np.array(UTCcurrent, dtype="S14")
+    )
 
 
 def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
-  """Set PARAMETER_DATA_MODE and DATA_MODE synchronously across all N_PROF profiles."""
-  n_prof = bgc_file.dimensions["N_PROF"].size
-  n_param = bgc_file.dimensions["N_PARAM"].size
+    """Set PARAMETER_DATA_MODE and DATA_MODE synchronously across all N_PROF profiles."""
+    n_prof = bgc_file.dimensions["N_PROF"].size
+    n_param = bgc_file.dimensions["N_PARAM"].size
 
-  pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
-  data_mode = bgc_file.variables["DATA_MODE"][:]
+    pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
+    data_mode = bgc_file.variables["DATA_MODE"][:]
 
-  for iprof in range(n_prof):
-    param_mat = bgc_file.variables["STATION_PARAMETERS"][iprof]
-    if isinstance(param_mat, np.ma.MaskedArray):
-      param_mat = param_mat.filled(b" ")
+    for iprof in range(n_prof):
+        param_mat = bgc_file.variables["STATION_PARAMETERS"][iprof]
+        if isinstance(param_mat, np.ma.MaskedArray):
+            param_mat = param_mat.filled(b" ")
 
-    if iprof == iprof_idx:
-      data_mode[iprof] = "D"
-      for j in range(n_param):
-        param_str = "".join([
-            c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
-            for c in param_mat[j]
-        ]).strip()
-        if param_str.startswith("CHLA"):
-          pdm[iprof, j] = "D"
-        elif param_str and pdm[iprof, j] == "R":
-          pdm[iprof, j] = "A"
-    else:
-      if data_mode[iprof] == "D":
-        for j in range(n_param):
-          param_str = "".join([
-              c.decode("utf-8", errors="ignore")
-              if isinstance(c, bytes)
-              else str(c)
-              for c in param_mat[j]
-          ]).strip()
-          if param_str and pdm[iprof, j] == "R":
-            pdm[iprof, j] = "A"
+        if iprof == iprof_idx:
+            data_mode[iprof] = "D"
+            for j in range(n_param):
+                param_str = "".join([
+                    c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                    for c in param_mat[j]
+                ]).strip()
+                if param_str.startswith("CHLA"):
+                    pdm[iprof, j] = "D"
+                elif param_str and pdm[iprof, j] == "R":
+                    pdm[iprof, j] = "A"
+        else:
+            if data_mode[iprof] == "D":
+                for j in range(n_param):
+                    param_str = "".join([
+                        c.decode("utf-8", errors="ignore")
+                        if isinstance(c, bytes)
+                        else str(c)
+                        for c in param_mat[j]
+                    ]).strip()
+                    if param_str and pdm[iprof, j] == "R":
+                        pdm[iprof, j] = "A"
 
-  bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
-  bgc_file.variables["DATA_MODE"][:] = data_mode
+    bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
+    bgc_file.variables["DATA_MODE"][:] = data_mode
 
 
 def get_profile_qc_grade(qc_masked_array):
-  """Calculate Argo profile QC letter grade (A-F, Z)."""
-  if hasattr(qc_masked_array, "compressed"):
-    unmasked_vals = qc_masked_array.compressed()
-  else:
-    unmasked_vals = qc_masked_array
+    """Calculate Argo profile QC letter grade (A-F, Z)."""
+    if hasattr(qc_masked_array, "compressed"):
+        unmasked_vals = qc_masked_array.compressed()
+    else:
+        unmasked_vals = qc_masked_array
 
-  valid_qcs = []
-  for q in unmasked_vals:
-    if isinstance(q, np.ma.core.MaskedConstant) or q is np.ma.masked:
-      continue
-    s = q.decode("utf-8").strip() if isinstance(q, bytes) else str(q).strip()
-    if s != "" and s != "9":
-      valid_qcs.append(s)
+    valid_qcs = []
+    for q in unmasked_vals:
+        if isinstance(q, np.ma.core.MaskedConstant) or q is np.ma.masked:
+            continue
+        s = q.decode("utf-8").strip() if isinstance(q, bytes) else str(q).strip()
+        if s != "" and s != "9":
+            valid_qcs.append(s)
 
-  total_points = len(valid_qcs)
-  if total_points == 0:
-    return "Z"
+    total_points = len(valid_qcs)
+    if total_points == 0:
+        return "Z"
 
-  bad_count = sum(1 for q in valid_qcs if q in ["3", "4"])
-  good_count = total_points - bad_count
-  pct_good = (good_count / total_points) * 100.0
+    bad_count = sum(1 for q in valid_qcs if q in ["3", "4"])
+    good_count = total_points - bad_count
+    pct_good = (good_count / total_points) * 100.0
 
-  if pct_good == 100.0:
-    return "A"
-  elif 75.0 <= pct_good < 100.0:
-    return "B"
-  elif 50.0 <= pct_good < 100.0:
-    return "C"
-  elif 25.0 <= pct_good < 50.0:
-    return "D"
-  elif 0.0 < pct_good < 25.0:
-    return "E"
-  else:
-    return "F"
+    if pct_good == 100.0:
+        return "A"
+    elif 75.0 <= pct_good < 100.0:
+        return "B"
+    elif 50.0 <= pct_good < 100.0:
+        return "C"
+    elif 25.0 <= pct_good < 50.0:
+        return "D"
+    elif 0.0 < pct_good < 25.0:
+        return "E"
+    else:
+        return "F"
 
 
 def write_scientific_calib_chla(bgc_file, idx_profile, bio_dmqc_csv_path):
-  """Write SCIENTIFIC_CALIB_* variables for CHLA safely against missing early cycles."""
-  df_bio = pd.read_csv(bio_dmqc_csv_path)
+    """Write SCIENTIFIC_CALIB_* variables for CHLA safely against missing early cycles."""
+    df_bio = pd.read_csv(bio_dmqc_csv_path)
 
-  dark_cols = sorted(
-      [col for col in df_bio.columns if col.startswith("MIN_FLUOCHLA_CYCLE")]
-  )
-  if dark_cols:
-    dark_vals = df_bio[dark_cols].iloc[0].dropna().astype(int).tolist()
-    dark_str = " ".join(map(str, dark_vals)) if dark_vals else "NA"
-  else:
-    dark_str = "NA"
-
-  scale_val = (
-      df_bio["SCALE_CHLA"].iloc[0] if "SCALE_CHLA" in df_bio.columns else "NA"
-  )
-  cycle_df = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
-
-  if not cycle_df.empty and "PHYSIO_RATIO" in cycle_df.columns:
-    physio_val = cycle_df["PHYSIO_RATIO"].iloc[0]
-  else:
-    physio_val = "1"
-
-  calib_coefficient = (
-      f"PRELIM_DARK_CHLA = [{dark_str}], SCALE_CHLA = {scale_val},"
-      f" PHYSIO_RATIO = {physio_val}"
-  )
-  calib_coefficient_flu = (
-      f"PRELIM_DARK_CHLA = [{dark_str}], SCALE_CHLA = {scale_val}"
-  )
-  UTCcurrent = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
-
-  str256_len = bgc_file.dimensions["STRING256"].size
-
-  SciCalComArray_CHLA = np.ma.empty(shape=(str256_len), dtype="|S1")
-  SciCalComArray_CHLA[:] = ""
-  SciCalComArray_CHLA.mask = True
-  SciCalComArray_CHLA[: len(scientific_calibration_comment_CHLA)] = list(
-      scientific_calibration_comment_CHLA
-  )
-
-  SciCalComArray_CHLA_FLU = np.ma.empty(shape=(str256_len), dtype="|S1")
-  SciCalComArray_CHLA_FLU[:] = ""
-  SciCalComArray_CHLA_FLU.mask = True
-  SciCalComArray_CHLA_FLU[: len(scientific_calibration_comment_CHLA_FLU)] = (
-      list(scientific_calibration_comment_CHLA_FLU)
-  )
-
-  SciCalEquArray_CHLA = np.ma.empty(shape=(str256_len), dtype="|S1")
-  SciCalEquArray_CHLA[:] = ""
-  SciCalEquArray_CHLA.mask = True
-  SciCalEquArray_CHLA[: len(scientific_calibration_equation_CHLA)] = list(
-      scientific_calibration_equation_CHLA
-  )
-
-  SciCalCoeArray_CHLA = np.ma.empty(shape=(str256_len), dtype="|S1")
-  SciCalCoeArray_CHLA[:] = ""
-  SciCalCoeArray_CHLA.mask = True
-  SciCalCoeArray_CHLA[: len(calib_coefficient)] = list(calib_coefficient)
-
-  SciCalCoeArray_CHLA_FLU = np.ma.empty(shape=(str256_len), dtype="|S1")
-  SciCalCoeArray_CHLA_FLU[:] = ""
-  SciCalCoeArray_CHLA_FLU.mask = True
-  SciCalCoeArray_CHLA_FLU[: len(calib_coefficient_flu)] = list(
-      calib_coefficient_flu
-  )
-
-  SciCalDateArray = nc.stringtochar(np.array(UTCcurrent, dtype="S14"))
-
-  n_prof_size = bgc_file.dimensions["N_PROF"].size
-  n_param_size = bgc_file.dimensions["N_PARAM"].size
-  chla_found = False
-
-  for iprof_idx in range(n_prof_size):
-    param_list = bgc_file.variables["STATION_PARAMETERS"][iprof_idx].data.astype(
-        str
+    dark_cols = sorted(
+        [col for col in df_bio.columns if col.startswith("MIN_FLUOCHLA_CYCLE")]
     )
-    for j in range(n_param_size):
-      param_str = "".join(param_list[j]).strip()
-      if param_str.startswith("CHLA_F"):
-        bgc_file.variables["SCIENTIFIC_CALIB_COMMENT"][iprof_idx, 0, j, :] = (
-            SciCalComArray_CHLA_FLU
-        )
-        bgc_file.variables["SCIENTIFIC_CALIB_COEFFICIENT"][
-            iprof_idx, 0, j, :
-        ] = SciCalCoeArray_CHLA_FLU
-        bgc_file.variables["SCIENTIFIC_CALIB_DATE"][iprof_idx, 0, j, :] = (
-            SciCalDateArray
-        )
-      elif param_str.startswith("CHLA"):
-        bgc_file.variables["SCIENTIFIC_CALIB_COMMENT"][iprof_idx, 0, j, :] = (
-            SciCalComArray_CHLA
-        )
-        bgc_file.variables["SCIENTIFIC_CALIB_EQUATION"][iprof_idx, 0, j, :] = (
-            SciCalEquArray_CHLA
-        )
-        bgc_file.variables["SCIENTIFIC_CALIB_COEFFICIENT"][
-            iprof_idx, 0, j, :
-        ] = SciCalCoeArray_CHLA
-        bgc_file.variables["SCIENTIFIC_CALIB_DATE"][iprof_idx, 0, j, :] = (
-            SciCalDateArray
-        )
-        chla_found = True
+    if dark_cols:
+        dark_vals = df_bio[dark_cols].iloc[0].dropna().astype(int).tolist()
+        dark_str = " ".join(map(str, dark_vals)) if dark_vals else "NA"
+    else:
+        dark_str = "NA"
 
-  if not chla_found:
-    print(
-        "Warning: CHLA parameter was not found in file for profile cycle"
-        f" {idx_profile}."
+    scale_val = (
+        df_bio["SCALE_CHLA"].iloc[0] if "SCALE_CHLA" in df_bio.columns else "NA"
     )
+    cycle_df = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
+
+    if not cycle_df.empty and "PHYSIO_RATIO" in cycle_df.columns:
+        physio_val = cycle_df["PHYSIO_RATIO"].iloc[0]
+    else:
+        physio_val = "1"
+
+    calib_coefficient = (
+        f"PRELIM_DARK_CHLA = [{dark_str}], SCALE_CHLA = {scale_val},"
+        f" PHYSIO_RATIO = {physio_val}"
+    )
+    calib_coefficient_flu = (
+        f"PRELIM_DARK_CHLA = [{dark_str}], SCALE_CHLA = {scale_val}"
+    )
+    UTCcurrent = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+
+    str256_len = bgc_file.dimensions["STRING256"].size
+
+    SciCalComArray_CHLA = np.ma.empty(shape=(str256_len), dtype="|S1")
+    SciCalComArray_CHLA[:] = ""
+    SciCalComArray_CHLA.mask = True
+    SciCalComArray_CHLA[: len(scientific_calibration_comment_CHLA)] = list(
+        scientific_calibration_comment_CHLA
+    )
+
+    SciCalComArray_CHLA_FLU = np.ma.empty(shape=(str256_len), dtype="|S1")
+    SciCalComArray_CHLA_FLU[:] = ""
+    SciCalComArray_CHLA_FLU.mask = True
+    SciCalComArray_CHLA_FLU[: len(scientific_calibration_comment_CHLA_FLU)] = (
+        list(scientific_calibration_comment_CHLA_FLU)
+    )
+
+    SciCalEquArray_CHLA = np.ma.empty(shape=(str256_len), dtype="|S1")
+    SciCalEquArray_CHLA[:] = ""
+    SciCalEquArray_CHLA.mask = True
+    SciCalEquArray_CHLA[: len(scientific_calibration_equation_CHLA)] = list(
+        scientific_calibration_equation_CHLA
+    )
+
+    SciCalCoeArray_CHLA = np.ma.empty(shape=(str256_len), dtype="|S1")
+    SciCalCoeArray_CHLA[:] = ""
+    SciCalCoeArray_CHLA.mask = True
+    SciCalCoeArray_CHLA[: len(calib_coefficient)] = list(calib_coefficient)
+
+    SciCalCoeArray_CHLA_FLU = np.ma.empty(shape=(str256_len), dtype="|S1")
+    SciCalCoeArray_CHLA_FLU[:] = ""
+    SciCalCoeArray_CHLA_FLU.mask = True
+    SciCalCoeArray_CHLA_FLU[: len(calib_coefficient_flu)] = list(
+        calib_coefficient_flu
+    )
+
+    SciCalDateArray = nc.stringtochar(np.array(UTCcurrent, dtype="S14"))
+
+    n_prof_size = bgc_file.dimensions["N_PROF"].size
+    n_param_size = bgc_file.dimensions["N_PARAM"].size
+    chla_found = False
+
+    for iprof_idx in range(n_prof_size):
+        param_list = bgc_file.variables["STATION_PARAMETERS"][iprof_idx].data.astype(
+            str
+        )
+        for j in range(n_param_size):
+            param_str = "".join(param_list[j]).strip()
+            if param_str.startswith("CHLA_F"):
+                bgc_file.variables["SCIENTIFIC_CALIB_COMMENT"][iprof_idx, 0, j, :] = (
+                    SciCalComArray_CHLA_FLU
+                )
+                bgc_file.variables["SCIENTIFIC_CALIB_COEFFICIENT"][
+                    iprof_idx, 0, j, :
+                ] = SciCalCoeArray_CHLA_FLU
+                bgc_file.variables["SCIENTIFIC_CALIB_DATE"][iprof_idx, 0, j, :] = (
+                    SciCalDateArray
+                )
+            elif param_str.startswith("CHLA"):
+                bgc_file.variables["SCIENTIFIC_CALIB_COMMENT"][iprof_idx, 0, j, :] = (
+                    SciCalComArray_CHLA
+                )
+                bgc_file.variables["SCIENTIFIC_CALIB_EQUATION"][iprof_idx, 0, j, :] = (
+                    SciCalEquArray_CHLA
+                )
+                bgc_file.variables["SCIENTIFIC_CALIB_COEFFICIENT"][
+                    iprof_idx, 0, j, :
+                ] = SciCalCoeArray_CHLA
+                bgc_file.variables["SCIENTIFIC_CALIB_DATE"][iprof_idx, 0, j, :] = (
+                    SciCalDateArray
+                )
+                chla_found = True
+
+    if not chla_found:
+        print(
+            "Warning: CHLA parameter was not found in file for profile cycle"
+            f" {idx_profile}."
+        )
 
 
 def write_chla_BBP_adjusted(
     bgc_file, idx_profile, bio_dmqc_csv_path, iprof_idx=iprof_chla
 ):
-  """Populate CHLA_ADJUSTED and CHLA_FLUORESCENCE_ADJUSTED without value/error mismatches."""
-  df_bio = pd.read_csv(bio_dmqc_csv_path)
-  df_bio = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
+    """Populate CHLA_ADJUSTED and CHLA_FLUORESCENCE_ADJUSTED without value/error mismatches."""
+    df_bio = pd.read_csv(bio_dmqc_csv_path)
+    df_bio = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
 
-  n_levels = bgc_file.dimensions["N_LEVELS"].size
+    n_levels = bgc_file.dimensions["N_LEVELS"].size
 
-  CHLA_Adjusted_Array = np.ma.empty(
-      shape=(n_levels,), fill_value=99999.0, dtype="float32"
-  )
-  CHLA_Adjusted_Array[:] = 99999.0
-  CHLA_Adjusted_Array.mask = True
+    CHLA_Adjusted_Array = np.ma.empty(
+        shape=(n_levels,), fill_value=99999.0, dtype="float32"
+    )
+    CHLA_Adjusted_Array[:] = 99999.0
+    CHLA_Adjusted_Array.mask = True
 
-  CHLA_AdjustedQC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
-  CHLA_AdjustedQC_Array[:] = b"9"
-  CHLA_AdjustedQC_Array.mask = True
+    CHLA_AdjustedQC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
+    CHLA_AdjustedQC_Array[:] = b"9"
+    CHLA_AdjustedQC_Array.mask = True
 
-  CHLA_Adjusted_ERROR_Array = np.ma.empty(
-      shape=(n_levels,), fill_value=99999.0, dtype="float32"
-  )
-  CHLA_Adjusted_ERROR_Array[:] = 99999.0
-  CHLA_Adjusted_ERROR_Array.mask = True
+    CHLA_Adjusted_ERROR_Array = np.ma.empty(
+        shape=(n_levels,), fill_value=99999.0, dtype="float32"
+    )
+    CHLA_Adjusted_ERROR_Array[:] = 99999.0
+    CHLA_Adjusted_ERROR_Array.mask = True
 
-  CHLA_FLUORESCENCE_Adjusted_Array = np.ma.empty(
-      shape=(n_levels,), fill_value=99999.0, dtype="float32"
-  )
-  CHLA_FLUORESCENCE_Adjusted_Array[:] = 99999.0
-  CHLA_FLUORESCENCE_Adjusted_Array.mask = True
+    CHLA_FLUORESCENCE_Adjusted_Array = np.ma.empty(
+        shape=(n_levels,), fill_value=99999.0, dtype="float32"
+    )
+    CHLA_FLUORESCENCE_Adjusted_Array[:] = 99999.0
+    CHLA_FLUORESCENCE_Adjusted_Array.mask = True
 
-  CHLA_FLUORESCENCE_AdjustedQC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
-  CHLA_FLUORESCENCE_AdjustedQC_Array[:] = b"9"
-  CHLA_FLUORESCENCE_AdjustedQC_Array.mask = True
+    CHLA_FLUORESCENCE_AdjustedQC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
+    CHLA_FLUORESCENCE_AdjustedQC_Array[:] = b"9"
+    CHLA_FLUORESCENCE_AdjustedQC_Array.mask = True
 
-  CHLA_FLUORESCENCE_Adjusted_ERROR_Array = np.ma.empty(
-      shape=(n_levels,), fill_value=99999.0, dtype="float32"
-  )
-  CHLA_FLUORESCENCE_Adjusted_ERROR_Array[:] = 99999.0
-  CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask = True
+    CHLA_FLUORESCENCE_Adjusted_ERROR_Array = np.ma.empty(
+        shape=(n_levels,), fill_value=99999.0, dtype="float32"
+    )
+    CHLA_FLUORESCENCE_Adjusted_ERROR_Array[:] = 99999.0
+    CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask = True
 
-  assigned_nc_pres_vals = set()
+    assigned_nc_pres_vals = set()
 
-  for row in range(len(df_bio)):
-    row_data = df_bio.iloc[row]
-    csv_pres = np.float32(row_data["PRES"])
+    for row in range(len(df_bio)):
+        row_data = df_bio.iloc[row]
+        csv_pres = np.float32(row_data["PRES"])
 
-    for i in range(n_levels):
-      nc_pres = np.float32(bgc_file.variables["PRES"][iprof_idx, i])
+        for i in range(n_levels):
+            nc_pres = np.float32(bgc_file.variables["PRES"][iprof_idx, i])
 
-      if nc_pres in assigned_nc_pres_vals:
-        continue
+            if nc_pres in assigned_nc_pres_vals:
+                continue
 
-      if np.isclose(csv_pres, nc_pres, atol=0.05):
-        raw_qc = row_data["CHLA_FINAL_QC"]
-        qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
+            if np.isclose(csv_pres, nc_pres, atol=0.05):
+                raw_qc = row_data["CHLA_FINAL_QC"]
+                qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
 
-        if qc_str in ["4", "9"]:
-          CHLA_Adjusted_Array[i] = 99999.0
-          CHLA_Adjusted_ERROR_Array[i] = 99999.0
-          CHLA_Adjusted_Array.mask[i] = True
-          CHLA_Adjusted_ERROR_Array.mask[i] = True
-        else:
-          CHLA_Adjusted_Array[i] = np.float32(row_data["CHLA_FINAL"])
-          CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
-          CHLA_Adjusted_Array.mask[i] = False
-          CHLA_Adjusted_ERROR_Array.mask[i] = False
+                if qc_str in ["4", "9"]:
+                    CHLA_Adjusted_Array[i] = 99999.0
+                    CHLA_Adjusted_ERROR_Array[i] = 99999.0
+                    CHLA_Adjusted_Array.mask[i] = True
+                    CHLA_Adjusted_ERROR_Array.mask[i] = True
+                else:
+                    CHLA_Adjusted_Array[i] = np.float32(row_data["CHLA_FINAL"])
+                    CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
+                    CHLA_Adjusted_Array.mask[i] = False
+                    CHLA_Adjusted_ERROR_Array.mask[i] = False
 
-        CHLA_AdjustedQC_Array[i] = qc_str.encode("utf-8")
-        CHLA_AdjustedQC_Array.mask[i] = False
+                CHLA_AdjustedQC_Array[i] = qc_str.encode("utf-8")
+                CHLA_AdjustedQC_Array.mask[i] = False
 
-        fluo_val = (
-            row_data["CHLA_FLUORESCENCE"]
-            if "CHLA_FLUORESCENCE" in row_data
-            else np.nan
+                fluo_val = (
+                    row_data["CHLA_FLUORESCENCE"]
+                    if "CHLA_FLUORESCENCE" in row_data
+                    else np.nan
+                )
+                if pd.isna(fluo_val) or fluo_val == 99999.0 or qc_str in ["4", "9"]:
+                    CHLA_FLUORESCENCE_Adjusted_Array[i] = 99999.0
+                    CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = 99999.0
+                    CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = True
+                    CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = True
+                else:
+                    CHLA_FLUORESCENCE_Adjusted_Array[i] = np.float32(fluo_val)
+                    CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = np.float32(
+                        CHLA_Adjusted_ERROR_est
+                    )
+                    CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = False
+                    CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = False
+
+                CHLA_FLUORESCENCE_AdjustedQC_Array[i] = qc_str.encode("utf-8")
+                CHLA_FLUORESCENCE_AdjustedQC_Array.mask[i] = False
+
+                assigned_nc_pres_vals.add(nc_pres)
+                break
+
+    bgc_file.variables["CHLA_ADJUSTED"][iprof_idx] = CHLA_Adjusted_Array
+    bgc_file.variables["CHLA_ADJUSTED_QC"][iprof_idx] = CHLA_AdjustedQC_Array
+    bgc_file.variables["CHLA_ADJUSTED_ERROR"][iprof_idx] = (
+        CHLA_Adjusted_ERROR_Array
+    )
+
+    if "CHLA_FLUORESCENCE_ADJUSTED" in bgc_file.variables:
+        bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED"][iprof_idx] = (
+            CHLA_FLUORESCENCE_Adjusted_Array
         )
-        if pd.isna(fluo_val) or fluo_val == 99999.0 or qc_str in ["4", "9"]:
-          CHLA_FLUORESCENCE_Adjusted_Array[i] = 99999.0
-          CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = 99999.0
-          CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = True
-          CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = True
-        else:
-          CHLA_FLUORESCENCE_Adjusted_Array[i] = np.float32(fluo_val)
-          CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = np.float32(
-              CHLA_Adjusted_ERROR_est
-          )
-          CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = False
-          CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = False
+        bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED_QC"][iprof_idx] = (
+            CHLA_FLUORESCENCE_AdjustedQC_Array
+        )
+        bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED_ERROR"][iprof_idx] = (
+            CHLA_FLUORESCENCE_Adjusted_ERROR_Array
+        )
 
-        CHLA_FLUORESCENCE_AdjustedQC_Array[i] = qc_str.encode("utf-8")
-        CHLA_FLUORESCENCE_AdjustedQC_Array.mask[i] = False
+    profile_chla_qc = get_profile_qc_grade(CHLA_AdjustedQC_Array)
+    if "PROFILE_CHLA_QC" in bgc_file.variables:
+        bgc_file.variables["PROFILE_CHLA_QC"][iprof_idx] = profile_chla_qc
 
-        assigned_nc_pres_vals.add(nc_pres)
-        break
-
-  bgc_file.variables["CHLA_ADJUSTED"][iprof_idx] = CHLA_Adjusted_Array
-  bgc_file.variables["CHLA_ADJUSTED_QC"][iprof_idx] = CHLA_AdjustedQC_Array
-  bgc_file.variables["CHLA_ADJUSTED_ERROR"][iprof_idx] = (
-      CHLA_Adjusted_ERROR_Array
-  )
-
-  if "CHLA_FLUORESCENCE_ADJUSTED" in bgc_file.variables:
-    bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED"][iprof_idx] = (
-        CHLA_FLUORESCENCE_Adjusted_Array
-    )
-    bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED_QC"][iprof_idx] = (
-        CHLA_FLUORESCENCE_AdjustedQC_Array
-    )
-    bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED_ERROR"][iprof_idx] = (
-        CHLA_FLUORESCENCE_Adjusted_ERROR_Array
-    )
-
-  profile_chla_qc = get_profile_qc_grade(CHLA_AdjustedQC_Array)
-  if "PROFILE_CHLA_QC" in bgc_file.variables:
-    bgc_file.variables["PROFILE_CHLA_QC"][iprof_idx] = profile_chla_qc
-
-  if "PROFILE_CHLA_FLUORESCENCE_QC" in bgc_file.variables:
-    profile_fluo_qc = get_profile_qc_grade(CHLA_FLUORESCENCE_AdjustedQC_Array)
-    bgc_file.variables["PROFILE_CHLA_FLUORESCENCE_QC"][iprof_idx] = (
-        profile_fluo_qc
-    )
+    if "PROFILE_CHLA_FLUORESCENCE_QC" in bgc_file.variables:
+        profile_fluo_qc = get_profile_qc_grade(CHLA_FLUORESCENCE_AdjustedQC_Array)
+        bgc_file.variables["PROFILE_CHLA_FLUORESCENCE_QC"][iprof_idx] = (
+            profile_fluo_qc
+        )
 
 
 # ==============================================================================
@@ -466,434 +465,331 @@ def write_chla_BBP_adjusted(
 # ==============================================================================
 
 
-def get_iprof_phys(pres_raw, pres_bgc, target_iprof):
-  """Find column index in physical PRES matching target BGC PRES profile."""
-  print(f"[DEBUG] Executing get_iprof_phys...")
-  iprof_phys = -1
-  target_pres = pres_bgc[target_iprof, :] if pres_bgc.ndim > 1 and pres_bgc.shape[0] > target_iprof else (pres_bgc[:, target_iprof] if pres_bgc.ndim > 1 else pres_bgc)
-  
-  if pres_raw.ndim > 1:
-    num_cols = pres_raw.shape[0] if pres_raw.shape[0] < pres_raw.shape[1] else pres_raw.shape[1]
-  else:
-    num_cols = 1
-
-  for col in range(num_cols):
-    current_pres = pres_raw[col, :] if (pres_raw.ndim > 1 and pres_raw.shape[0] == num_cols) else (pres_raw[:, col] if pres_raw.ndim > 1 else pres_raw)
-    valid_mask = ~np.isnan(current_pres) & ~np.isnan(target_pres)
-    if not np.any(valid_mask):
-      continue
-
-    diff = np.max(np.abs(current_pres[valid_mask] - target_pres[valid_mask]))
-    if diff < 0.1:
-      iprof_phys = col
-      break
-
-  if iprof_phys < 0:
-    iprof_phys = 0  # Safe fallback to profile 0 if precision match fails
-
-  print(f"[DEBUG] Using profile {iprof_phys} of physical file for density.")
-  return iprof_phys
-
-
 def create_working_doxy_bd_file(filename, dest_dir):
-  """Copy file to destination directory as 'w_BD...' working file."""
-  base_name = os.path.basename(filename)
-  bd_name = re.sub(r"^BR", "BD", base_name)
-  w_filename = os.path.join(dest_dir, f"w_{bd_name}")
-  shutil.copyfile(filename, w_filename)
-  return w_filename
-
-
-def get_phys_filename(bgc_filename, base_dir):
-  """Locate matching core physical NetCDF file."""
-  base_name = os.path.basename(bgc_filename)
-  core_phys_name = re.sub(r"^B", "", base_name)
-
-  d_name = re.sub(r"^R", "D", core_phys_name)
-  phys_filename = os.path.join(base_dir, d_name)
-
-  if not os.path.exists(phys_filename):
-    phys_filename = os.path.join(base_dir, "D", d_name)
-
-  if not os.path.exists(phys_filename):
-    r_name = re.sub(r"^D", "R", core_phys_name)
-    phys_filename = os.path.join(base_dir, r_name)
-    if not os.path.exists(phys_filename):
-      phys_filename = os.path.join(base_dir, "R", r_name)
-
-  if not os.path.exists(phys_filename):
-    raise FileNotFoundError(
-        f"No corresponding phys file found for {bgc_filename} in {base_dir}"
-    )
-
-  return phys_filename
-
-
-def get_phys_raw_pres(phys_filename):
-  """Read PRES variable from physical file."""
-  with nc.Dataset(phys_filename, "r") as ds:
-    return ds.variables["PRES"][:]
-
-
-def get_dens(phys_filename, verbose=False):
-  """Calculate potential density (rho) using TEOS-10 GSW."""
-  with nc.Dataset(phys_filename, "r") as ds:
-    var_names = ds.variables.keys()
-
-    temp = (
-        ds.variables["TEMP_ADJUSTED"][:]
-        if "TEMP_ADJUSTED" in var_names
-        else ds.variables["TEMP"][:]
-    )
-    psal = (
-        ds.variables["PSAL_ADJUSTED"][:]
-        if "PSAL_ADJUSTED" in var_names
-        else ds.variables["PSAL"][:]
-    )
-    pres = ds.variables["PRES"][:]
-
-    dens = gsw.rho_t_exact(SA=psal, t=temp, p=pres)
-    return {"dens": dens, "psal": psal, "temp": temp}
+    """Copy file to destination directory as 'w_BD...' working file."""
+    base_name = os.path.basename(filename)
+    bd_name = re.sub(r"^BR", "BD", base_name)
+    w_filename = os.path.join(dest_dir, f"w_{bd_name}")
+    shutil.copyfile(filename, w_filename)
+    return w_filename
 
 
 def update_history_doxy(nc_ds, dct, iprof_idx):
-  """Update HISTORY array entries natively using netCDF4."""
-  hix = nc_ds.dimensions["N_HISTORY"].size
-  for name, value in dct.items():
-    if name in nc_ds.variables:
-      char_len = nc_ds.dimensions[nc_ds[name].dimensions[-1]].size
-      padded_val = str(value).ljust(char_len)[:char_len]
-      nc_ds[name][hix, iprof_idx, :] = nc.stringtochar(
-          np.array(padded_val, dtype=f"S{char_len}")
-      )
+    """Update HISTORY array entries natively using netCDF4."""
+    hix = nc_ds.dimensions["N_HISTORY"].size
+    for name, value in dct.items():
+        if name in nc_ds.variables:
+            char_len = nc_ds.dimensions[nc_ds[name].dimensions[-1]].size
+            padded_val = str(value).ljust(char_len)[:char_len]
+            nc_ds[name][hix, iprof_idx, :] = nc.stringtochar(
+                np.array(padded_val, dtype=f"S{char_len}")
+            )
 
 
 def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
-  """Update global history attributes for DOXY processing."""
-  print(f"[DEBUG] Substep 1: Writing HISTORY metadata for DOXY...")
-  ds.history = datetime.datetime.utcnow().strftime(
-      "%Y-%m-%dT%H:%M:%SZ creation"
-  )
-  ds.setncattr("comment_dmqc_operator", comment_op)
-
-  history_step = "ARSQ"
-  history_action = "IP"
-  history_software = "BITTIG"
-  history_software_release = "2024"
-  history_parameter = "DOXY"
-  UTCcurrent = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
-
-  update_history_doxy(
-      ds,
-      {
-          "HISTORY_INSTITUTION": inst,
-          "HISTORY_STEP": history_step,
-          "HISTORY_SOFTWARE": history_software,
-          "HISTORY_SOFTWARE_RELEASE": history_software_release,
-          "HISTORY_REFERENCE": ref,
-          "HISTORY_DATE": UTCcurrent,
-          "HISTORY_ACTION": history_action,
-          "HISTORY_PARAMETER": history_parameter,
-      },
-      profile_idx,
-  )
-
-  if "DATE_UPDATE" in ds.variables:
-    ds.variables["DATE_UPDATE"][:] = nc.stringtochar(
-        np.array(UTCcurrent, dtype="S14")
+    """Update global history attributes for DOXY processing."""
+    print(f"[DEBUG] Substep 1: Writing HISTORY metadata for DOXY...")
+    ds.history = datetime.datetime.utcnow().strftime(
+        "%Y-%m-%dT%H:%M:%SZ creation"
     )
+    ds.setncattr("comment_dmqc_operator", comment_op)
+
+    history_step = "ARSQ"
+    history_action = "IP"
+    history_software = "BITTIG"
+    history_software_release = "2024"
+    history_parameter = "DOXY"
+    UTCcurrent = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+
+    update_history_doxy(
+        ds,
+        {
+            "HISTORY_INSTITUTION": inst,
+            "HISTORY_STEP": history_step,
+            "HISTORY_SOFTWARE": history_software,
+            "HISTORY_SOFTWARE_RELEASE": history_software_release,
+            "HISTORY_REFERENCE": ref,
+            "HISTORY_DATE": UTCcurrent,
+            "HISTORY_ACTION": history_action,
+            "HISTORY_PARAMETER": history_parameter,
+        },
+        profile_idx,
+    )
+
+    if "DATE_UPDATE" in ds.variables:
+        ds.variables["DATE_UPDATE"][:] = nc.stringtochar(
+            np.array(UTCcurrent, dtype="S14")
+        )
 
 
 def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
-  """Set PARAMETER_DATA_MODE and DATA_MODE synchronously across all N_PROF profiles."""
-  print(f"[DEBUG] Substep 2: Synchronizing PARAMETER_DATA_MODE and DATA_MODE...")
-  n_prof = bgc_file.dimensions["N_PROF"].size
-  n_param = bgc_file.dimensions["N_PARAM"].size
+    """Set PARAMETER_DATA_MODE and DATA_MODE synchronously across all N_PROF profiles."""
+    print(f"[DEBUG] Substep 2: Synchronizing PARAMETER_DATA_MODE and DATA_MODE...")
+    n_prof = bgc_file.dimensions["N_PROF"].size
+    n_param = bgc_file.dimensions["N_PARAM"].size
 
-  pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
-  data_mode = bgc_file.variables["DATA_MODE"][:]
+    pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
+    data_mode = bgc_file.variables["DATA_MODE"][:]
 
-  for iprof in range(n_prof):
-    param_mat = bgc_file.variables["STATION_PARAMETERS"][iprof]
-    if isinstance(param_mat, np.ma.MaskedArray):
-      param_mat = param_mat.filled(b" ")
+    for iprof in range(n_prof):
+        param_mat = bgc_file.variables["STATION_PARAMETERS"][iprof]
+        if isinstance(param_mat, np.ma.MaskedArray):
+            param_mat = param_mat.filled(b" ")
 
-    if iprof == iprof_idx:
-      data_mode[iprof] = "D"
-      for j in range(n_param):
-        param_str = "".join([
-            c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
-            for c in param_mat[j]
-        ]).strip()
-        if param_str.startswith("DOXY"):
-          pdm[iprof, j] = "D"
-        elif param_str and pdm[iprof, j] == "R":
-          pdm[iprof, j] = "A"
-    else:
-      if data_mode[iprof] == "D":
-        for j in range(n_param):
-          param_str = "".join([
-              c.decode("utf-8", errors="ignore")
-              if isinstance(c, bytes)
-              else str(c)
-              for c in param_mat[j]
-          ]).strip()
-          if param_str and pdm[iprof, j] == "R":
-            pdm[iprof, j] = "A"
+        if iprof == iprof_idx:
+            data_mode[iprof] = "D"
+            for j in range(n_param):
+                param_str = "".join([
+                    c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                    for c in param_mat[j]
+                ]).strip()
+                if param_str.startswith("DOXY"):
+                    pdm[iprof, j] = "D"
+                elif param_str and pdm[iprof, j] == "R":
+                    pdm[iprof, j] = "A"
+        else:
+            if data_mode[iprof] == "D":
+                for j in range(n_param):
+                    param_str = "".join([
+                        c.decode("utf-8", errors="ignore")
+                        if isinstance(c, bytes)
+                        else str(c)
+                        for c in param_mat[j]
+                    ]).strip()
+                    if param_str and pdm[iprof, j] == "R":
+                        pdm[iprof, j] = "A"
 
-  bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
-  bgc_file.variables["DATA_MODE"][:] = data_mode
+    bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
+    bgc_file.variables["DATA_MODE"][:] = data_mode
 
 
 def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
-  """Write DOXY slope and drift calibration coefficients using safe dimension handling."""
-  print(f"[DEBUG] Substep 3: Writing DOXY slope & drift coefficients...")
-  cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)]
-  if cycle_df.empty:
-    return
+    """Write DOXY slope and drift calibration coefficients using safe dimension handling."""
+    print(f"[DEBUG] Substep 3: Writing DOXY slope & drift coefficients...")
+    cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)]
+    if cycle_df.empty:
+        return
 
-  slope_val = cycle_df["DOXY_SLOPE"].iloc[0]
-  drift_val = cycle_df["DOXY_DRIFT"].iloc[0]
+    slope_val = cycle_df["DOXY_SLOPE"].iloc[0]
+    drift_val = cycle_df["DOXY_DRIFT"].iloc[0]
 
-  if pd.isna(slope_val) and pd.isna(drift_val):
-    return
+    if pd.isna(slope_val) and pd.isna(drift_val):
+        return
 
-  s_str = "1" if pd.isna(slope_val) else str(slope_val)
-  d_str = "0" if pd.isna(drift_val) else str(drift_val)
-  calib_str = f"m={s_str}, d={d_str}"
+    s_str = "1" if pd.isna(slope_val) else str(slope_val)
+    d_str = "0" if pd.isna(drift_val) else str(drift_val)
+    calib_str = f"m={s_str}, d={d_str}"
 
-  var_names = ds.variables.keys()
+    var_names = ds.variables.keys()
 
-  if "SCIENTIFIC_CALIB_COEFFICIENT" in var_names:
-    calib_var = ds.variables["SCIENTIFIC_CALIB_COEFFICIENT"]
-    station_params = ds.variables["STATION_PARAMETERS"][profile_idx]
+    if "SCIENTIFIC_CALIB_COEFFICIENT" in var_names:
+        calib_var = ds.variables["SCIENTIFIC_CALIB_COEFFICIENT"]
+        station_params = ds.variables["STATION_PARAMETERS"][profile_idx]
 
-    if isinstance(station_params, np.ma.MaskedArray):
-      station_params = station_params.filled(b" ")
+        if isinstance(station_params, np.ma.MaskedArray):
+            station_params = station_params.filled(b" ")
 
-    n_param = ds.dimensions["N_PARAM"].size
-    doxy_idx = -1
+        n_param = ds.dimensions["N_PARAM"].size
+        doxy_idx = -1
 
-    for j in range(n_param):
-      param_str = "".join([
-          c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
-          for c in station_params[j]
-      ]).strip()
-      if param_str.startswith("DOXY"):
-        doxy_idx = j
-        break
+        for j in range(n_param):
+            param_str = "".join([
+                c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                for c in station_params[j]
+            ]).strip()
+            if param_str.startswith("DOXY"):
+                doxy_idx = j
+                break
 
-    if doxy_idx != -1:
-      char_len = calib_var.shape[-1]
-      padded_str = calib_str.ljust(char_len)[:char_len]
+        if doxy_idx != -1:
+            char_len = calib_var.shape[-1]
+            padded_str = calib_str.ljust(char_len)[:char_len]
 
-      if calib_var.ndim == 4:
-        calib_var[profile_idx, 0, doxy_idx, :] = nc.stringtochar(
-            np.array(padded_str, dtype=f"S{char_len}")
-        )
-      elif calib_var.ndim == 3:
-        calib_var[profile_idx, doxy_idx, :] = nc.stringtochar(
-            np.array(padded_str, dtype=f"S{char_len}")
-        )
+            if calib_var.ndim == 4:
+                calib_var[profile_idx, 0, doxy_idx, :] = nc.stringtochar(
+                    np.array(padded_str, dtype=f"S{char_len}")
+                )
+            elif calib_var.ndim == 3:
+                calib_var[profile_idx, doxy_idx, :] = nc.stringtochar(
+                    np.array(padded_str, dtype=f"S{char_len}")
+                )
 
-  if "DOXY_SLOPE" in var_names and not pd.isna(slope_val):
-    ds.variables["DOXY_SLOPE"][:] = slope_val
-  if "DOXY_DRIFT" in var_names and not pd.isna(drift_val):
-    ds.variables["DOXY_DRIFT"][:] = drift_val
+    if "DOXY_SLOPE" in var_names and not pd.isna(slope_val):
+        ds.variables["DOXY_SLOPE"][:] = slope_val
+    if "DOXY_DRIFT" in var_names and not pd.isna(drift_val):
+        ds.variables["DOXY_DRIFT"][:] = drift_val
 
-  print(f"[DEBUG] Updated DOXY Slope/Drift for Cycle {target_cycle}: {calib_str}")
+    print(f"[DEBUG] Updated DOXY Slope/Drift for Cycle {target_cycle}: {calib_str}")
 
 
 def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
-  """Populate DOXY, DOXY_ADJUSTED, and QC variables with safe 2D array indexing."""
-  print(f"[DEBUG] Substep 4: Running write_DOXY_from_csv...")
-  var_names = ds.variables.keys()
-  n_prof = ds.dimensions["N_PROF"].size
-  n_levels = ds.dimensions["N_LEVELS"].size
+    """Populate DOXY, DOXY_ADJUSTED, DOXY_ADJUSTED_ERROR, and QC variables from CSV."""
+    print(f"[DEBUG] Substep 4: Running write_DOXY_from_csv...")
+    var_names = ds.variables.keys()
+    n_prof = ds.dimensions["N_PROF"].size
+    n_levels = ds.dimensions["N_LEVELS"].size
 
-  pres_nc_full = ds.variables["PRES"][:]
-  
-  # Safe 2D PRES extraction
-  if pres_nc_full.ndim > 1:
-    if pres_nc_full.shape[0] == n_prof:
-      pres_nc = pres_nc_full[profile_idx, :]
+    pres_nc_full = ds.variables["PRES"][:]
+
+    # Safe 2D PRES extraction
+    if pres_nc_full.ndim > 1:
+        if pres_nc_full.shape[0] == n_prof:
+            pres_nc = pres_nc_full[profile_idx, :]
+        else:
+            pres_nc = pres_nc_full[:, profile_idx]
     else:
-      pres_nc = pres_nc_full[:, profile_idx]
-  else:
-    pres_nc = pres_nc_full
+        pres_nc = pres_nc_full
 
-  cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)].copy()
+    cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)].copy()
 
-  DOXY_Adjusted_Array = np.ma.empty(
-      shape=(n_levels,), fill_value=99999.0, dtype="float32"
-  )
-  DOXY_Adjusted_Array[:] = 99999.0
-  DOXY_Adjusted_Array.mask = True
-
-  DOXY_AdjustedQC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
-  DOXY_AdjustedQC_Array[:] = b"9"
-  DOXY_AdjustedQC_Array.mask = False
-
-  DOXY_Array = np.ma.empty(
-      shape=(n_levels,), fill_value=99999.0, dtype="float32"
-  )
-  DOXY_Array[:] = 99999.0
-  DOXY_Array.mask = True
-
-  DOXY_QC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
-  DOXY_QC_Array[:] = b"9"
-  DOXY_QC_Array.mask = False
-
-  assigned_nc_pres_vals = set()
-
-  if not cycle_df.empty:
-    for row in range(len(cycle_df)):
-      row_data = cycle_df.iloc[row]
-      csv_pres = np.float32(row_data["PRES"])
-
-      for i in range(n_levels):
-        nc_pres = np.float32(pres_nc[i])
-        if nc_pres in assigned_nc_pres_vals or np.isnan(nc_pres):
-          continue
-
-        if np.isclose(csv_pres, nc_pres, atol=0.05):
-          raw_qc = row_data.get("DOXY_FINAL_QC")
-          qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
-
-          raw_doxy = row_data.get("DOXY")
-          if pd.notna(raw_doxy) and raw_doxy != 99999.0:
-            DOXY_Array[i] = np.float32(raw_doxy)
-            DOXY_Array.mask[i] = False
-            DOXY_QC_Array[i] = b"1"
-
-          raw_doxy_final = row_data.get("DOXY_FINAL")
-          if (
-              pd.isna(raw_doxy_final)
-              or raw_doxy_final == 99999.0
-              or qc_str in ["4", "9"]
-          ):
-            DOXY_Adjusted_Array[i] = 99999.0
-            DOXY_Adjusted_Array.mask[i] = True
-          else:
-            DOXY_Adjusted_Array[i] = np.float32(raw_doxy_final)
-            DOXY_Adjusted_Array.mask[i] = False
-
-          DOXY_AdjustedQC_Array[i] = qc_str.encode("utf-8")
-          assigned_nc_pres_vals.add(nc_pres)
-          break
-
-  # Write target profile with shape safety
-  if "DOXY" in var_names:
-    doxy_var = ds.variables["DOXY"]
-    if doxy_var.ndim > 1:
-      if doxy_var.shape[0] == n_prof:
-        doxy_var[profile_idx, :] = DOXY_Array
-        ds.variables["DOXY_QC"][profile_idx, :] = DOXY_QC_Array
-      else:
-        doxy_var[:, profile_idx] = DOXY_Array
-        ds.variables["DOXY_QC"][:, profile_idx] = DOXY_QC_Array
-    else:
-      doxy_var[:] = DOXY_Array
-      ds.variables["DOXY_QC"][:] = DOXY_QC_Array
-
-  if "DOXY_ADJUSTED" in var_names:
-    doxy_adj_var = ds.variables["DOXY_ADJUSTED"]
-    if doxy_adj_var.ndim > 1:
-      if doxy_adj_var.shape[0] == n_prof:
-        doxy_adj_var[profile_idx, :] = DOXY_Adjusted_Array
-        ds.variables["DOXY_ADJUSTED_QC"][profile_idx, :] = DOXY_AdjustedQC_Array
-      else:
-        doxy_adj_var[:, profile_idx] = DOXY_Adjusted_Array
-        ds.variables["DOXY_ADJUSTED_QC"][:, profile_idx] = DOXY_AdjustedQC_Array
-    else:
-      doxy_adj_var[:] = DOXY_Adjusted_Array
-      ds.variables["DOXY_ADJUSTED_QC"][:] = DOXY_AdjustedQC_Array
-
-  # PROFILE_DOXY_QC grade assignment
-  profile_doxy_qc = get_profile_qc_grade(DOXY_AdjustedQC_Array)
-  if "PROFILE_DOXY_QC" in ds.variables:
-    prof_qc_var = ds.variables["PROFILE_DOXY_QC"]
-    qc_char = nc.stringtochar(np.array(profile_doxy_qc, dtype="S1"))
-    if prof_qc_var.ndim == 1:
-      prof_qc_var[profile_idx] = qc_char
-    elif prof_qc_var.ndim == 2:
-      prof_qc_var[profile_idx, 0] = qc_char
-
-  print(f"[DEBUG] Substep 4 complete for write_DOXY_from_csv.")
-  return DOXY_Adjusted_Array.filled(99999.0)
-
-
-def write_DOXY_adjusted_error(
-    ds, profile_idx, err_mbar, pres_phys, dens_phys, pres_bgc, doxy_adj
-):
-  """Calculate and assign DOXY_ADJUSTED_ERROR in µmol/kg aligned strictly to BGC PRES levels."""
-  print(f"[DEBUG] Substep 6: Calculating and writing DOXY_ADJUSTED_ERROR...")
-
-  n_levels = len(pres_bgc)
-  doxy_adj_error_ma = np.ma.masked_all((n_levels,), dtype="float32")
-
-  # 1. Identify valid physical levels for density interpolation
-  valid_phys = ~np.isnan(pres_phys) & ~np.isnan(dens_phys) & (dens_phys > 0)
-
-  if np.any(valid_phys):
-    # Interpolate physical density onto exact BGC pressure levels (pres_bgc)
-    dens_bgc_interp = np.interp(
-        pres_bgc,
-        pres_phys[valid_phys],
-        dens_phys[valid_phys],
-        left=np.nan,
-        right=np.nan,
+    DOXY_Adjusted_Array = np.ma.empty(
+        shape=(n_levels,), fill_value=99999.0, dtype="float32"
     )
+    DOXY_Adjusted_Array[:] = 99999.0
+    DOXY_Adjusted_Array.mask = True
 
-    # 2. Identify valid BGC levels matching DOXY_ADJUSTED data
-    valid_bgc = (
-        ~np.isnan(pres_bgc)
-        & ~np.isnan(doxy_adj)
-        & (doxy_adj != 99999.0)
-        & ~np.isnan(dens_bgc_interp)
-        & (dens_bgc_interp > 0)
+    DOXY_AdjustedQC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
+    DOXY_AdjustedQC_Array[:] = b"9"
+    DOXY_AdjustedQC_Array.mask = False
+
+    DOXY_Adjusted_Error_Array = np.ma.empty(
+        shape=(n_levels,), fill_value=99999.0, dtype="float32"
     )
+    DOXY_Adjusted_Error_Array[:] = 99999.0
+    DOXY_Adjusted_Error_Array.mask = True
 
-    # Convert error: µmol/L -> µmol/kg on BGC pressure grid
-    err_umol_L = err_mbar * 1.00
-    err_umol_kg = (err_umol_L * 1000.0) / dens_bgc_interp
+    DOXY_Array = np.ma.empty(
+        shape=(n_levels,), fill_value=99999.0, dtype="float32"
+    )
+    DOXY_Array[:] = 99999.0
+    DOXY_Array.mask = True
 
-    # Populate valid BGC levels
-    doxy_adj_error_ma[valid_bgc] = err_umol_kg[valid_bgc]
+    DOXY_QC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
+    DOXY_QC_Array[:] = b"9"
+    DOXY_QC_Array.mask = False
 
-  # 3. Write into NetCDF variable with shape safety
-  n_prof = ds.dimensions["N_PROF"].size
-  doxy_adj_err_var = ds.variables["DOXY_ADJUSTED_ERROR"]
+    assigned_nc_pres_vals = set()
 
-  if doxy_adj_err_var.ndim > 1:
-    if doxy_adj_err_var.shape[0] == n_prof:
-      doxy_adj_err_var[profile_idx, :] = doxy_adj_error_ma
-    else:
-      doxy_adj_err_var[:, profile_idx] = doxy_adj_error_ma
-  else:
-    doxy_adj_err_var[:] = doxy_adj_error_ma
+    if not cycle_df.empty:
+        for row in range(len(cycle_df)):
+            row_data = cycle_df.iloc[row]
+            csv_pres = np.float32(row_data["PRES"])
+
+            for i in range(n_levels):
+                nc_pres = np.float32(pres_nc[i])
+                if nc_pres in assigned_nc_pres_vals or np.isnan(nc_pres):
+                    continue
+
+                if np.isclose(csv_pres, nc_pres, atol=0.05):
+                    raw_qc = row_data.get("DOXY_FINAL_QC")
+                    qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
+
+                    raw_doxy = row_data.get("DOXY")
+                    if pd.notna(raw_doxy) and raw_doxy != 99999.0:
+                        DOXY_Array[i] = np.float32(raw_doxy)
+                        DOXY_Array.mask[i] = False
+                        DOXY_QC_Array[i] = b"1"
+
+                    raw_doxy_final = row_data.get("DOXY_FINAL")
+                    if (
+                        pd.isna(raw_doxy_final)
+                        or raw_doxy_final == 99999.0
+                        or qc_str in ["4", "9"]
+                    ):
+                        DOXY_Adjusted_Array[i] = 99999.0
+                        DOXY_Adjusted_Array.mask[i] = True
+                    else:
+                        DOXY_Adjusted_Array[i] = np.float32(raw_doxy_final)
+                        DOXY_Adjusted_Array.mask[i] = False
+
+                    # Extract DOXY_ADJUSTED_ERROR directly from CSV
+                    raw_doxy_error = row_data.get("DOXY_ADJUSTED_ERROR")
+                    if (
+                        pd.notna(raw_doxy_error)
+                        and raw_doxy_error != 99999.0
+                        and qc_str not in ["4", "9"]
+                    ):
+                        DOXY_Adjusted_Error_Array[i] = np.float32(raw_doxy_error)
+                        DOXY_Adjusted_Error_Array.mask[i] = False
+                    else:
+                        DOXY_Adjusted_Error_Array[i] = 99999.0
+                        DOXY_Adjusted_Error_Array.mask[i] = True
+
+                    DOXY_AdjustedQC_Array[i] = qc_str.encode("utf-8")
+                    assigned_nc_pres_vals.add(nc_pres)
+                    break
+
+    # Write target profile with shape safety
+    if "DOXY" in var_names:
+        doxy_var = ds.variables["DOXY"]
+        if doxy_var.ndim > 1:
+            if doxy_var.shape[0] == n_prof:
+                doxy_var[profile_idx, :] = DOXY_Array
+                ds.variables["DOXY_QC"][profile_idx, :] = DOXY_QC_Array
+            else:
+                doxy_var[:, profile_idx] = DOXY_Array
+                ds.variables["DOXY_QC"][:, profile_idx] = DOXY_QC_Array
+        else:
+            doxy_var[:] = DOXY_Array
+            ds.variables["DOXY_QC"][:] = DOXY_QC_Array
+
+    if "DOXY_ADJUSTED" in var_names:
+        doxy_adj_var = ds.variables["DOXY_ADJUSTED"]
+        if doxy_adj_var.ndim > 1:
+            if doxy_adj_var.shape[0] == n_prof:
+                doxy_adj_var[profile_idx, :] = DOXY_Adjusted_Array
+                ds.variables["DOXY_ADJUSTED_QC"][profile_idx, :] = DOXY_AdjustedQC_Array
+            else:
+                doxy_adj_var[:, profile_idx] = DOXY_Adjusted_Array
+                ds.variables["DOXY_ADJUSTED_QC"][:, profile_idx] = DOXY_AdjustedQC_Array
+        else:
+            doxy_adj_var[:] = DOXY_Adjusted_Array
+            ds.variables["DOXY_ADJUSTED_QC"][:] = DOXY_AdjustedQC_Array
+
+    if "DOXY_ADJUSTED_ERROR" in var_names:
+        doxy_adj_err_var = ds.variables["DOXY_ADJUSTED_ERROR"]
+        if doxy_adj_err_var.ndim > 1:
+            if doxy_adj_err_var.shape[0] == n_prof:
+                doxy_adj_err_var[profile_idx, :] = DOXY_Adjusted_Error_Array
+            else:
+                doxy_adj_err_var[:, profile_idx] = DOXY_Adjusted_Error_Array
+        else:
+            doxy_adj_err_var[:] = DOXY_Adjusted_Error_Array
+
+    # PROFILE_DOXY_QC grade assignment
+    profile_doxy_qc = get_profile_qc_grade(DOXY_AdjustedQC_Array)
+    if "PROFILE_DOXY_QC" in ds.variables:
+        prof_qc_var = ds.variables["PROFILE_DOXY_QC"]
+        qc_char = nc.stringtochar(np.array(profile_doxy_qc, dtype="S1"))
+        if prof_qc_var.ndim == 1:
+            prof_qc_var[profile_idx] = qc_char
+        elif prof_qc_var.ndim == 2:
+            prof_qc_var[profile_idx, 0] = qc_char
+
+    print(f"[DEBUG] Substep 4 complete for write_DOXY_from_csv.")
+    return DOXY_Adjusted_Array.filled(99999.0)
 
 
 def safe_rename(from_file, to_file):
-  """Safely rename file handling Windows/Linux file locks."""
-  gc.collect()
-  try:
-    os.replace(from_file, to_file)
-    print(
-        f"Renamed {os.path.basename(from_file)} to {os.path.basename(to_file)}"
-    )
-  except OSError:
+    """Safely rename file handling Windows/Linux file locks."""
+    gc.collect()
     try:
-      shutil.copyfile(from_file, to_file)
-      os.remove(from_file)
-      print(
-          "Copied and replaced (lock fallback):"
-          f" {os.path.basename(from_file)} -> {os.path.basename(to_file)}"
-      )
-    except Exception as e:
-      print(
-          f"Warning: Failed to rename or copy {from_file} to {to_file}: {e}"
-      )
+        os.replace(from_file, to_file)
+        print(
+            f"Renamed {os.path.basename(from_file)} to {os.path.basename(to_file)}"
+        )
+    except OSError:
+        try:
+            shutil.copyfile(from_file, to_file)
+            os.remove(from_file)
+            print(
+                "Copied and replaced (lock fallback):"
+                f" {os.path.basename(from_file)} -> {os.path.basename(to_file)}"
+            )
+        except Exception as e:
+            print(
+                f"Warning: Failed to rename or copy {from_file} to {to_file}: {e}"
+            )
 
 
 # ==============================================================================
@@ -903,283 +799,253 @@ def safe_rename(from_file, to_file):
 total_floats = len(WMO_FLOAT_IDS)
 
 for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
-  print("\n" + "=" * 70)
-  print(f" PROCESSING WMO FLOAT ID: {WMOfloatid} ({idx_f} of {total_floats})")
-  print("=" * 70)
+    print("\n" + "=" * 70)
+    print(f" PROCESSING WMO FLOAT ID: {WMOfloatid} ({idx_f} of {total_floats})")
+    print("=" * 70)
 
-  float_dir = f"/a1/ARGO_DELAY/DMQC_BGC/data/{WMOfloatid}/"
-  bio_dmqc_csv_path = (
-      f"/a1/ARGO_DELAY/DMQC_BGC/data/csv/CHLA_DOXY_{WMOfloatid}.csv"
-  )
-  output_lut_dir = os.path.join(float_dir, "LUT")
-
-  if not os.path.exists(bio_dmqc_csv_path):
-    print(
-        f"ERROR: CSV file not found at {bio_dmqc_csv_path}. Skipping Float"
-        f" {WMOfloatid}..."
+    float_dir = f"/a1/ARGO_DELAY/DMQC_BGC/data/{WMOfloatid}/"
+    bio_dmqc_csv_path = (
+        f"/a1/ARGO_DELAY/DMQC_BGC/data/csv/CHLA_DOXY_{WMOfloatid}.csv"
     )
-    continue
+    output_lut_dir = os.path.join(float_dir, "LUT")
 
-  if not os.path.exists(float_dir):
-    print(
-        f"ERROR: Float directory not found at {float_dir}. Skipping Float"
-        f" {WMOfloatid}..."
-    )
-    continue
-
-  os.makedirs(output_lut_dir, exist_ok=True)
-
-  # --------------------------------------------------------------------------
-  # STEP 1: CHLA BD Filler
-  # --------------------------------------------------------------------------
-  print(f"\n--- [Float {WMOfloatid}] Step 1: Running CHLA BD Filler ---")
-
-  all_bd_files = sorted(
-      glob.glob(os.path.join(float_dir, f"BD*{WMOfloatid}_*.nc"))
-  )
-  all_br_files = sorted(
-      glob.glob(os.path.join(float_dir, f"AOML_BR*{WMOfloatid}_*.nc"))
-  )
-  if not all_br_files:
-    all_br_files = sorted(
-        glob.glob(os.path.join(float_dir, f"BR*{WMOfloatid}_*.nc"))
-    )
-
-  sorted_b_files = organize_b_files(all_bd_files, all_br_files)
-  print(f"{len(sorted_b_files)} relevant B files found in {float_dir}")
-
-  new_bd_files = []
-
-  for bgc_filename in sorted_b_files:
-    print(f"Processing CHLA for {os.path.basename(bgc_filename)}")
-    idx_profile = int(bgc_filename[-6:-3])
-    w_bgc_filename = create_working_bd_file(bgc_filename)
-
-    try:
-      bgc_file = netCDF4.Dataset(w_bgc_filename, "a")
-
-      write_history_chla(bgc_file, iprof_chla)
-      write_parameter_data_mode_chla(bgc_file, iprof_chla)
-      write_scientific_calib_chla(bgc_file, idx_profile, bio_dmqc_csv_path)
-
-      for i in range(bgc_file.dimensions["N_PROF"].size):
-        if i != iprof_chla:
-          continue
-        bgc_file.variables["DATA_STATE_INDICATOR"][i] = np.ma.array(
-            data_state_indicator, mask=[False, False, True, True], dtype="|S1"
-        )
-
-      write_chla_BBP_adjusted(
-          bgc_file, idx_profile, bio_dmqc_csv_path, iprof_chla
-      )
-
-      bgc_file.close()
-      new_bd_files.append(w_bgc_filename)
-    except Exception as e:
-      print(f"Error processing CHLA for {bgc_filename}: {e}")
-
-  # Move output files into the LUT folder for Step 2
-  for file in new_bd_files:
-    path, name = os.path.split(file)
-    new_name = name.replace("w_AOML_BD", "BD").replace("w_BD", "BD")
-    new_path = os.path.join(output_lut_dir, new_name)
-    safe_rename(file, new_path)
-
-  # --------------------------------------------------------------------------
-  # STEP 2: DOXY BD Filler (Using output from Step 1)
-  # --------------------------------------------------------------------------
-  print(f"\n--- [Float {WMOfloatid}] Step 2: Running DOXY BD Filler ---")
-
-  csv_data = pd.read_csv(bio_dmqc_csv_path)
-
-  req_cols = [
-      "FLOAT_NUM",
-      "CYCLE_NUMBER",
-      "PRES",
-      "DOXY",
-      "DOXY_FINAL",
-      "DOXY_FINAL_QC",
-      "DOXY_SLOPE",
-      "DOXY_DRIFT",
-  ]
-  if not all(col in csv_data.columns for col in req_cols):
-    print(
-        f"Warning: CSV file for float {WMOfloatid} missing required DOXY"
-        " columns. Skipping Step 2..."
-    )
-    continue
-
-  csv_data["CYCLE_NUMBER"] = csv_data["CYCLE_NUMBER"].astype(int)
-  unique_floats = csv_data["FLOAT_NUM"].unique()
-
-  for float_id_raw in unique_floats:
-    floatid = int(float_id_raw)
-    float_df = csv_data[csv_data["FLOAT_NUM"] == floatid]
-
-    try:
-      inst_float = FLOAT_TYPES.get(floatid, "aoml_apex")
-
-      if inst_float == "aoml_apex":
-        comment_dmqc_operator = (
-            "PRIMARY | https://orcid.org/0000-0003-1297-6599 | Jennifer"
-            " McWhorter, NOAA/AOML"
-        )
-        history_institution = "AO"
-        history_reference = "WOA2023"
-        DOXY_adj_err = 2
-        iprof_doxy = 0
-      elif inst_float == "aoml_navis":
-        comment_dmqc_operator = (
-            "PRIMARY | https://orcid.org/0000-0003-1297-6599 | Jennifer"
-            " McWhorter, NOAA/AOML"
-        )
-        history_institution = "AO"
-        history_reference = "WOA2023"
-        DOXY_adj_err = 5
-        iprof_doxy = 0
-
-      today_str = dt.now().strftime("%Y-%m-%d")
-      final_doxy_out_dir = os.path.join(output_lut_dir, today_str)
-      os.makedirs(final_doxy_out_dir, exist_ok=True)
-
-      csv_cycles = sorted(float_df["CYCLE_NUMBER"].unique())
-
-      for target_cycle in csv_cycles:
-        pattern_bd = f"BD*{floatid}_{target_cycle:03d}.nc"
-        pattern_bd_raw = f"BD*{floatid}_{target_cycle}.nc"
-
-        matched_files = glob.glob(
-            os.path.join(output_lut_dir, pattern_bd)
-        ) or glob.glob(os.path.join(output_lut_dir, pattern_bd_raw))
-
-        if not matched_files:
-          print(
-              f"Warning: Cycle {target_cycle} present in CSV, but no matching"
-              f" BD file found in {output_lut_dir}"
-          )
-          continue
-
-        bgc_filename = matched_files[0]
+    if not os.path.exists(bio_dmqc_csv_path):
         print(
-            f"Processing DOXY for Cycle {target_cycle}"
-            f" ({inst_float.upper()}): {os.path.basename(bgc_filename)}"
+            f"ERROR: CSV file not found at {bio_dmqc_csv_path}. Skipping Float"
+            f" {WMOfloatid}..."
+        )
+        continue
+
+    if not os.path.exists(float_dir):
+        print(
+            f"ERROR: Float directory not found at {float_dir}. Skipping Float"
+            f" {WMOfloatid}..."
+        )
+        continue
+
+    os.makedirs(output_lut_dir, exist_ok=True)
+
+    # --------------------------------------------------------------------------
+    # STEP 1: CHLA BD Filler
+    # --------------------------------------------------------------------------
+    print(f"\n--- [Float {WMOfloatid}] Step 1: Running CHLA BD Filler ---")
+
+    all_bd_files = sorted(
+        glob.glob(os.path.join(float_dir, f"BD*{WMOfloatid}_*.nc"))
+    )
+    all_br_files = sorted(
+        glob.glob(os.path.join(float_dir, f"AOML_BR*{WMOfloatid}_*.nc"))
+    )
+    if not all_br_files:
+        all_br_files = sorted(
+            glob.glob(os.path.join(float_dir, f"BR*{WMOfloatid}_*.nc"))
         )
 
-        w_bgc_filename = create_working_doxy_bd_file(
-            bgc_filename, final_doxy_out_dir
-        )
+    sorted_b_files = organize_b_files(all_bd_files, all_br_files)
+    print(f"{len(sorted_b_files)} relevant B files found in {float_dir}")
+
+    new_bd_files = []
+
+    for bgc_filename in sorted_b_files:
+        print(f"Processing CHLA for {os.path.basename(bgc_filename)}")
+        idx_profile = int(bgc_filename[-6:-3])
+        w_bgc_filename = create_working_bd_file(bgc_filename)
 
         try:
-          ds = nc.Dataset(w_bgc_filename, "r+")
+            bgc_file = netCDF4.Dataset(w_bgc_filename, "a")
 
-          # 1. History Metadata
-          write_history_doxy(
-              ds,
-              iprof_doxy,
-              history_institution,
-              history_reference,
-              comment_dmqc_operator,
-          )
+            write_history_chla(bgc_file, iprof_chla)
+            write_parameter_data_mode_chla(bgc_file, iprof_chla)
+            write_scientific_calib_chla(bgc_file, idx_profile, bio_dmqc_csv_path)
 
-          # 2. Synchronize Parameter Data Mode and Station Parameters
-          write_parameter_data_mode_doxy(ds, iprof_idx=iprof_doxy)
-
-          # 3. Write Slope & Drift
-          write_DOXY_slope_drift(ds, iprof_doxy, float_df, target_cycle)
-
-          # 4. Write DOXY values from CSV & Update PROFILE_DOXY_QC
-          doxy_adjusted = write_DOXY_from_csv(
-              ds, iprof_doxy, float_df, target_cycle
-          )
-
-          # 5. Get physical profile density
-          print(f"[DEBUG] Substep 5: Locating core physical file & calculating density...")
-          phys_filename = get_phys_filename(bgc_filename, float_dir)
-          pres_phys_raw = get_phys_raw_pres(phys_filename)
-          phys_data = get_dens(phys_filename)
-
-          pres_bgc = ds.variables["PRES"][:]
-          iprof_phys = get_iprof_phys(pres_phys_raw, pres_bgc, iprof_doxy)
-
-          # Extract 1D physical arrays safely
-          if pres_phys_raw.ndim > 1:
-            pres_phys_col = pres_phys_raw[iprof_phys, :] if pres_phys_raw.shape[0] > iprof_phys else pres_phys_raw[:, iprof_phys]
-          else:
-            pres_phys_col = pres_phys_raw
-
-          if phys_data["dens"].ndim > 1:
-            dens_phys_col = phys_data["dens"][iprof_phys, :] if phys_data["dens"].shape[0] > iprof_phys else phys_data["dens"][:, iprof_phys]
-          else:
-            dens_phys_col = phys_data["dens"]
-
-          if pres_bgc.ndim > 1:
-            pres_col = pres_bgc[iprof_doxy, :] if pres_bgc.shape[0] > iprof_doxy else pres_bgc[:, iprof_doxy]
-          else:
-            pres_col = pres_bgc
-
-          # 6. DOXY Error Calculation (aligned strictly to pres_col)
-          write_DOXY_adjusted_error(
-              ds,
-              iprof_doxy,
-              DOXY_adj_err,
-              pres_phys_col,
-              dens_phys_col,
-              pres_col,
-              doxy_adjusted,
-          )
-
-          # Print DOXY_ADJUSTED and PRES values at index levels 510 and 511 for Cycle 5
-          if target_cycle == 5:
-            doxy_adj_vals = ds.variables["DOXY_ADJUSTED"][:]
-            pres_vals = ds.variables["PRES"][:]
-
-            if doxy_adj_vals.ndim > 1:
-              doxy_adj_prof = (
-                  doxy_adj_vals[iprof_doxy, :]
-                  if doxy_adj_vals.shape[0] > iprof_doxy
-                  else doxy_adj_vals[:, iprof_doxy]
-              )
-            else:
-              doxy_adj_prof = doxy_adj_vals
-
-            if pres_vals.ndim > 1:
-              pres_prof = (
-                  pres_vals[iprof_doxy, :]
-                  if pres_vals.shape[0] > iprof_doxy
-                  else pres_vals[:, iprof_doxy]
-              )
-            else:
-              pres_prof = pres_vals
-
-            print("\n--- Cycle 5 Output Verification (Indices 510 & 511) ---")
-            for idx in [510, 511]:
-              if idx < len(doxy_adj_prof):
-                p_val = pres_prof[idx]
-                doxy_val = doxy_adj_prof[idx]
-                print(f"Index {idx} -> PRES: {p_val}, DOXY_ADJUSTED: {doxy_val}")
-              else:
-                print(
-                    f"Index {idx} is out of bounds for profile length"
-                    f" {len(doxy_adj_prof)}"
+            for i in range(bgc_file.dimensions["N_PROF"].size):
+                if i != iprof_chla:
+                    continue
+                bgc_file.variables["DATA_STATE_INDICATOR"][i] = np.ma.array(
+                    data_state_indicator, mask=[False, False, True, True], dtype="|S1"
                 )
-            print("----------------------------------------------------\n")
 
-          ds.close()
+            write_chla_BBP_adjusted(
+                bgc_file, idx_profile, bio_dmqc_csv_path, iprof_chla
+            )
+
+            bgc_file.close()
+            new_bd_files.append(w_bgc_filename)
+        except Exception as e:
+            print(f"Error processing CHLA for {bgc_filename}: {e}")
+
+    # Move output files into the LUT folder for Step 2
+    for file in new_bd_files:
+        path, name = os.path.split(file)
+        new_name = name.replace("w_AOML_BD", "BD").replace("w_BD", "BD")
+        new_path = os.path.join(output_lut_dir, new_name)
+        safe_rename(file, new_path)
+
+    # --------------------------------------------------------------------------
+    # STEP 2: DOXY BD Filler (Using output from Step 1)
+    # --------------------------------------------------------------------------
+    print(f"\n--- [Float {WMOfloatid}] Step 2: Running DOXY BD Filler ---")
+
+    csv_data = pd.read_csv(bio_dmqc_csv_path)
+
+    req_cols = [
+        "FLOAT_NUM",
+        "CYCLE_NUMBER",
+        "PRES",
+        "DOXY",
+        "DOXY_FINAL",
+        "DOXY_FINAL_QC",
+        "DOXY_SLOPE",
+        "DOXY_DRIFT",
+        "DOXY_ADJUSTED_ERROR",
+    ]
+    if not all(col in csv_data.columns for col in req_cols):
+        print(
+            f"Warning: CSV file for float {WMOfloatid} missing required DOXY"
+            " columns. Skipping Step 2..."
+        )
+        continue
+
+    csv_data["CYCLE_NUMBER"] = csv_data["CYCLE_NUMBER"].astype(int)
+    unique_floats = csv_data["FLOAT_NUM"].unique()
+
+    for float_id_raw in unique_floats:
+        floatid = int(float_id_raw)
+        float_df = csv_data[csv_data["FLOAT_NUM"] == floatid]
+
+        try:
+            inst_float = FLOAT_TYPES.get(floatid, "aoml_apex")
+
+            if inst_float == "aoml_apex":
+                comment_dmqc_operator = (
+                    "PRIMARY | https://orcid.org/0000-0003-1297-6599 | Jennifer"
+                    " McWhorter, NOAA/AOML"
+                )
+                history_institution = "AO"
+                history_reference = "WOA2023"
+                iprof_doxy = 0
+            elif inst_float == "aoml_navis":
+                comment_dmqc_operator = (
+                    "PRIMARY | https://orcid.org/0000-0003-1297-6599 | Jennifer"
+                    " McWhorter, NOAA/AOML"
+                )
+                history_institution = "AO"
+                history_reference = "WOA2023"
+                iprof_doxy = 0
+
+            today_str = dt.now().strftime("%Y-%m-%d")
+            final_doxy_out_dir = os.path.join(output_lut_dir, today_str)
+            os.makedirs(final_doxy_out_dir, exist_ok=True)
+
+            csv_cycles = sorted(float_df["CYCLE_NUMBER"].unique())
+
+            for target_cycle in csv_cycles:
+                pattern_bd = f"BD*{floatid}_{target_cycle:03d}.nc"
+                pattern_bd_raw = f"BD*{floatid}_{target_cycle}.nc"
+
+                matched_files = glob.glob(
+                    os.path.join(output_lut_dir, pattern_bd)
+                ) or glob.glob(os.path.join(output_lut_dir, pattern_bd_raw))
+
+                if not matched_files:
+                    print(
+                        f"Warning: Cycle {target_cycle} present in CSV, but no matching"
+                        f" BD file found in {output_lut_dir}"
+                    )
+                    continue
+
+                bgc_filename = matched_files[0]
+                print(
+                    f"Processing DOXY for Cycle {target_cycle}"
+                    f" ({inst_float.upper()}): {os.path.basename(bgc_filename)}"
+                )
+
+                w_bgc_filename = create_working_doxy_bd_file(
+                    bgc_filename, final_doxy_out_dir
+                )
+
+                try:
+                    ds = nc.Dataset(w_bgc_filename, "r+")
+
+                    # 1. History Metadata
+                    write_history_doxy(
+                        ds,
+                        iprof_doxy,
+                        history_institution,
+                        history_reference,
+                        comment_dmqc_operator,
+                    )
+
+                    # 2. Synchronize Parameter Data Mode and Station Parameters
+                    write_parameter_data_mode_doxy(ds, iprof_idx=iprof_doxy)
+
+                    # 3. Write Slope & Drift
+                    write_DOXY_slope_drift(ds, iprof_doxy, float_df, target_cycle)
+
+                    # 4. Write DOXY values & DOXY_ADJUSTED_ERROR directly from CSV & Update PROFILE_DOXY_QC
+                    doxy_adjusted = write_DOXY_from_csv(
+                        ds, iprof_doxy, float_df, target_cycle
+                    )
+
+                    # Print DOXY_ADJUSTED, PRES, and DOXY_ADJUSTED_ERROR values as a table
+                    doxy_adj_vals = ds.variables["DOXY_ADJUSTED"][:]
+                    doxy_err_vals = ds.variables["DOXY_ADJUSTED_ERROR"][:]
+                    pres_vals = ds.variables["PRES"][:]
+
+                    # Handle 2D arrays to safely extract 1D profile data
+                    if doxy_adj_vals.ndim > 1:
+                        doxy_adj_prof = (
+                            doxy_adj_vals[iprof_doxy, :]
+                            if doxy_adj_vals.shape[0] > iprof_doxy
+                            else doxy_adj_vals[:, iprof_doxy]
+                        )
+                        doxy_err_prof = (
+                            doxy_err_vals[iprof_doxy, :]
+                            if doxy_err_vals.shape[0] > iprof_doxy
+                            else doxy_err_vals[:, iprof_doxy]
+                        )
+                        pres_prof = (
+                            pres_vals[iprof_doxy, :]
+                            if pres_vals.shape[0] > iprof_doxy
+                            else pres_vals[:, iprof_doxy]
+                        )
+                    else:
+                        doxy_adj_prof = doxy_adj_vals
+                        doxy_err_prof = doxy_err_vals
+                        pres_prof = pres_vals
+
+                    # Construct DataFrame
+                    df_output = pd.DataFrame({
+                        "PRES": pres_prof,
+                        "DOXY_ADJUSTED": doxy_adj_prof,
+                        "DOXY_ADJUSTED_ERROR": doxy_err_prof,
+                    })
+
+                    print(f"\n====================================================")
+                    print(f" Summary Table for Float {floatid} | Cycle {target_cycle}")
+                    print(f"====================================================")
+                    
+                    # Print the entire table (or use df_output.dropna() to print only valid measurements)
+                    print(df_output.to_string(index=True))
+                    
+                    print("====================================================\n")
+
+                    ds.close()
+
+                except Exception as e:
+                    print(f"Error updating DOXY in file {w_bgc_filename}: {e}")
+                    traceback.print_exc()
+                    if "ds" in locals() and ds.isopen():
+                        ds.close()
+
+                # Final rename in output directory
+                base_name = os.path.basename(w_bgc_filename)
+                new_name = re.sub(r"^w_BD", "BD", base_name)
+                new_path = os.path.join(final_doxy_out_dir, new_name)
+
+                safe_rename(w_bgc_filename, new_path)
 
         except Exception as e:
-          print(f"Error updating DOXY in file {w_bgc_filename}: {e}")
-          traceback.print_exc()
-          if "ds" in locals() and ds.isopen():
-            ds.close()
-
-        # Final rename in output directory
-        base_name = os.path.basename(w_bgc_filename)
-        new_name = re.sub(r"^w_BD", "BD", base_name)
-        new_path = os.path.join(final_doxy_out_dir, new_name)
-
-        safe_rename(w_bgc_filename, new_path)
-
-    except Exception as e:
-      print(f"Error processing DOXY for Float ID {floatid}: {e}")
+            print(f"Error processing DOXY for Float ID {floatid}: {e}")
 
 print("\nProcessing complete for all WMO Float IDs.")

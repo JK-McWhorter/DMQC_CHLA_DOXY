@@ -165,8 +165,8 @@ write_history <- function(nc, profile_idx, inst, ref, comment_op) {
   hist_data <- list(
     HISTORY_INSTITUTION = inst,
     HISTORY_STEP = "ARSQ",
-    HISTORY_SOFTWARE = "SAGE",
-    HISTORY_SOFTWARE_RELEASE = "2024",
+    HISTORY_SOFTWARE = "BITTIG",
+    HISTORY_SOFTWARE_RELEASE = "2026",
     HISTORY_REFERENCE = ref,
     HISTORY_DATE = format(Sys.time(), "%Y%m%d%H%M%S", tz = "UTC"),
     HISTORY_ACTION = "IP",
