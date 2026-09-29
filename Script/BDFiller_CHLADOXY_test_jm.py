@@ -20,9 +20,21 @@ import numpy as np
 import pandas as pd
 
 
+# Dynamic mapping for Float IDs and Float Types
 FLOAT_TYPES = {
+    4903622: "aoml_apex",
+    2904010: "aoml_apex",
+    2904011: "aoml_apex",
+    4903624: "aoml_apex",
+    4903625: "aoml_apex",
     4903904: "aoml_navis",
+    6999992: "aoml_navis",
+    7902327: "aoml_navis",
+    3902693: "aoml_apex",
+    1902800: "aoml_apex",
+    7901009: "aoml_navis",
 }
+
 # Derived list of WMO Float IDs to process
 WMO_FLOAT_IDS = list(FLOAT_TYPES.keys())
 
@@ -352,9 +364,10 @@ def write_chla_BBP_adjusted(
     CHLA_Adjusted_Array[:] = 99999.0
     CHLA_Adjusted_Array.mask = True
 
+    # Character QC arrays set to mask = False so literal b"9" is written explicitly
     CHLA_AdjustedQC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
     CHLA_AdjustedQC_Array[:] = b"9"
-    CHLA_AdjustedQC_Array.mask = True
+    CHLA_AdjustedQC_Array.mask = False
 
     CHLA_Adjusted_ERROR_Array = np.ma.empty(
         shape=(n_levels,), fill_value=99999.0, dtype="float32"
@@ -368,9 +381,10 @@ def write_chla_BBP_adjusted(
     CHLA_FLUORESCENCE_Adjusted_Array[:] = 99999.0
     CHLA_FLUORESCENCE_Adjusted_Array.mask = True
 
+    # Character QC arrays set to mask = False so literal b"9" is written explicitly
     CHLA_FLUORESCENCE_AdjustedQC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
     CHLA_FLUORESCENCE_AdjustedQC_Array[:] = b"9"
-    CHLA_FLUORESCENCE_AdjustedQC_Array.mask = True
+    CHLA_FLUORESCENCE_AdjustedQC_Array.mask = False
 
     CHLA_FLUORESCENCE_Adjusted_ERROR_Array = np.ma.empty(
         shape=(n_levels,), fill_value=99999.0, dtype="float32"
@@ -458,7 +472,6 @@ def write_chla_BBP_adjusted(
         bgc_file.variables["PROFILE_CHLA_FLUORESCENCE_QC"][iprof_idx] = (
             profile_fluo_qc
         )
-
 
 # ==============================================================================
 # SECTION 3: Helper Functions - DOXY Processing
