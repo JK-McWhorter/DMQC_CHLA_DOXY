@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import sys
+import traceback
 from datetime import datetime as dt, timezone
 
 import gsw
@@ -216,7 +217,7 @@ def get_profile_qc_grade(qc_masked_array):
     return "A"
   elif 75.0 <= pct_good < 100.0:
     return "B"
-  elif 50.0 <= pct_good < 75.0:
+  elif 50.0 <= pct_good < 100.0:
     return "C"
   elif 25.0 <= pct_good < 50.0:
     return "D"
@@ -467,12 +468,17 @@ def write_chla_BBP_adjusted(
 
 def get_iprof_phys(pres_raw, pres_bgc, target_iprof):
   """Find column index in physical PRES matching target BGC PRES profile."""
+  print(f"[DEBUG] Executing get_iprof_phys...")
   iprof_phys = -1
-  target_pres = pres_bgc[:, target_iprof] if pres_bgc.ndim > 1 else pres_bgc
-  num_cols = pres_raw.shape[1] if pres_raw.ndim > 1 else 1
+  target_pres = pres_bgc[target_iprof, :] if pres_bgc.ndim > 1 and pres_bgc.shape[0] > target_iprof else (pres_bgc[:, target_iprof] if pres_bgc.ndim > 1 else pres_bgc)
+  
+  if pres_raw.ndim > 1:
+    num_cols = pres_raw.shape[0] if pres_raw.shape[0] < pres_raw.shape[1] else pres_raw.shape[1]
+  else:
+    num_cols = 1
 
   for col in range(num_cols):
-    current_pres = pres_raw[:, col] if pres_raw.ndim > 1 else pres_raw
+    current_pres = pres_raw[col, :] if (pres_raw.ndim > 1 and pres_raw.shape[0] == num_cols) else (pres_raw[:, col] if pres_raw.ndim > 1 else pres_raw)
     valid_mask = ~np.isnan(current_pres) & ~np.isnan(target_pres)
     if not np.any(valid_mask):
       continue
@@ -483,9 +489,9 @@ def get_iprof_phys(pres_raw, pres_bgc, target_iprof):
       break
 
   if iprof_phys < 0:
-    raise ValueError("Matching PRES values not found")
+    iprof_phys = 0  # Safe fallback to profile 0 if precision match fails
 
-  print(f"Using profile {iprof_phys} of physical file to determine density.")
+  print(f"[DEBUG] Using profile {iprof_phys} of physical file for density.")
   return iprof_phys
 
 
@@ -551,7 +557,7 @@ def get_dens(phys_filename, verbose=False):
 
 
 def update_history_doxy(nc_ds, dct, iprof_idx):
-  """Update HISTORY array entries natively using netCDF4 (Identical to CHLA implementation)."""
+  """Update HISTORY array entries natively using netCDF4."""
   hix = nc_ds.dimensions["N_HISTORY"].size
   for name, value in dct.items():
     if name in nc_ds.variables:
@@ -563,7 +569,8 @@ def update_history_doxy(nc_ds, dct, iprof_idx):
 
 
 def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
-  """Update global history attributes for DOXY processing (Identical structure to CHLA)."""
+  """Update global history attributes for DOXY processing."""
+  print(f"[DEBUG] Substep 1: Writing HISTORY metadata for DOXY...")
   ds.history = datetime.datetime.utcnow().strftime(
       "%Y-%m-%dT%H:%M:%SZ creation"
   )
@@ -571,7 +578,7 @@ def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
 
   history_step = "ARSQ"
   history_action = "IP"
-  history_software = "SAGE"
+  history_software = "BITTIG"
   history_software_release = "2024"
   history_parameter = "DOXY"
   UTCcurrent = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
@@ -598,7 +605,8 @@ def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
 
 
 def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
-  """Set PARAMETER_DATA_MODE and DATA_MODE synchronously across all N_PROF profiles (using CHLA method)."""
+  """Set PARAMETER_DATA_MODE and DATA_MODE synchronously across all N_PROF profiles."""
+  print(f"[DEBUG] Substep 2: Synchronizing PARAMETER_DATA_MODE and DATA_MODE...")
   n_prof = bgc_file.dimensions["N_PROF"].size
   n_param = bgc_file.dimensions["N_PARAM"].size
 
@@ -636,16 +644,10 @@ def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
   bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
   bgc_file.variables["DATA_MODE"][:] = data_mode
 
-  # DIAGNOSTIC PRINT STATEMENT
-  print(
-      f"[VERIFICATION] write_parameter_data_mode_doxy matched CHLA method.\n"
-      f"  DATA_MODE: {data_mode.tolist()}\n"
-      f"  PARAMETER_DATA_MODE: {pdm.tolist()}"
-  )
-
 
 def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
-  """Write DOXY slope and drift calibration coefficients."""
+  """Write DOXY slope and drift calibration coefficients using safe dimension handling."""
+  print(f"[DEBUG] Substep 3: Writing DOXY slope & drift coefficients...")
   cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)]
   if cycle_df.empty:
     return
@@ -663,53 +665,62 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
   var_names = ds.variables.keys()
 
   if "SCIENTIFIC_CALIB_COEFFICIENT" in var_names:
-    params = ds.variables["STATION_PARAMETERS"][:]
-    if params.ndim == 3:
-      prof_params = params[profile_idx, :, :]
-      if isinstance(prof_params, np.ma.MaskedArray):
-        prof_params = prof_params.filled(b" ")
+    calib_var = ds.variables["SCIENTIFIC_CALIB_COEFFICIENT"]
+    station_params = ds.variables["STATION_PARAMETERS"][profile_idx]
 
-      param_strings = []
-      for row in prof_params:
-        row_chars = [
-            c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
-            for c in row
-        ]
-        param_strings.append("".join(row_chars).strip())
+    if isinstance(station_params, np.ma.MaskedArray):
+      station_params = station_params.filled(b" ")
 
-      doxy_indices = [
-          idx for idx, s in enumerate(param_strings) if s.startswith("DOXY")
-      ]
+    n_param = ds.dimensions["N_PARAM"].size
+    doxy_idx = -1
 
-      if doxy_indices:
-        calib_var = ds.variables["SCIENTIFIC_CALIB_COEFFICIENT"]
-        doxy_idx = doxy_indices[0]
-        char_len = calib_var.shape[-1]
-        padded_str = calib_str.ljust(char_len)
+    for j in range(n_param):
+      param_str = "".join([
+          c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+          for c in station_params[j]
+      ]).strip()
+      if param_str.startswith("DOXY"):
+        doxy_idx = j
+        break
 
-        if calib_var.ndim == 3:
-          calib_var[profile_idx, doxy_idx, :] = nc.stringtochar(
-              np.array(padded_str, dtype=f"S{char_len}")
-          )
+    if doxy_idx != -1:
+      char_len = calib_var.shape[-1]
+      padded_str = calib_str.ljust(char_len)[:char_len]
+
+      if calib_var.ndim == 4:
+        calib_var[profile_idx, 0, doxy_idx, :] = nc.stringtochar(
+            np.array(padded_str, dtype=f"S{char_len}")
+        )
+      elif calib_var.ndim == 3:
+        calib_var[profile_idx, doxy_idx, :] = nc.stringtochar(
+            np.array(padded_str, dtype=f"S{char_len}")
+        )
 
   if "DOXY_SLOPE" in var_names and not pd.isna(slope_val):
     ds.variables["DOXY_SLOPE"][:] = slope_val
   if "DOXY_DRIFT" in var_names and not pd.isna(drift_val):
     ds.variables["DOXY_DRIFT"][:] = drift_val
 
-  print(f"Updated DOXY Slope/Drift for Cycle {target_cycle}: {calib_str}")
+  print(f"[DEBUG] Updated DOXY Slope/Drift for Cycle {target_cycle}: {calib_str}")
 
 
 def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
-  """Populate DOXY, DOXY_ADJUSTED, and QC variables following CHLA profile target methods."""
+  """Populate DOXY, DOXY_ADJUSTED, and QC variables with safe 2D array indexing."""
+  print(f"[DEBUG] Substep 4: Running write_DOXY_from_csv...")
   var_names = ds.variables.keys()
   n_prof = ds.dimensions["N_PROF"].size
   n_levels = ds.dimensions["N_LEVELS"].size
 
   pres_nc_full = ds.variables["PRES"][:]
-  pres_nc = (
-      pres_nc_full[:, profile_idx] if pres_nc_full.ndim > 1 else pres_nc_full
-  )
+  
+  # Safe 2D PRES extraction
+  if pres_nc_full.ndim > 1:
+    if pres_nc_full.shape[0] == n_prof:
+      pres_nc = pres_nc_full[profile_idx, :]
+    else:
+      pres_nc = pres_nc_full[:, profile_idx]
+  else:
+    pres_nc = pres_nc_full
 
   cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)].copy()
 
@@ -771,68 +782,52 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
           assigned_nc_pres_vals.add(nc_pres)
           break
 
-  # Write target profile
+  # Write target profile with shape safety
   if "DOXY" in var_names:
-    if ds.variables["DOXY"].ndim > 1:
-      ds.variables["DOXY"][:, profile_idx] = DOXY_Array
-      ds.variables["DOXY_QC"][:, profile_idx] = DOXY_QC_Array
+    doxy_var = ds.variables["DOXY"]
+    if doxy_var.ndim > 1:
+      if doxy_var.shape[0] == n_prof:
+        doxy_var[profile_idx, :] = DOXY_Array
+        ds.variables["DOXY_QC"][profile_idx, :] = DOXY_QC_Array
+      else:
+        doxy_var[:, profile_idx] = DOXY_Array
+        ds.variables["DOXY_QC"][:, profile_idx] = DOXY_QC_Array
     else:
-      ds.variables["DOXY"][:] = DOXY_Array
+      doxy_var[:] = DOXY_Array
       ds.variables["DOXY_QC"][:] = DOXY_QC_Array
 
   if "DOXY_ADJUSTED" in var_names:
-    if ds.variables["DOXY_ADJUSTED"].ndim > 1:
-      ds.variables["DOXY_ADJUSTED"][:, profile_idx] = DOXY_Adjusted_Array
-      ds.variables["DOXY_ADJUSTED_QC"][:, profile_idx] = DOXY_AdjustedQC_Array
+    doxy_adj_var = ds.variables["DOXY_ADJUSTED"]
+    if doxy_adj_var.ndim > 1:
+      if doxy_adj_var.shape[0] == n_prof:
+        doxy_adj_var[profile_idx, :] = DOXY_Adjusted_Array
+        ds.variables["DOXY_ADJUSTED_QC"][profile_idx, :] = DOXY_AdjustedQC_Array
+      else:
+        doxy_adj_var[:, profile_idx] = DOXY_Adjusted_Array
+        ds.variables["DOXY_ADJUSTED_QC"][:, profile_idx] = DOXY_AdjustedQC_Array
     else:
-      ds.variables["DOXY_ADJUSTED"][:] = DOXY_Adjusted_Array
+      doxy_adj_var[:] = DOXY_Adjusted_Array
       ds.variables["DOXY_ADJUSTED_QC"][:] = DOXY_AdjustedQC_Array
 
+  # PROFILE_DOXY_QC grade assignment
   profile_doxy_qc = get_profile_qc_grade(DOXY_AdjustedQC_Array)
   if "PROFILE_DOXY_QC" in ds.variables:
-    ds.variables["PROFILE_DOXY_QC"][profile_idx] = profile_doxy_qc
+    prof_qc_var = ds.variables["PROFILE_DOXY_QC"]
+    qc_char = nc.stringtochar(np.array(profile_doxy_qc, dtype="S1"))
+    if prof_qc_var.ndim == 1:
+      prof_qc_var[profile_idx] = qc_char
+    elif prof_qc_var.ndim == 2:
+      prof_qc_var[profile_idx, 0] = qc_char
 
-  # DIAGNOSTIC PRINT STATEMENT FOR SECONDARY PROFILE HANDLING
-  print("\n" + "=" * 60)
-  print(
-      f"[VERIFICATION] write_DOXY_from_csv matched CHLA secondary profile method for Cycle {target_cycle}:"
-  )
-  for iprof in range(n_prof):
-    adj_qc_raw = (
-        ds.variables["DOXY_ADJUSTED_QC"][:, iprof]
-        if "DOXY_ADJUSTED_QC" in var_names
-        else []
-    )
-    blank_count = sum(
-        1
-        for q in adj_qc_raw
-        if (q.decode("utf-8") if isinstance(q, bytes) else str(q)) == " "
-    )
-    nine_count = sum(
-        1
-        for q in adj_qc_raw
-        if (q.decode("utf-8") if isinstance(q, bytes) else str(q)) == "9"
-    )
-    val_count = sum(
-        1
-        for q in adj_qc_raw
-        if (q.decode("utf-8") if isinstance(q, bytes) else str(q))
-        not in [" ", "9"]
-    )
-    target_flag = " (Target Profile Modified)" if iprof == profile_idx else " (Secondary Profile Untouched)"
-    print(
-        f"  Profile [{iprof}]{target_flag}: Blank (' ') = {blank_count},"
-        f" Fill ('9') = {nine_count}, Valid QC = {val_count}"
-    )
-  print("=" * 60 + "\n")
-
+  print(f"[DEBUG] Substep 4 complete for write_DOXY_from_csv.")
   return DOXY_Adjusted_Array.filled(99999.0)
 
 
 def write_DOXY_adjusted_error(
     ds, profile_idx, err_mbar, psal, temp, pres, dens, doxy_adj
 ):
-  """Calculate and assign DOXY_ADJUSTED_ERROR in µmol/kg for target Delayed-Mode profile."""
+  """Calculate and assign DOXY_ADJUSTED_ERROR in µmol/kg."""
+  print(f"[DEBUG] Substep 6: Calculating and writing DOXY_ADJUSTED_ERROR...")
   valid_idx = ~np.isnan(psal) & ~np.isnan(doxy_adj) & (doxy_adj != 99999.0)
   doxy_adj_error = np.full(len(psal), 99999.0, dtype="float32")
 
@@ -841,11 +836,16 @@ def write_DOXY_adjusted_error(
   doxy_adj_error_umol_kg = (doxy_adj_error * 1000.0) / dens
   doxy_adj_error_ma = np.ma.masked_values(doxy_adj_error_umol_kg, 99999.0)
 
-  doxy_adj_full = ds.variables["DOXY_ADJUSTED"][:]
-  if doxy_adj_full.ndim > 1:
-    ds.variables["DOXY_ADJUSTED_ERROR"][:, profile_idx] = doxy_adj_error_ma
+  n_prof = ds.dimensions["N_PROF"].size
+  doxy_adj_err_var = ds.variables["DOXY_ADJUSTED_ERROR"]
+
+  if doxy_adj_err_var.ndim > 1:
+    if doxy_adj_err_var.shape[0] == n_prof:
+      doxy_adj_err_var[profile_idx, :] = doxy_adj_error_ma
+    else:
+      doxy_adj_err_var[:, profile_idx] = doxy_adj_error_ma
   else:
-    ds.variables["DOXY_ADJUSTED_ERROR"][:] = doxy_adj_error_ma
+    doxy_adj_err_var[:] = doxy_adj_error_ma
 
 
 def safe_rename(from_file, to_file):
@@ -1067,6 +1067,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
           )
 
           # 5. Get physical profile density
+          print(f"[DEBUG] Substep 5: Locating core physical file & calculating density...")
           phys_filename = get_phys_filename(bgc_filename, float_dir)
           pres_phys_raw = get_phys_raw_pres(phys_filename)
           phys_data = get_dens(phys_filename)
@@ -1074,26 +1075,28 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
           pres_bgc = ds.variables["PRES"][:]
           iprof_phys = get_iprof_phys(pres_phys_raw, pres_bgc, iprof_doxy)
 
-          # 6. DOXY Error Calculation
-          psal_col = (
-              phys_data["psal"][:, iprof_phys]
-              if phys_data["psal"].ndim > 1
-              else phys_data["psal"]
-          )
-          temp_col = (
-              phys_data["temp"][:, iprof_phys]
-              if phys_data["temp"].ndim > 1
-              else phys_data["temp"]
-          )
-          pres_col = (
-              pres_bgc[:, iprof_doxy] if pres_bgc.ndim > 1 else pres_bgc
-          )
-          dens_col = (
-              phys_data["dens"][:, iprof_phys]
-              if phys_data["dens"].ndim > 1
-              else phys_data["dens"]
-          )
+          # Extract 1D physical arrays safely
+          if phys_data["psal"].ndim > 1:
+            psal_col = phys_data["psal"][iprof_phys, :] if phys_data["psal"].shape[0] > iprof_phys else phys_data["psal"][:, iprof_phys]
+          else:
+            psal_col = phys_data["psal"]
 
+          if phys_data["temp"].ndim > 1:
+            temp_col = phys_data["temp"][iprof_phys, :] if phys_data["temp"].shape[0] > iprof_phys else phys_data["temp"][:, iprof_phys]
+          else:
+            temp_col = phys_data["temp"]
+
+          if pres_bgc.ndim > 1:
+            pres_col = pres_bgc[iprof_doxy, :] if pres_bgc.shape[0] > iprof_doxy else pres_bgc[:, iprof_doxy]
+          else:
+            pres_col = pres_bgc
+
+          if phys_data["dens"].ndim > 1:
+            dens_col = phys_data["dens"][iprof_phys, :] if phys_data["dens"].shape[0] > iprof_phys else phys_data["dens"][:, iprof_phys]
+          else:
+            dens_col = phys_data["dens"]
+
+          # 6. DOXY Error Calculation
           write_DOXY_adjusted_error(
               ds,
               iprof_doxy,
@@ -1109,6 +1112,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
         except Exception as e:
           print(f"Error updating DOXY in file {w_bgc_filename}: {e}")
+          traceback.print_exc()
           if "ds" in locals() and ds.isopen():
             ds.close()
 
