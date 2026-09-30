@@ -76,7 +76,10 @@ launch_date_dict <- tibble::tribble(
   7902327,    "2026-05-21 04:14:00",
   3902693,    "2026-05-20 18:58:00",
   1902800,    "2026-05-29 09:33:00",
-  7901009,    "2023-06-05 10:30:00"
+  7901009,    "2023-06-05 10:30:00",
+  4903911,    "2026-05-15 21:52:00", 
+  4903910,    "2026-05-20 18:00:00", 
+  5907206,    "2026-05-29 09:33:00",
 )
 
 # --- IN-MEMORY DICTIONARY MAPPING FOR FLOAT TYPES ---
@@ -92,7 +95,10 @@ float_type_dict <- tibble::tribble(
   7902327,    "aoml_navis",
   3902693,    "aoml_apex",
   1902800,    "aoml_apex",
-  7901009,    "aoml_navis"
+  7901009,    "aoml_navis",
+  4903911,    "aoml_navis",
+  4903910,    "aoml_navis",
+  5907206,    "aoml_apex",
 )
 
 # --- DOXY ADJUSTED ERROR WRITER FUNCTION ---
@@ -144,7 +150,7 @@ cat("===========================================================================
 
 # Extract processing targets and dates
 float_ids     <- calib_df$float_ids
-target_floats <- c(6999992, 4903904, 1902800, 4903624) # Restricted strictly for CHLA No_LUT
+target_floats <- c(6999992, 4903904, 1902800, 5907206, 4903624) # Restricted strictly for CHLA No_LUT, Caribbean Floats showed better without based on sat match-up
 today_str     <- format(Sys.Date(), "%Y-%m-%d")
 
 # Region Map Boundaries
@@ -266,7 +272,7 @@ for (woko in float_ids) {
     
     meta_path <- file.path(dir_profs, paste0(woko, "_meta.nc"))
     if (!file.exists(meta_path)) {
-      try(download.file(paste0('https://usgodae.org/ftp/argo/dac/aoml/', woko, '/', woko, '_meta.nc'),
+      try(download.file(paste0('ftp://ftp.ifremer.fr/ifremer/argo/dac/', woko, '/', woko, '_meta.nc'),
                         meta_path, quiet = FALSE, mode = "wb", method = "libcurl", cacheOK = TRUE), silent = TRUE)
     }
     
@@ -276,7 +282,7 @@ for (woko in float_ids) {
     r_file  <- file.path(dir_profs, paste0("R", www, ".nc"))
     
     if (!file.exists(bd_file) && !file.exists(br_file)) {
-      try(download.file(paste0("https://usgodae.org/ftp/argo/dac/", files[kiwi]),
+      try(download.file(paste0("ftp://ftp.ifremer.fr/ifremer/argo/dac/", files[kiwi]),
                         file.path(dir_profs, prof_id[kiwi]), mode = "wb", method = "libcurl", quiet = TRUE), silent = TRUE)
     }
     
@@ -285,12 +291,12 @@ for (woko in float_ids) {
     }
     
     if (!file.exists(d_file) && !file.exists(r_file)) {
-      try(download.file(paste0("https://usgodae.org/ftp/argo/dac/", dac[kiwi], "/", wod[kiwi], "/profiles/D", www, ".nc"),
+      try(download.file(paste0("ftp://ftp.ifremer.fr/ifremer/argo/dac/", dac[kiwi], "/", wod[kiwi], "/profiles/D", www, ".nc"),
                         d_file, mode = "wb", method = "libcurl", quiet = TRUE), silent = TRUE)
     }
     
     if (!file.exists(d_file) && !file.exists(r_file)) {
-      try(download.file(paste0("https://usgodae.org/ftp/argo/dac/", dac[kiwi], "/", wod[kiwi], "/profiles/R", www, ".nc"),
+      try(download.file(paste0("ftp://ftp.ifremer.fr/ifremer/argo/dac/", dac[kiwi], "/", wod[kiwi], "/profiles/R", www, ".nc"),
                         r_file, mode = "wb", method = "libcurl", quiet = TRUE), silent = TRUE)
     }
     

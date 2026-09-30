@@ -22,17 +22,17 @@ import pandas as pd
 
 # Dynamic mapping for Float IDs and Float Types
 FLOAT_TYPES = {
-    4903622: "aoml_apex",
+    # 4903622: "aoml_apex",
     2904010: "aoml_apex",
-    2904011: "aoml_apex",
-    4903624: "aoml_apex",
-    4903625: "aoml_apex",
+    # 2904011: "aoml_apex",
+    # 4903624: "aoml_apex",
+    # 4903625: "aoml_apex",
     4903904: "aoml_navis",
-    6999992: "aoml_navis",
-    7902327: "aoml_navis",
-    3902693: "aoml_apex",
-    1902800: "aoml_apex",
-    7901009: "aoml_navis",
+    # 6999992: "aoml_navis",
+    # 7902327: "aoml_navis",
+    # 3902693: "aoml_apex",
+    # 1902800: "aoml_apex",
+    # 7901009: "aoml_navis",
 }
 
 # Derived list of WMO Float IDs to process
@@ -66,7 +66,6 @@ scientific_calibration_equation_CHLA = (
 scientific_calibration_coefficient_CHLA = "PHYSIO_RATIO=1.0"
 CHLA_Adjusted_ERROR_est = 0.07
 
-iprof_chla = 0
 data_state_indicator = ["2", "C", "", ""]
 parameter_data_mode = "D"
 
@@ -76,11 +75,35 @@ parameter_data_mode = "D"
 # ==============================================================================
 
 
-def create_working_bd_file(filename):
+def detect_parameter_profile(ds, param_prefix):
+    """Dynamically locate the profile index (N_PROF) containing the target parameter prefix."""
+    if "STATION_PARAMETERS" not in ds.variables:
+        return 0
+
+    n_prof = ds.dimensions["N_PROF"].size
+    n_param = ds.dimensions["N_PARAM"].size
+
+    for iprof in range(n_prof):
+        param_mat = ds.variables["STATION_PARAMETERS"][iprof]
+        if isinstance(param_mat, np.ma.MaskedArray):
+            param_mat = param_mat.filled(b" ")
+
+        for j in range(n_param):
+            param_str = "".join([
+                c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                for c in param_mat[j]
+            ]).strip()
+            if param_str.startswith(param_prefix):
+                return iprof
+    return 0
+
+
+def create_working_bd_file(filename, dest_dir=None):
     """Create a working copy of the B file with a leading 'w_' in the name."""
     path, name = os.path.split(filename)
     bd_name = name.replace("BR", "BD")
-    w_filename = os.path.join(path, f"w_{bd_name}")
+    out_dir = dest_dir if dest_dir else path
+    w_filename = os.path.join(out_dir, f"w_{bd_name}")
     shutil.copyfile(filename, w_filename)
     return w_filename
 
@@ -162,7 +185,7 @@ def write_history_chla(bgc_file, iprof_idx):
 
 
 def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
-    """Set PARAMETER_DATA_MODE and DATA_MODE synchronously across all N_PROF profiles."""
+    """Set PARAMETER_DATA_MODE and DATA_MODE synchronously across all N_PROF profiles using CHLA method."""
     n_prof = bgc_file.dimensions["N_PROF"].size
     n_param = bgc_file.dimensions["N_PARAM"].size
 
@@ -183,10 +206,10 @@ def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
                 ]).strip()
                 if param_str.startswith("CHLA"):
                     pdm[iprof, j] = "D"
-                elif param_str and pdm[iprof, j] == "R":
+                elif param_str and pdm[iprof, j] in [b"R", "R"]:
                     pdm[iprof, j] = "A"
         else:
-            if data_mode[iprof] == "D":
+            if data_mode[iprof] in [b"D", "D"]:
                 for j in range(n_param):
                     param_str = "".join([
                         c.decode("utf-8", errors="ignore")
@@ -194,7 +217,7 @@ def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
                         else str(c)
                         for c in param_mat[j]
                     ]).strip()
-                    if param_str and pdm[iprof, j] == "R":
+                    if param_str and pdm[iprof, j] in [b"R", "R"]:
                         pdm[iprof, j] = "A"
 
     bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
@@ -350,7 +373,7 @@ def write_scientific_calib_chla(bgc_file, idx_profile, bio_dmqc_csv_path):
 
 
 def write_chla_BBP_adjusted(
-    bgc_file, idx_profile, bio_dmqc_csv_path, iprof_idx=iprof_chla
+    bgc_file, idx_profile, bio_dmqc_csv_path, iprof_idx=0
 ):
     """Populate CHLA_ADJUSTED and CHLA_FLUORESCENCE_ADJUSTED without value/error mismatches."""
     df_bio = pd.read_csv(bio_dmqc_csv_path)
@@ -364,7 +387,6 @@ def write_chla_BBP_adjusted(
     CHLA_Adjusted_Array[:] = 99999.0
     CHLA_Adjusted_Array.mask = True
 
-    # Character QC arrays set to mask = False so literal b"9" is written explicitly
     CHLA_AdjustedQC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
     CHLA_AdjustedQC_Array[:] = b"9"
     CHLA_AdjustedQC_Array.mask = False
@@ -381,7 +403,6 @@ def write_chla_BBP_adjusted(
     CHLA_FLUORESCENCE_Adjusted_Array[:] = 99999.0
     CHLA_FLUORESCENCE_Adjusted_Array.mask = True
 
-    # Character QC arrays set to mask = False so literal b"9" is written explicitly
     CHLA_FLUORESCENCE_AdjustedQC_Array = np.ma.empty(shape=(n_levels,), dtype="|S1")
     CHLA_FLUORESCENCE_AdjustedQC_Array[:] = b"9"
     CHLA_FLUORESCENCE_AdjustedQC_Array.mask = False
@@ -536,8 +557,10 @@ def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
 
 
 def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
-    """Set PARAMETER_DATA_MODE and DATA_MODE synchronously across all N_PROF profiles."""
-    print(f"[DEBUG] Substep 2: Synchronizing PARAMETER_DATA_MODE and DATA_MODE...")
+    """Set PARAMETER_DATA_MODE and DATA_MODE synchronously across all N_PROF profiles,
+    following the non-mutating CHLA method directly from write_parameter_data.
+    """
+    print(f"[DEBUG] Substep 2: Synchronizing PARAMETER_DATA_MODE and DATA_MODE for DOXY (Target Profile: {iprof_idx})...")
     n_prof = bgc_file.dimensions["N_PROF"].size
     n_param = bgc_file.dimensions["N_PARAM"].size
 
@@ -549,87 +572,89 @@ def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
         if isinstance(param_mat, np.ma.MaskedArray):
             param_mat = param_mat.filled(b" ")
 
+        # Decode station parameters cleanly
+        station_params = []
+        for j in range(n_param):
+            chars = [
+                c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                for c in param_mat[j]
+            ]
+            station_params.append("".join(chars).strip())
+
+        raw_dm = data_mode[iprof]
+        current_dm = raw_dm.decode("utf-8") if isinstance(raw_dm, bytes) else str(raw_dm)
+
+        print(f"  [Profile {iprof}] BEFORE -> DATA_MODE: '{current_dm}'")
+        print(f"  [Profile {iprof}] BEFORE -> STATION_PARAMETERS: {station_params}")
+
+        # Follow CHLA method: Update DATA_MODE and PARAMETER_DATA_MODE on target profile without reshaping STATION_PARAMETERS
         if iprof == iprof_idx:
             data_mode[iprof] = "D"
-            for j in range(n_param):
-                param_str = "".join([
-                    c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
-                    for c in param_mat[j]
-                ]).strip()
+            for j, param_str in enumerate(station_params):
+                if not param_str:
+                    continue
                 if param_str.startswith("DOXY"):
                     pdm[iprof, j] = "D"
-                elif param_str and pdm[iprof, j] == "R":
+                elif pdm[iprof, j] in [b"R", "R"]:
                     pdm[iprof, j] = "A"
         else:
-            if data_mode[iprof] == "D":
-                for j in range(n_param):
-                    param_str = "".join([
-                        c.decode("utf-8", errors="ignore")
-                        if isinstance(c, bytes)
-                        else str(c)
-                        for c in param_mat[j]
-                    ]).strip()
-                    if param_str and pdm[iprof, j] == "R":
+            if current_dm in ["D", "D"]:
+                for j, param_str in enumerate(station_params):
+                    if param_str and pdm[iprof, j] in [b"R", "R"]:
                         pdm[iprof, j] = "A"
+
+        updated_dm = data_mode[iprof].decode("utf-8") if isinstance(data_mode[iprof], bytes) else str(data_mode[iprof])
+        print(f"  [Profile {iprof}] AFTER  -> DATA_MODE: '{updated_dm}'")
+        print(f"  [Profile {iprof}] AFTER  -> STATION_PARAMETERS: {station_params}\n")
 
     bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
     bgc_file.variables["DATA_MODE"][:] = data_mode
 
 
 def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
-    """Write DOXY slope and drift calibration coefficients using safe dimension handling."""
+    """Write DOXY slope and drift calibration coefficients safely handling missing data and array dimensions."""
     print(f"[DEBUG] Substep 3: Writing DOXY slope & drift coefficients...")
     cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)]
     if cycle_df.empty:
+        print(f"  [Warning] No cycle data found in CSV for cycle {target_cycle}")
         return
 
-    slope_val = cycle_df["DOXY_SLOPE"].iloc[0]
-    drift_val = cycle_df["DOXY_DRIFT"].iloc[0]
-
-    if pd.isna(slope_val) and pd.isna(drift_val):
-        return
+    slope_val = cycle_df["DOXY_SLOPE"].iloc[0] if "DOXY_SLOPE" in cycle_df.columns else np.nan
+    drift_val = cycle_df["DOXY_DRIFT"].iloc[0] if "DOXY_DRIFT" in cycle_df.columns else np.nan
 
     s_str = "1" if pd.isna(slope_val) else str(slope_val)
     d_str = "0" if pd.isna(drift_val) else str(drift_val)
     calib_str = f"m={s_str}, d={d_str}"
 
-    var_names = ds.variables.keys()
-
-    if "SCIENTIFIC_CALIB_COEFFICIENT" in var_names:
+    if "SCIENTIFIC_CALIB_COEFFICIENT" in ds.variables:
         calib_var = ds.variables["SCIENTIFIC_CALIB_COEFFICIENT"]
-        station_params = ds.variables["STATION_PARAMETERS"][profile_idx]
-
-        if isinstance(station_params, np.ma.MaskedArray):
-            station_params = station_params.filled(b" ")
-
+        n_prof = ds.dimensions["N_PROF"].size
         n_param = ds.dimensions["N_PARAM"].size
-        doxy_idx = -1
+        char_len = calib_var.shape[-1]
 
-        for j in range(n_param):
-            param_str = "".join([
-                c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
-                for c in station_params[j]
-            ]).strip()
-            if param_str.startswith("DOXY"):
-                doxy_idx = j
-                break
+        padded_str = calib_str.ljust(char_len)[:char_len]
+        char_arr = np.array(list(padded_str), dtype="|S1")
 
-        if doxy_idx != -1:
-            char_len = calib_var.shape[-1]
-            padded_str = calib_str.ljust(char_len)[:char_len]
+        for iprof in range(n_prof):
+            station_params = ds.variables["STATION_PARAMETERS"][iprof]
+            if isinstance(station_params, np.ma.MaskedArray):
+                station_params = station_params.filled(b" ")
 
-            if calib_var.ndim == 4:
-                calib_var[profile_idx, 0, doxy_idx, :] = nc.stringtochar(
-                    np.array(padded_str, dtype=f"S{char_len}")
-                )
-            elif calib_var.ndim == 3:
-                calib_var[profile_idx, doxy_idx, :] = nc.stringtochar(
-                    np.array(padded_str, dtype=f"S{char_len}")
-                )
+            for j in range(n_param):
+                param_str = "".join([
+                    c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                    for c in station_params[j]
+                ]).strip()
 
-    if "DOXY_SLOPE" in var_names and not pd.isna(slope_val):
+                if param_str.startswith("DOXY"):
+                    if calib_var.ndim == 4:
+                        calib_var[iprof, 0, j, :] = char_arr
+                    elif calib_var.ndim == 3:
+                        calib_var[iprof, j, :] = char_arr
+
+    if "DOXY_SLOPE" in ds.variables and not pd.isna(slope_val):
         ds.variables["DOXY_SLOPE"][:] = slope_val
-    if "DOXY_DRIFT" in var_names and not pd.isna(drift_val):
+    if "DOXY_DRIFT" in ds.variables and not pd.isna(drift_val):
         ds.variables["DOXY_DRIFT"][:] = drift_val
 
     print(f"[DEBUG] Updated DOXY Slope/Drift for Cycle {target_cycle}: {calib_str}")
@@ -715,7 +740,6 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
                         DOXY_Adjusted_Array[i] = np.float32(raw_doxy_final)
                         DOXY_Adjusted_Array.mask[i] = False
 
-                    # Extract DOXY_ADJUSTED_ERROR directly from CSV
                     raw_doxy_error = row_data.get("DOXY_ADJUSTED_ERROR")
                     if (
                         pd.notna(raw_doxy_error)
@@ -732,7 +756,7 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
                     assigned_nc_pres_vals.add(nc_pres)
                     break
 
-    # Write target profile with shape safety
+    # Write target profile safely
     if "DOXY" in var_names:
         doxy_var = ds.variables["DOXY"]
         if doxy_var.ndim > 1:
@@ -769,11 +793,10 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
         else:
             doxy_adj_err_var[:] = DOXY_Adjusted_Error_Array
 
-    # PROFILE_DOXY_QC grade assignment
     profile_doxy_qc = get_profile_qc_grade(DOXY_AdjustedQC_Array)
     if "PROFILE_DOXY_QC" in ds.variables:
         prof_qc_var = ds.variables["PROFILE_DOXY_QC"]
-        qc_char = nc.stringtochar(np.array(profile_doxy_qc, dtype="S1"))
+        qc_char = np.array(list(profile_doxy_qc), dtype="|S1")
         if prof_qc_var.ndim == 1:
             prof_qc_var[profile_idx] = qc_char
         elif prof_qc_var.ndim == 2:
@@ -816,11 +839,18 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
     print(f" PROCESSING WMO FLOAT ID: {WMOfloatid} ({idx_f} of {total_floats})")
     print("=" * 70)
 
-    float_dir = f"/a1/ARGO_DELAY/DMQC_BGC/data/{WMOfloatid}/"
+    # 1. Main source directory for raw float data
+    main_float_dir = f"/data/a1/ARGO_DELAY/DMQC_BGC/data/{WMOfloatid}/"
     bio_dmqc_csv_path = (
-        f"/a1/ARGO_DELAY/DMQC_BGC/data/csv/CHLA_DOXY_{WMOfloatid}.csv"
+        f"/data/a1/ARGO_DELAY/DMQC_BGC/data/csv/CHLA_DOXY_{WMOfloatid}.csv"
     )
-    output_lut_dir = os.path.join(float_dir, "LUT")
+
+    # 2. Level 1 destination directory (LUT)
+    output_lut_dir = os.path.join(main_float_dir, "LUT")
+
+    # 3. Level 2 destination directory (LUT/YYYY-MM-DD)
+    today_str = dt.now().strftime("%Y-%m-%d")
+    final_doxy_out_dir = os.path.join(output_lut_dir, today_str)
 
     if not os.path.exists(bio_dmqc_csv_path):
         print(
@@ -829,43 +859,49 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
         )
         continue
 
-    if not os.path.exists(float_dir):
+    if not os.path.exists(main_float_dir):
         print(
-            f"ERROR: Float directory not found at {float_dir}. Skipping Float"
+            f"ERROR: Main float directory not found at {main_float_dir}. Skipping Float"
             f" {WMOfloatid}..."
         )
         continue
 
     os.makedirs(output_lut_dir, exist_ok=True)
+    os.makedirs(final_doxy_out_dir, exist_ok=True)
 
     # --------------------------------------------------------------------------
-    # STEP 1: CHLA BD Filler
+    # STEP 1: CHLA BD Filler (Reads from main directory -> Outputs into LUT)
     # --------------------------------------------------------------------------
     print(f"\n--- [Float {WMOfloatid}] Step 1: Running CHLA BD Filler ---")
 
     all_bd_files = sorted(
-        glob.glob(os.path.join(float_dir, f"BD*{WMOfloatid}_*.nc"))
+        glob.glob(os.path.join(main_float_dir, f"BD*{WMOfloatid}_*.nc"))
     )
     all_br_files = sorted(
-        glob.glob(os.path.join(float_dir, f"AOML_BR*{WMOfloatid}_*.nc"))
+        glob.glob(os.path.join(main_float_dir, f"AOML_BR*{WMOfloatid}_*.nc"))
     )
     if not all_br_files:
         all_br_files = sorted(
-            glob.glob(os.path.join(float_dir, f"BR*{WMOfloatid}_*.nc"))
+            glob.glob(os.path.join(main_float_dir, f"BR*{WMOfloatid}_*.nc"))
         )
 
     sorted_b_files = organize_b_files(all_bd_files, all_br_files)
-    print(f"{len(sorted_b_files)} relevant B files found in {float_dir}")
+    print(f"{len(sorted_b_files)} relevant B files found in main directory: {main_float_dir}")
 
     new_bd_files = []
 
     for bgc_filename in sorted_b_files:
         print(f"Processing CHLA for {os.path.basename(bgc_filename)}")
         idx_profile = int(bgc_filename[-6:-3])
-        w_bgc_filename = create_working_bd_file(bgc_filename)
+
+        # Create working BD file directly inside LUT directory
+        w_bgc_filename = create_working_bd_file(bgc_filename, dest_dir=output_lut_dir)
 
         try:
             bgc_file = netCDF4.Dataset(w_bgc_filename, "a")
+
+            # Dynamic CHLA Profile Index Detection
+            iprof_chla = detect_parameter_profile(bgc_file, "CHLA")
 
             write_history_chla(bgc_file, iprof_chla)
             write_parameter_data_mode_chla(bgc_file, iprof_chla)
@@ -887,15 +923,16 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
         except Exception as e:
             print(f"Error processing CHLA for {bgc_filename}: {e}")
 
-    # Move output files into the LUT folder for Step 2
+    # Remove 'w_' prefix from working files in the LUT directory
     for file in new_bd_files:
         path, name = os.path.split(file)
-        new_name = name.replace("w_AOML_BD", "BD").replace("w_BD", "BD")
+        new_name = re.sub(r"^w_AOML_BD", "BD", name)
+        new_name = re.sub(r"^w_BD", "BD", new_name)
         new_path = os.path.join(output_lut_dir, new_name)
         safe_rename(file, new_path)
 
     # --------------------------------------------------------------------------
-    # STEP 2: DOXY BD Filler (Using output from Step 1)
+    # STEP 2: DOXY BD Filler (Reads from LUT directory -> Outputs into LUT/YYYY-MM-DD)
     # --------------------------------------------------------------------------
     print(f"\n--- [Float {WMOfloatid}] Step 2: Running DOXY BD Filler ---")
 
@@ -936,7 +973,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                 )
                 history_institution = "AO"
                 history_reference = "WOA2023"
-                iprof_doxy = 0
             elif inst_float == "aoml_navis":
                 comment_dmqc_operator = (
                     "PRIMARY | https://orcid.org/0000-0003-1297-6599 | Jennifer"
@@ -944,11 +980,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                 )
                 history_institution = "AO"
                 history_reference = "WOA2023"
-                iprof_doxy = 0
-
-            today_str = dt.now().strftime("%Y-%m-%d")
-            final_doxy_out_dir = os.path.join(output_lut_dir, today_str)
-            os.makedirs(final_doxy_out_dir, exist_ok=True)
 
             csv_cycles = sorted(float_df["CYCLE_NUMBER"].unique())
 
@@ -956,6 +987,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                 pattern_bd = f"BD*{floatid}_{target_cycle:03d}.nc"
                 pattern_bd_raw = f"BD*{floatid}_{target_cycle}.nc"
 
+                # Pull BD files created in Step 1 from LUT folder
                 matched_files = glob.glob(
                     os.path.join(output_lut_dir, pattern_bd)
                 ) or glob.glob(os.path.join(output_lut_dir, pattern_bd_raw))
@@ -963,22 +995,26 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                 if not matched_files:
                     print(
                         f"Warning: Cycle {target_cycle} present in CSV, but no matching"
-                        f" BD file found in {output_lut_dir}"
+                        f" BD file found in LUT directory: {output_lut_dir}"
                     )
                     continue
 
                 bgc_filename = matched_files[0]
                 print(
-                    f"Processing DOXY for Cycle {target_cycle}"
+                    f"\nProcessing DOXY for Cycle {target_cycle}"
                     f" ({inst_float.upper()}): {os.path.basename(bgc_filename)}"
                 )
 
+                # Create working file directly inside destination LUT subfolder
                 w_bgc_filename = create_working_doxy_bd_file(
                     bgc_filename, final_doxy_out_dir
                 )
 
                 try:
                     ds = nc.Dataset(w_bgc_filename, "r+")
+
+                    # Dynamic DOXY Profile Index Detection
+                    iprof_doxy = detect_parameter_profile(ds, "DOXY")
 
                     # 1. History Metadata
                     write_history_doxy(
@@ -1000,12 +1036,11 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                         ds, iprof_doxy, float_df, target_cycle
                     )
 
-                    # Print DOXY_ADJUSTED, PRES, and DOXY_ADJUSTED_ERROR values as a table
+                    # Print summary table
                     doxy_adj_vals = ds.variables["DOXY_ADJUSTED"][:]
                     doxy_err_vals = ds.variables["DOXY_ADJUSTED_ERROR"][:]
                     pres_vals = ds.variables["PRES"][:]
 
-                    # Handle 2D arrays to safely extract 1D profile data
                     if doxy_adj_vals.ndim > 1:
                         doxy_adj_prof = (
                             doxy_adj_vals[iprof_doxy, :]
@@ -1027,7 +1062,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                         doxy_err_prof = doxy_err_vals
                         pres_prof = pres_vals
 
-                    # Construct DataFrame
                     df_output = pd.DataFrame({
                         "PRES": pres_prof,
                         "DOXY_ADJUSTED": doxy_adj_prof,
@@ -1037,10 +1071,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                     print(f"\n====================================================")
                     print(f" Summary Table for Float {floatid} | Cycle {target_cycle}")
                     print(f"====================================================")
-                    
-                    # Print the entire table (or use df_output.dropna() to print only valid measurements)
                     print(df_output.to_string(index=True))
-                    
                     print("====================================================\n")
 
                     ds.close()
@@ -1051,7 +1082,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                     if "ds" in locals() and ds.isopen():
                         ds.close()
 
-                # Final rename in output directory
+                # Remove working prefix inside the final dated folder
                 base_name = os.path.basename(w_bgc_filename)
                 new_name = re.sub(r"^w_BD", "BD", base_name)
                 new_path = os.path.join(final_doxy_out_dir, new_name)
