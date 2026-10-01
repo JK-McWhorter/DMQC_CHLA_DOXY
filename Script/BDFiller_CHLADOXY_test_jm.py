@@ -80,6 +80,8 @@ ARGO_VALID_RANGES = {
     "RPHASE_DOXY": (0.0, 500.0),
     "HUMIDITY_NITRATE": (0.0, 100.0),
     "TPHASE_DOXY": (0.0, 500.0),
+    "PHASE_DELAY_DOXY": (0.0, 500.0),
+    "FREQUENCY_DOXY": (0.0, 100000.0),
     "DOXY": (0.0, 600.0),
     "DOXY_ADJUSTED": (0.0, 600.0),
 }
@@ -91,33 +93,13 @@ ARGO_VALID_RANGES = {
 
 
 def clean_and_fill_qc_variables(bgc_file):
-    """Safely inspect and clean ONLY CHLA and DOXY QC variables.
-    Does NOT modify PH_IN_SITU_TOTAL, NITRATE, or any non-target parameter QC variables.
+    """Safely inspect and clean ALL QC variables in the NetCDF file.
+    Replaces blank or null QC flags with '9' (missing data). Flag '8' is strictly avoided.
     """
     n_prof = bgc_file.dimensions["N_PROF"].size
-    filename = getattr(bgc_file, "filepath", lambda: "NetCDF_Dataset")()
-    basename = os.path.basename(filename)
-
-    # Variables managed strictly by this script
-    target_qc_prefixes = [
-        "CHLA",
-        "CHLA_ADJUSTED",
-        "CHLA_FLUORESCENCE",
-        "CHLA_FLUORESCENCE_ADJUSTED",
-        "DOXY",
-        "DOXY_ADJUSTED",
-        "PROFILE_CHLA",
-        "PROFILE_CHLA_FLUORESCENCE",
-        "PROFILE_DOXY",
-    ]
 
     for var_name, var in bgc_file.variables.items():
         if not var_name.endswith("_QC"):
-            continue
-
-        # Skip non-target parameters (e.g., pH, NITRATE) to preserve original BD file flags
-        param_base = var_name.replace("_QC", "")
-        if not any(param_base == target or var_name == target for target in target_qc_prefixes):
             continue
 
         for iprof in range(n_prof):
@@ -148,7 +130,7 @@ def clean_and_fill_qc_variables(bgc_file):
                             bgc_file.variables[var_name][iprof, :] = char_arr
 
             except Exception as e:
-                print(f"Error cleaning target QC var {var_name}: {e}")
+                print(f"Error cleaning QC var {var_name}: {e}")
 
 
 def add_missing_valid_range_attributes(bgc_file):
@@ -261,14 +243,14 @@ def update_history_chla(nc_ds, dct, iprof_idx):
 
 def write_history_chla(bgc_file, iprof_idx):
     """Write global attributes and HISTORY variables for CHLA."""
-    bgc_file.history = datetime.datetime.utcnow().strftime(
+    bgc_file.history = datetime.datetime.now(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ creation"
     )
     bgc_file.setncattr("comment_dmqc_operator", comment_dmqc_operator_chla)
 
     history_step = "ARSQ"
     history_action = "IP"
-    UTCcurrent = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    UTCcurrent = datetime.datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
     update_history_chla(
         bgc_file,
@@ -345,7 +327,7 @@ def get_profile_qc_grade(qc_masked_array):
         return "A"
     elif 75.0 <= pct_good < 100.0:
         return "B"
-    elif 50.0 <= pct_good < 100.0:
+    elif 50.0 <= pct_good < 75.0:
         return "C"
     elif 25.0 <= pct_good < 50.0:
         return "D"
@@ -385,7 +367,7 @@ def write_scientific_calib_chla(bgc_file, idx_profile, bio_dmqc_csv_path):
     calib_coefficient_flu = (
         f"PRELIM_DARK_CHLA = [{dark_str}], SCALE_CHLA = {scale_val}"
     )
-    UTCcurrent = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    UTCcurrent = datetime.datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
     str256_len = bgc_file.dimensions["STRING256"].size
 
@@ -577,9 +559,9 @@ def write_chla_BBP_adjusted(
     prof_fluo_qc = get_profile_qc_grade(CHLA_FLUORESCENCE_AdjustedQC_Array)
 
     if "PROFILE_CHLA_QC" in bgc_file.variables:
-        bgc_file.variables["PROFILE_CHLA_QC"][iprof_idx] = prof_qc
+        bgc_file.variables["PROFILE_CHLA_QC"][iprof_idx] = np.array([prof_qc], dtype="|S1")
     if "PROFILE_CHLA_FLUORESCENCE_QC" in bgc_file.variables:
-        bgc_file.variables["PROFILE_CHLA_FLUORESCENCE_QC"][iprof_idx] = prof_fluo_qc
+        bgc_file.variables["PROFILE_CHLA_FLUORESCENCE_QC"][iprof_idx] = np.array([prof_fluo_qc], dtype="|S1")
 
 
 # ==============================================================================
@@ -611,7 +593,7 @@ def update_history_doxy(nc_ds, dct, iprof_idx):
 def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
     """Update global history attributes for DOXY processing."""
     print(f"[DEBUG] Substep 1: Writing HISTORY metadata for DOXY...")
-    ds.history = datetime.datetime.utcnow().strftime(
+    ds.history = datetime.datetime.now(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ creation"
     )
     ds.setncattr("comment_dmqc_operator", comment_op)
@@ -621,7 +603,7 @@ def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
     history_software = "BITTIG"
     history_software_release = "2024"
     history_parameter = "DOXY"
-    UTCcurrent = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    UTCcurrent = datetime.datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
     update_history_doxy(
         ds,
@@ -852,7 +834,7 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
     prof_qc = get_profile_qc_grade(DOXY_AdjustedQC_Array)
     if "PROFILE_DOXY_QC" in ds.variables:
         prof_qc_var = ds.variables["PROFILE_DOXY_QC"]
-        qc_char = np.array(list(prof_qc), dtype="|S1")
+        qc_char = np.array([prof_qc], dtype="|S1")
         if prof_qc_var.ndim == 1:
             prof_qc_var[profile_idx] = qc_char
         elif prof_qc_var.ndim == 2:
@@ -972,7 +954,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                 bgc_file, idx_profile, bio_dmqc_csv_path, iprof_chla
             )
 
-            # Clean ONLY target CHLA/DOXY QC variables and fix attributes
+            # Clean ALL QC variables and fix missing/forbidden attributes
             clean_and_fill_qc_variables(bgc_file)
             add_missing_valid_range_attributes(bgc_file)
             remove_forbidden_attributes(bgc_file)
@@ -1078,7 +1060,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                         ds, iprof_doxy, float_df, target_cycle
                     )
 
-                    # Clean ONLY target CHLA/DOXY QC variables and fix attributes
+                    # Clean ALL QC variables and fix missing/forbidden attributes
                     clean_and_fill_qc_variables(ds)
                     add_missing_valid_range_attributes(ds)
                     remove_forbidden_attributes(ds)
