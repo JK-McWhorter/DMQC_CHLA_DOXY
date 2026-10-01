@@ -23,16 +23,16 @@ import pandas as pd
 # Dynamic mapping for Float IDs and Float Types
 FLOAT_TYPES = {
     4903622: "aoml_apex",
-    # 2904010: "aoml_apex",
-    # 2904011: "aoml_apex",
-    # 4903624: "aoml_apex",
-    # 4903625: "aoml_apex",
-    # 4903904: "aoml_navis",
-    # 6999992: "aoml_navis",
-    # 7902327: "aoml_navis",
-    # 3902693: "aoml_apex",
-    # 1902800: "aoml_apex",
-    # 7901009: "aoml_navis",
+    2904010: "aoml_apex",
+    2904011: "aoml_apex",
+    4903624: "aoml_apex",
+    4903625: "aoml_apex",
+    4903904: "aoml_navis",
+    6999992: "aoml_navis",
+    7902327: "aoml_navis",
+    3902693: "aoml_apex",
+    1902800: "aoml_apex",
+    7901009: "aoml_navis",
 }
 
 # Derived list of WMO Float IDs to process
@@ -95,7 +95,9 @@ ARGO_VALID_RANGES = {
 
 def clean_and_fill_qc_variables(bgc_file):
     """Safely inspect and clean ALL QC variables in the NetCDF file.
-    Replaces blank or null QC flags with '9' (missing data). Strictly avoids modifying PH variables.
+    Replaces blank or null QC flags with '9' (missing data) or 'F' for profile QC.
+    Strictly avoids modifying PH and NITRATE variables, as well as PROFILE_*_QC flags
+    for profile indices where the target parameter does not exist.
     """
     n_prof = bgc_file.dimensions["N_PROF"].size
 
@@ -103,12 +105,37 @@ def clean_and_fill_qc_variables(bgc_file):
         if not var_name.endswith("_QC"):
             continue
 
-        # Preserve PH portion completely
-        if "PH" in var_name:
+        # Preserve PH and NITRATE portions completely
+        if "PH" in var_name or "NITRATE" in var_name:
             continue
+
+        # Extract base parameter name if this is a PROFILE_<PARAM>_QC variable
+        param_base = None
+        if var_name.startswith("PROFILE_") and var_name.endswith("_QC"):
+            param_base = var_name[8:-3]  # e.g., 'PROFILE_BBP700_QC' -> 'BBP700'
 
         for iprof in range(n_prof):
             try:
+                # If this is a PROFILE_<PARAM>_QC variable, verify the parameter belongs to this profile index
+                if param_base and "STATION_PARAMETERS" in bgc_file.variables:
+                    station_params = bgc_file.variables["STATION_PARAMETERS"][iprof]
+                    if isinstance(station_params, np.ma.MaskedArray):
+                        station_params = station_params.filled(b" ")
+
+                    has_param = False
+                    for p in station_params:
+                        p_str = "".join([
+                            c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                            for c in p
+                        ]).strip()
+                        if p_str.startswith(param_base):
+                            has_param = True
+                            break
+
+                    # If parameter is not present on this profile index, leave PROFILE_*_QC untouched (as ' ')
+                    if not has_param:
+                        continue
+
                 if var.dtype.kind in ["S", "U", "O"]:
                     raw_var_slice = var[iprof] if var.ndim == 1 else var[iprof, :]
                     slice_data = np.array(raw_var_slice, copy=True)
@@ -558,7 +585,7 @@ def write_chla_BBP_adjusted(
             CHLA_FLUORESCENCE_Adjusted_ERROR_Array
         )
 
-    # Compute profile QC grade specifically for CHLA on target profile iprof_idx
+    # Compute profile QC grade specifically for CHLA strictly on target profile iprof_idx
     prof_qc = get_profile_qc_grade(CHLA_AdjustedQC_Array)
     prof_fluo_qc = get_profile_qc_grade(CHLA_FLUORESCENCE_AdjustedQC_Array)
 
@@ -633,7 +660,7 @@ def write_BBP700_adjusted(
     if "BBP700_ADJUSTED_ERROR" in bgc_file.variables:
         bgc_file.variables["BBP700_ADJUSTED_ERROR"][iprof_idx] = BBP700_Adjusted_ERROR_Array
 
-    # Compute and set profile QC grade specifically for BBP700
+    # Compute and set profile QC grade strictly for target profile iprof_idx
     prof_bbp_qc = get_profile_qc_grade(BBP700_AdjustedQC_Array)
     if "PROFILE_BBP700_QC" in bgc_file.variables:
         bgc_file.variables["PROFILE_BBP700_QC"][iprof_idx] = np.array([prof_bbp_qc], dtype="|S1")
@@ -676,7 +703,7 @@ def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
     history_step = "ARSQ"
     history_action = "IP"
     history_software = "BITTIG"
-    history_software_release = "2024"
+    history_software_release = "2026"
     history_parameter = "DOXY"
     UTCcurrent = datetime.datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
@@ -905,7 +932,7 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
         else:
             doxy_adj_err_var[:] = DOXY_Adjusted_Error_Array
 
-    # Compute profile QC grade specifically for DOXY on target profile profile_idx
+    # Compute profile QC grade specifically for DOXY strictly on target profile profile_idx
     prof_qc = get_profile_qc_grade(DOXY_AdjustedQC_Array)
     if "PROFILE_DOXY_QC" in ds.variables:
         prof_qc_var = ds.variables["PROFILE_DOXY_QC"]
@@ -1034,7 +1061,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                 bgc_file, idx_profile, bio_dmqc_csv_path, iprof_bbp
             )
 
-            # Clean ALL QC variables (skipping PH) and fix missing/forbidden attributes
+            # Clean ALL QC variables (skipping PH, NITRATE, and non-target PROFILE_*_QC) and fix missing/forbidden attributes
             clean_and_fill_qc_variables(bgc_file)
             add_missing_valid_range_attributes(bgc_file)
             remove_forbidden_attributes(bgc_file)
@@ -1140,7 +1167,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                         ds, iprof_doxy, float_df, target_cycle
                     )
 
-                    # Clean ALL QC variables (skipping PH) and fix missing/forbidden attributes
+                    # Clean ALL QC variables (skipping PH, NITRATE, and non-target PROFILE_*_QC) and fix missing/forbidden attributes
                     clean_and_fill_qc_variables(ds)
                     add_missing_valid_range_attributes(ds)
                     remove_forbidden_attributes(ds)
