@@ -23,16 +23,16 @@ import pandas as pd
 # Dynamic mapping for Float IDs and Float Types
 FLOAT_TYPES = {
     4903622: "aoml_apex",
-    2904010: "aoml_apex",
-    2904011: "aoml_apex",
-    4903624: "aoml_apex",
-    4903625: "aoml_apex",
-    4903904: "aoml_navis",
-    6999992: "aoml_navis",
-    7902327: "aoml_navis",
-    3902693: "aoml_apex",
-    1902800: "aoml_apex",
-    7901009: "aoml_navis",
+    # 2904010: "aoml_apex",
+    # 2904011: "aoml_apex",
+    # 4903624: "aoml_apex",
+    # 4903625: "aoml_apex",
+    # 4903904: "aoml_navis",
+    # 6999992: "aoml_navis",
+    # 7902327: "aoml_navis",
+    # 3902693: "aoml_apex",
+    # 1902800: "aoml_apex",
+    # 7901009: "aoml_navis",
 }
 
 # Derived list of WMO Float IDs to process
@@ -703,7 +703,7 @@ def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
     history_step = "ARSQ"
     history_action = "IP"
     history_software = "BITTIG"
-    history_software_release = "2026"
+    history_software_release = "2024"
     history_parameter = "DOXY"
     UTCcurrent = datetime.datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
