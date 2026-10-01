@@ -23,16 +23,16 @@ import pandas as pd
 # Dynamic mapping for Float IDs and Float Types
 FLOAT_TYPES = {
     4903622: "aoml_apex",
-    2904010: "aoml_apex",
-    2904011: "aoml_apex",
-    4903624: "aoml_apex",
-    4903625: "aoml_apex",
-    4903904: "aoml_navis",
-    6999992: "aoml_navis",
-    7902327: "aoml_navis",
-    3902693: "aoml_apex",
-    1902800: "aoml_apex",
-    7901009: "aoml_navis",
+    # 2904010: "aoml_apex",
+    # 2904011: "aoml_apex",
+    # 4903624: "aoml_apex",
+    # 4903625: "aoml_apex",
+    # 4903904: "aoml_navis",
+    # 6999992: "aoml_navis",
+    # 7902327: "aoml_navis",
+    # 3902693: "aoml_apex",
+    # 1902800: "aoml_apex",
+    # 7901009: "aoml_navis",
 }
 
 # Derived list of WMO Float IDs to process
@@ -65,6 +65,7 @@ scientific_calibration_equation_CHLA = (
 )
 scientific_calibration_coefficient_CHLA = "PHYSIO_RATIO=1.0"
 CHLA_Adjusted_ERROR_est = 0.07
+BBP700_Adjusted_ERROR_est = 0.0005  # Default estimated error for BBP700
 
 data_state_indicator = ["2", "C", "", ""]
 parameter_data_mode = "D"
@@ -77,6 +78,8 @@ ARGO_VALID_RANGES = {
     "TEMP_DOXY": (-2.5, 40.0),
     "CHLA_FLUORESCENCE": (0.0, 50.0),
     "CHLA_FLUORESCENCE_ADJUSTED": (0.0, 50.0),
+    "BBP700": (0.0, 0.1),
+    "BBP700_ADJUSTED": (0.0, 0.1),
     "RPHASE_DOXY": (0.0, 500.0),
     "HUMIDITY_NITRATE": (0.0, 100.0),
     "TPHASE_DOXY": (0.0, 500.0),
@@ -159,7 +162,7 @@ def remove_forbidden_attributes(bgc_file):
 
 
 # ==============================================================================
-# SECTION 3: Helper Functions - CHLA Processing
+# SECTION 3: Helper Functions - CHLA & BBP700 Processing
 # ==============================================================================
 
 
@@ -273,9 +276,7 @@ def write_history_chla(bgc_file, iprof_idx):
 
 
 def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
-    """Set PARAMETER_DATA_MODE and DATA_MODE strictly for CHLA on target profile iprof_idx.
-    Leaves non-target parameters (PH_IN_SITU_TOTAL, NITRATE, etc.) untouched.
-    """
+    """Set PARAMETER_DATA_MODE and DATA_MODE strictly for CHLA and BBP700 on target profile iprof_idx."""
     n_param = bgc_file.dimensions["N_PARAM"].size
 
     pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
@@ -293,7 +294,7 @@ def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
         ]).strip()
         if param_str == "PRES":
             pdm[iprof_idx, j] = "R"  # Force PRES to 'R'
-        elif param_str.startswith("CHLA"):
+        elif param_str.startswith("CHLA") or param_str.startswith("BBP"):
             pdm[iprof_idx, j] = "D"
 
     bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
@@ -498,7 +499,7 @@ def write_chla_BBP_adjusted(
                 continue
 
             if np.isclose(csv_pres, nc_pres, atol=0.05):
-                raw_qc = row_data["CHLA_FINAL_QC"]
+                raw_qc = row_data["CHLA_FINAL_QC"] if "CHLA_FINAL_QC" in row_data else "9"
                 qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
 
                 if qc_str in ["4", "9"]:
@@ -562,6 +563,77 @@ def write_chla_BBP_adjusted(
         bgc_file.variables["PROFILE_CHLA_QC"][iprof_idx] = np.array([prof_qc], dtype="|S1")
     if "PROFILE_CHLA_FLUORESCENCE_QC" in bgc_file.variables:
         bgc_file.variables["PROFILE_CHLA_FLUORESCENCE_QC"][iprof_idx] = np.array([prof_fluo_qc], dtype="|S1")
+
+
+def write_BBP700_adjusted(
+    bgc_file, idx_profile, bio_dmqc_csv_path, iprof_idx=0
+):
+    """Populate BBP700_ADJUSTED, BBP700_ADJUSTED_QC, BBP700_ADJUSTED_ERROR, and PROFILE_BBP700_QC."""
+    if "BBP700_ADJUSTED" not in bgc_file.variables:
+        return
+
+    df_bio = pd.read_csv(bio_dmqc_csv_path)
+    df_bio = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
+
+    if "BBP700_FINAL" not in df_bio.columns or "BBP700_FINAL_QC" not in df_bio.columns:
+        print(f"Warning: BBP700_FINAL/QC columns missing in CSV for cycle {idx_profile}.")
+        return
+
+    n_levels = bgc_file.dimensions["N_LEVELS"].size
+
+    BBP700_Adjusted_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
+    BBP700_Adjusted_Array[:] = 99999.0
+    BBP700_Adjusted_Array.mask = True
+
+    BBP700_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
+
+    BBP700_Adjusted_ERROR_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
+    BBP700_Adjusted_ERROR_Array[:] = 99999.0
+    BBP700_Adjusted_ERROR_Array.mask = True
+
+    assigned_nc_pres_vals = set()
+
+    for row in range(len(df_bio)):
+        row_data = df_bio.iloc[row]
+        csv_pres = np.float32(row_data["PRES"])
+
+        for i in range(n_levels):
+            nc_pres = np.float32(bgc_file.variables["PRES"][iprof_idx, i])
+
+            if nc_pres in assigned_nc_pres_vals:
+                continue
+
+            if np.isclose(csv_pres, nc_pres, atol=0.05):
+                raw_qc = row_data["BBP700_FINAL_QC"]
+                qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
+
+                raw_bbp = row_data["BBP700_FINAL"]
+
+                if pd.isna(raw_bbp) or raw_bbp == 99999.0 or qc_str in ["4", "9"]:
+                    BBP700_Adjusted_Array[i] = 99999.0
+                    BBP700_Adjusted_ERROR_Array[i] = 99999.0
+                    BBP700_Adjusted_Array.mask[i] = True
+                    BBP700_Adjusted_ERROR_Array.mask[i] = True
+                else:
+                    BBP700_Adjusted_Array[i] = np.float32(raw_bbp)
+                    BBP700_Adjusted_ERROR_Array[i] = np.float32(BBP700_Adjusted_ERROR_est)
+                    BBP700_Adjusted_Array.mask[i] = False
+                    BBP700_Adjusted_ERROR_Array.mask[i] = False
+
+                BBP700_AdjustedQC_Array[i] = qc_str.encode("utf-8")
+                assigned_nc_pres_vals.add(nc_pres)
+                break
+
+    bgc_file.variables["BBP700_ADJUSTED"][iprof_idx] = BBP700_Adjusted_Array
+    if "BBP700_ADJUSTED_QC" in bgc_file.variables:
+        bgc_file.variables["BBP700_ADJUSTED_QC"][iprof_idx, :] = BBP700_AdjustedQC_Array
+    if "BBP700_ADJUSTED_ERROR" in bgc_file.variables:
+        bgc_file.variables["BBP700_ADJUSTED_ERROR"][iprof_idx] = BBP700_Adjusted_ERROR_Array
+
+    # Compute and set profile QC grade specifically for BBP700
+    prof_bbp_qc = get_profile_qc_grade(BBP700_AdjustedQC_Array)
+    if "PROFILE_BBP700_QC" in bgc_file.variables:
+        bgc_file.variables["PROFILE_BBP700_QC"][iprof_idx] = np.array([prof_bbp_qc], dtype="|S1")
 
 
 # ==============================================================================
@@ -883,7 +955,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
     main_float_dir = f"/data/a1/ARGO_DELAY/DMQC_BGC/data/{WMOfloatid}/"
     bio_dmqc_csv_path = (
-        f"/data/a1/ARGO_DELAY/DMQC_BGC/data/csv/CHLA_DOXY_{WMOfloatid}.csv"
+        f"/data/a1/ARGO_DELAY/DMQC_BGC/data/csv/CHLA_BBP_DOXY_{WMOfloatid}.csv"
     )
 
     output_lut_dir = os.path.join(main_float_dir, "LUT")
@@ -908,9 +980,9 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
     os.makedirs(final_doxy_out_dir, exist_ok=True)
 
     # --------------------------------------------------------------------------
-    # STEP 1: CHLA BD Filler (Reads from main directory -> Outputs into LUT)
+    # STEP 1: CHLA & BBP700 BD Filler (Reads from main directory -> Outputs into LUT)
     # --------------------------------------------------------------------------
-    print(f"\n--- [Float {WMOfloatid}] Step 1: Running CHLA BD Filler ---")
+    print(f"\n--- [Float {WMOfloatid}] Step 1: Running CHLA & BBP700 BD Filler ---")
 
     all_bd_files = sorted(
         glob.glob(os.path.join(main_float_dir, f"BD*{WMOfloatid}_*.nc"))
@@ -929,7 +1001,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
     new_bd_files = []
 
     for bgc_filename in sorted_b_files:
-        print(f"Processing CHLA for {os.path.basename(bgc_filename)}")
+        print(f"Processing CHLA and BBP700 for {os.path.basename(bgc_filename)}")
         idx_profile = int(bgc_filename[-6:-3])
 
         w_bgc_filename = create_working_bd_file(bgc_filename, dest_dir=output_lut_dir)
@@ -938,20 +1010,25 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             bgc_file = netCDF4.Dataset(w_bgc_filename, "a")
 
             iprof_chla = detect_parameter_profile(bgc_file, "CHLA")
+            iprof_bbp = detect_parameter_profile(bgc_file, "BBP700")
 
             write_history_chla(bgc_file, iprof_chla)
             write_parameter_data_mode_chla(bgc_file, iprof_chla)
             write_scientific_calib_chla(bgc_file, idx_profile, bio_dmqc_csv_path)
 
             for i in range(bgc_file.dimensions["N_PROF"].size):
-                if i != iprof_chla:
+                if i not in [iprof_chla, iprof_bbp]:
                     continue
                 bgc_file.variables["DATA_STATE_INDICATOR"][i] = np.ma.array(
                     data_state_indicator, mask=[False, False, True, True], dtype="|S1"
                 )
 
+            # Write adjusted CHLA and BBP700 data
             write_chla_BBP_adjusted(
                 bgc_file, idx_profile, bio_dmqc_csv_path, iprof_chla
+            )
+            write_BBP700_adjusted(
+                bgc_file, idx_profile, bio_dmqc_csv_path, iprof_bbp
             )
 
             # Clean ALL QC variables and fix missing/forbidden attributes
@@ -962,7 +1039,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             bgc_file.close()
             new_bd_files.append(w_bgc_filename)
         except Exception as e:
-            print(f"Error processing CHLA for {bgc_filename}: {e}")
+            print(f"Error processing CHLA/BBP700 for {bgc_filename}: {e}")
 
     for file in new_bd_files:
         path, name = os.path.split(file)
