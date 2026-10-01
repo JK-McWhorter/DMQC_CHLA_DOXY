@@ -95,12 +95,16 @@ ARGO_VALID_RANGES = {
 
 def clean_and_fill_qc_variables(bgc_file):
     """Safely inspect and clean ALL QC variables in the NetCDF file.
-    Replaces blank or null QC flags with '9' (missing data). Flag '8' is strictly avoided.
+    Replaces blank or null QC flags with '9' (missing data). Strictly avoids modifying PH variables.
     """
     n_prof = bgc_file.dimensions["N_PROF"].size
 
     for var_name, var in bgc_file.variables.items():
         if not var_name.endswith("_QC"):
+            continue
+
+        # Preserve PH portion completely
+        if "PH" in var_name:
             continue
 
         for iprof in range(n_prof):
@@ -284,7 +288,7 @@ def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
     if isinstance(param_mat, np.ma.MaskedArray):
         param_mat = param_mat.filled(b" ")
 
-    data_mode[iprof_idx] = "D"
+    # Only set target profile data_mode to 'D' if it contains CHLA/BBP700
     for j in range(n_param):
         param_str = "".join([
             c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
@@ -294,6 +298,7 @@ def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
             pdm[iprof_idx, j] = "R"  # Force PRES to 'R'
         elif param_str.startswith("CHLA") or param_str.startswith("BBP"):
             pdm[iprof_idx, j] = "D"
+            data_mode[iprof_idx] = "D"
 
     bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
     bgc_file.variables["DATA_MODE"][:] = data_mode
@@ -709,7 +714,6 @@ def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
     if isinstance(param_mat, np.ma.MaskedArray):
         param_mat = param_mat.filled(b" ")
 
-    data_mode[iprof_idx] = "D"
     for j in range(n_param):
         param_str = "".join([
             c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
@@ -719,6 +723,7 @@ def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
             pdm[iprof_idx, j] = "R"  # Force PRES to 'R'
         elif param_str.startswith("DOXY"):
             pdm[iprof_idx, j] = "D"
+            data_mode[iprof_idx] = "D"
 
     bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
     bgc_file.variables["DATA_MODE"][:] = data_mode
@@ -1029,7 +1034,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                 bgc_file, idx_profile, bio_dmqc_csv_path, iprof_bbp
             )
 
-            # Clean ALL QC variables and fix missing/forbidden attributes
+            # Clean ALL QC variables (skipping PH) and fix missing/forbidden attributes
             clean_and_fill_qc_variables(bgc_file)
             add_missing_valid_range_attributes(bgc_file)
             remove_forbidden_attributes(bgc_file)
@@ -1135,7 +1140,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                         ds, iprof_doxy, float_df, target_cycle
                     )
 
-                    # Clean ALL QC variables and fix missing/forbidden attributes
+                    # Clean ALL QC variables (skipping PH) and fix missing/forbidden attributes
                     clean_and_fill_qc_variables(ds)
                     add_missing_valid_range_attributes(ds)
                     remove_forbidden_attributes(ds)
