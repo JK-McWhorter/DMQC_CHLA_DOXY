@@ -348,7 +348,7 @@ def get_profile_qc_grade(qc_masked_array):
 
     total_points = len(valid_qcs)
     if total_points == 0:
-        return "Z"
+        return "F"  # If parameter profile was processed but has 0 valid points, fallback to 'F'
 
     bad_count = sum(1 for q in valid_qcs if q in ["3", "4"])
     good_count = total_points - bad_count
@@ -528,7 +528,8 @@ def write_chla_BBP_adjusted(
             if nc_pres in assigned_nc_pres_vals:
                 continue
 
-            if np.isclose(csv_pres, nc_pres, atol=0.05):
+            # Check pressure alignment with a 0.5 dbar tolerance
+            if np.isclose(csv_pres, nc_pres, atol=0.5):
                 raw_qc = row_data["CHLA_FINAL_QC"] if "CHLA_FINAL_QC" in row_data else "9"
                 qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
 
@@ -585,12 +586,13 @@ def write_chla_BBP_adjusted(
             CHLA_FLUORESCENCE_Adjusted_ERROR_Array
         )
 
-    # Compute profile QC grade specifically for CHLA strictly on target profile iprof_idx
+    # Compute profile QC grade strictly for CHLA on target profile iprof_idx
     prof_qc = get_profile_qc_grade(CHLA_AdjustedQC_Array)
     prof_fluo_qc = get_profile_qc_grade(CHLA_FLUORESCENCE_AdjustedQC_Array)
 
     if "PROFILE_CHLA_QC" in bgc_file.variables:
         bgc_file.variables["PROFILE_CHLA_QC"][iprof_idx] = np.array([prof_qc], dtype="|S1")
+
     if "PROFILE_CHLA_FLUORESCENCE_QC" in bgc_file.variables:
         bgc_file.variables["PROFILE_CHLA_FLUORESCENCE_QC"][iprof_idx] = np.array([prof_fluo_qc], dtype="|S1")
 
@@ -633,7 +635,8 @@ def write_BBP700_adjusted(
             if nc_pres in assigned_nc_pres_vals:
                 continue
 
-            if np.isclose(csv_pres, nc_pres, atol=0.05):
+            # Check pressure alignment with a 0.5 dbar tolerance
+            if np.isclose(csv_pres, nc_pres, atol=0.5):
                 raw_qc = row_data["BBP700_FINAL_QC"]
                 qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
 
@@ -694,7 +697,6 @@ def update_history_doxy(nc_ds, dct, iprof_idx):
 
 def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
     """Update global history attributes for DOXY processing."""
-    print(f"[DEBUG] Substep 1: Writing HISTORY metadata for DOXY...")
     ds.history = datetime.datetime.now(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ creation"
     )
@@ -758,7 +760,6 @@ def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
 
 def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
     """Write DOXY slope and drift calibration coefficients safely handling missing data and array dimensions."""
-    print(f"[DEBUG] Substep 3: Writing DOXY slope & drift coefficients...")
     cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)]
     if cycle_df.empty:
         print(f"  [Warning] No cycle data found in CSV for cycle {target_cycle}")
@@ -802,12 +803,9 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
     if "DOXY_DRIFT" in ds.variables and not pd.isna(drift_val):
         ds.variables["DOXY_DRIFT"][:] = drift_val
 
-    print(f"[DEBUG] Updated DOXY Slope/Drift for Cycle {target_cycle}: {calib_str}")
-
 
 def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
     """Populate DOXY, DOXY_ADJUSTED, DOXY_ADJUSTED_ERROR, and QC variables from CSV."""
-    print(f"[DEBUG] Substep 4: Running write_DOXY_from_csv...")
     var_names = ds.variables.keys()
     n_prof = ds.dimensions["N_PROF"].size
     n_levels = ds.dimensions["N_LEVELS"].size
@@ -858,7 +856,7 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
                 if nc_pres in assigned_nc_pres_vals or np.isnan(nc_pres):
                     continue
 
-                if np.isclose(csv_pres, nc_pres, atol=0.05):
+                if np.isclose(csv_pres, nc_pres, atol=0.5):
                     raw_qc = row_data.get("DOXY_FINAL_QC")
                     qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
 
@@ -942,7 +940,6 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
         elif prof_qc_var.ndim == 2:
             prof_qc_var[profile_idx, 0] = qc_char
 
-    print(f"[DEBUG] Substep 4 complete for write_DOXY_from_csv.")
     return (
         DOXY_Adjusted_Array.filled(99999.0)
         if hasattr(DOXY_Adjusted_Array, "filled")
@@ -955,17 +952,10 @@ def safe_rename(from_file, to_file):
     gc.collect()
     try:
         os.replace(from_file, to_file)
-        print(
-            f"Renamed {os.path.basename(from_file)} to {os.path.basename(to_file)}"
-        )
     except OSError:
         try:
             shutil.copyfile(from_file, to_file)
             os.remove(from_file)
-            print(
-                "Copied and replaced (lock fallback):"
-                f" {os.path.basename(from_file)} -> {os.path.basename(to_file)}"
-            )
         except Exception as e:
             print(
                 f"Warning: Failed to rename or copy {from_file} to {to_file}: {e}"
@@ -1031,7 +1021,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
     new_bd_files = []
 
     for bgc_filename in sorted_b_files:
-        print(f"Processing CHLA and BBP700 for {os.path.basename(bgc_filename)}")
         idx_profile = int(bgc_filename[-6:-3])
 
         w_bgc_filename = create_working_bd_file(bgc_filename, dest_dir=output_lut_dir)
@@ -1068,6 +1057,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
             bgc_file.close()
             new_bd_files.append(w_bgc_filename)
+            print(f"[PASS] CHLA & BBP700 BD Filler passed for cycle {idx_profile:03d} ({os.path.basename(bgc_filename)})")
         except Exception as e:
             print(f"Error processing CHLA/BBP700 for {bgc_filename}: {e}")
 
@@ -1138,10 +1128,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                     continue
 
                 bgc_filename = matched_files[0]
-                print(
-                    f"\nProcessing DOXY for Cycle {target_cycle}"
-                    f" ({inst_float.upper()}): {os.path.basename(bgc_filename)}"
-                )
 
                 w_bgc_filename = create_working_doxy_bd_file(
                     bgc_filename, final_doxy_out_dir
@@ -1174,17 +1160,18 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
                     ds.close()
 
+                    base_name = os.path.basename(w_bgc_filename)
+                    new_name = re.sub(r"^w_BD", "BD", base_name)
+                    new_path = os.path.join(final_doxy_out_dir, new_name)
+
+                    safe_rename(w_bgc_filename, new_path)
+                    print(f"[PASS] DOXY BD Filler passed for cycle {target_cycle:03d} ({new_name})")
+
                 except Exception as e:
                     print(f"Error updating DOXY in file {w_bgc_filename}: {e}")
                     traceback.print_exc()
                     if "ds" in locals() and ds.isopen():
                         ds.close()
-
-                base_name = os.path.basename(w_bgc_filename)
-                new_name = re.sub(r"^w_BD", "BD", base_name)
-                new_path = os.path.join(final_doxy_out_dir, new_name)
-
-                safe_rename(w_bgc_filename, new_path)
 
         except Exception as e:
             print(f"Error processing DOXY for Float ID {floatid}: {e}")
