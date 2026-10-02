@@ -142,7 +142,7 @@ def clean_and_fill_qc_variables(bgc_file):
                 if var_name.endswith("_ADJUSTED_QC") and not var_name.startswith("PROFILE_"):
                     base_var = var_name[:-12]
                     param_dm = "R"
-                    
+
                     if "STATION_PARAMETERS" in bgc_file.variables:
                         station_params = bgc_file.variables["STATION_PARAMETERS"][iprof]
                         if isinstance(station_params, np.ma.MaskedArray):
@@ -548,7 +548,7 @@ def write_chla_BBP_adjusted(
 
     for i in range(n_levels):
         nc_pres = nc_pres_all[i]
-        
+
         matched_row = None
         if not df_bio.empty:
             diffs = np.abs(df_bio["PRES"].values - nc_pres)
@@ -650,7 +650,7 @@ def write_BBP700_adjusted(
 
     for i in range(n_levels):
         nc_pres = nc_pres_all[i]
-        
+
         matched_row = None
         if not df_bio.empty:
             diffs = np.abs(df_bio["PRES"].values - nc_pres)
