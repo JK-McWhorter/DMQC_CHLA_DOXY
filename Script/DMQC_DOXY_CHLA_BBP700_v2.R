@@ -1,7 +1,7 @@
 ### BGC-Argo CHLA, BBP700 & DOXY Corrections DMQC Pipeline
 ### Integrated DMQC processing for all listed float IDs
 ### Created by Jen McWhorter and Marin Cornec
-### Last updated 02-Oct-2026
+### Last updated 01-Oct-2026
 
 # DOXY drift was not applied to floats that were deployed at the end of May 2026, limited profiles for analysis 
 ## flags 
@@ -904,9 +904,6 @@ for (woko in float_ids) {
       qc_flags_fluo[is.na(fluo_v)]                  <- 9
       qc_flags_fluo[pres_qc_9_mask] <- df_cyc$PRES_QC[pres_qc_9_mask]
       
-      # If CHLA_FINAL_QC is 9, set CHLA_FLUORESCENCE_QC to 9
-      qc_flags_fluo[qc_flags_chla %in% c("9", 9)] <- 9
-      
       qc_flags_fluo_adj <- ifelse(length(min_first_five) >= 5, 1, 2)
       qc_flags_fluo_adj <- rep(qc_flags_fluo_adj, n_obs)
       
@@ -1468,19 +1465,21 @@ for (woko in float_ids) {
           (float_num == "2904011" & CYCLE_NUMBER >= 24)
       ),
       # Target CHLA_FINAL, BBP700_FINAL, and associated QC flags
-      CHLA_FINAL            = ifelse(override_condition, 99999.0, CHLA_FINAL),
-      BBP700_FINAL          = ifelse(override_condition, 99999.0, BBP700_FINAL),
-      CHLA_FINAL_QC         = ifelse(override_condition, 9, CHLA_FINAL_QC),
-      BBP700_FINAL_QC       = ifelse(override_condition, 9, BBP700_FINAL_QC),
-      CHLA_FLUORESCENCE_QC  = ifelse(override_condition, 9, CHLA_FLUORESCENCE_QC),
+      CHLA_FINAL      = ifelse(override_condition, 99999.0, CHLA_FINAL),
+      BBP700_FINAL    = ifelse(override_condition, 99999.0, BBP700_FINAL),
+      CHLA_FINAL_QC   = ifelse(override_condition, 9, CHLA_FINAL_QC),
+      BBP700_FINAL_QC = ifelse(override_condition, 9, BBP700_FINAL_QC),
       
       # Additional requested parameters set to 99999.0 on override condition
       CHLA                       = ifelse(override_condition, 99999.0, CHLA),
       CHLA_ADJUSTED              = ifelse(override_condition, 99999.0, CHLA_ADJUSTED),
       CHLA_FLUORESCENCE          = ifelse(override_condition, 99999.0, CHLA_FLUORESCENCE),
+      CHLA_FLUORESCENCE_QC = ifelse(override_condition, 9, CHLA_FLUORESCENCE_QC),
       CHLA_FLUORESCENCE_ADJUSTED = ifelse(override_condition, 99999.0, CHLA_FLUORESCENCE_ADJUSTED),
+      CHLA_FLUORESCENCE_ADJUSTED_QC = ifelse(override_condition, 9, CHLA_FLUORESCENCE_ADJUSTED_QC),
       CHLA_NoLUT                 = ifelse(override_condition, 99999.0, CHLA_NoLUT),
       BBP700                     = ifelse(override_condition, 99999.0, BBP700),
+      BBP700_QC = ifelse(override_condition, 9, BBP700_QC),
       SCALE_CHLA                 = ifelse(override_condition, 99999.0, SCALE_CHLA),
       DARK_CHLA                  = ifelse(override_condition, 99999.0, DARK_CHLA)
     ) %>%
@@ -1508,18 +1507,12 @@ for (woko in float_ids) {
       )
   }
   
-  # Set CHLA_FLUORESCENCE_QC to 9 whenever CHLA_FINAL_QC is 9
-  df_export_prep <- df_export_prep %>%
-    mutate(
-      CHLA_FLUORESCENCE_QC = ifelse(CHLA_FINAL_QC %in% c(9, "9"), 9, CHLA_FLUORESCENCE_QC)
-    )
-  
   # 3. Clean up columns, rename to uppercase, reorder, filter out PRES == 99999, and fill missing values with 99999.0
   df_combo_export <- df_export_prep %>%
     select(-any_of(c(
-      "WMOID", "ID", "DOXY_QC", "BBP700_QC_MANUAL", "BBP700_QC",
+      "WMOID", "ID", "DOXY_QC", "BBP700_QC_MANUAL",
       "DOXY_ADJUSTED", "DOXY_ADJUSTED_QC",
-      "DOXY_CALCULATED_ADJ", "float_ids", "CHLA_QC", "TIME",
+      "DOXY_CALCULATED_ADJ", "float_ids", "TIME",
       "launch_date", "lauch_date", "LAUNCH_DATE"
     ))) %>%
     rename_with(toupper) %>%
