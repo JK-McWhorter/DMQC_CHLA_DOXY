@@ -574,26 +574,29 @@ def write_chla_BBP_adjusted(
             raw_qc = matched_row["CHLA_FINAL_QC"] if "CHLA_FINAL_QC" in matched_row else "9"
             qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
 
-            if qc_str in ["4", "9"]:
+            chla_final_val = matched_row["CHLA_FINAL"] if "CHLA_FINAL" in matched_row else np.nan
+
+            if pd.isna(chla_final_val) or chla_final_val == 99999.0 or qc_str in ["4", "9"]:
                 CHLA_Adjusted_Array[i] = 99999.0
                 CHLA_Adjusted_ERROR_Array[i] = 99999.0
                 CHLA_Adjusted_Array.mask[i] = True
                 CHLA_Adjusted_ERROR_Array.mask[i] = True
 
+                CHLA_AdjustedQC_Array[i] = b"9"
+
                 if chla_qc_arr is not None:
-                    chla_qc_arr[i] = qc_str.encode("utf-8")
+                    chla_qc_arr[i] = qc_str.encode("utf-8") if qc_str == "4" else b"9"
                 if chla_data_arr is not None:
                     chla_data_arr[i] = 99999.0
                     if hasattr(chla_data_arr, "mask"):
                         chla_data_arr.mask[i] = True
                 bad_chla_levels += 1
             else:
-                CHLA_Adjusted_Array[i] = np.float32(matched_row["CHLA_FINAL"])
+                CHLA_Adjusted_Array[i] = np.float32(chla_final_val)
                 CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
                 CHLA_Adjusted_Array.mask[i] = False
                 CHLA_Adjusted_ERROR_Array.mask[i] = False
-
-            CHLA_AdjustedQC_Array[i] = qc_str.encode("utf-8")
+                CHLA_AdjustedQC_Array[i] = qc_str.encode("utf-8")
 
             fluo_val = matched_row["CHLA_FLUORESCENCE"] if "CHLA_FLUORESCENCE" in matched_row else np.nan
             if pd.isna(fluo_val) or fluo_val == 99999.0 or qc_str in ["4", "9"]:
@@ -602,8 +605,10 @@ def write_chla_BBP_adjusted(
                 CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = True
                 CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = True
 
+                CHLA_FLUORESCENCE_AdjustedQC_Array[i] = b"9"
+
                 if fluo_qc_arr is not None:
-                    fluo_qc_arr[i] = qc_str.encode("utf-8")
+                    fluo_qc_arr[i] = qc_str.encode("utf-8") if qc_str == "4" else b"9"
                 if fluo_data_arr is not None:
                     fluo_data_arr[i] = 99999.0
                     if hasattr(fluo_data_arr, "mask"):
@@ -614,13 +619,11 @@ def write_chla_BBP_adjusted(
                 CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
                 CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = False
                 CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = False
-
-            CHLA_FLUORESCENCE_AdjustedQC_Array[i] = qc_str.encode("utf-8")
+                CHLA_FLUORESCENCE_AdjustedQC_Array[i] = qc_str.encode("utf-8")
         else:
             CHLA_AdjustedQC_Array[i] = b"9"
             CHLA_FLUORESCENCE_AdjustedQC_Array[i] = b"9"
 
-        # Enforcement: Ensure raw missing data (99999.0 / NaN) forces QC to '9'
         if chla_data_arr is not None and (pd.isna(chla_data_arr[i]) or chla_data_arr[i] == 99999.0):
             if chla_qc_arr is not None:
                 chla_qc_arr[i] = b"9"
@@ -628,6 +631,12 @@ def write_chla_BBP_adjusted(
         if fluo_data_arr is not None and (pd.isna(fluo_data_arr[i]) or fluo_data_arr[i] == 99999.0):
             if fluo_qc_arr is not None:
                 fluo_qc_arr[i] = b"9"
+
+        if CHLA_Adjusted_Array.mask[i] or CHLA_Adjusted_Array[i] == 99999.0:
+            CHLA_AdjustedQC_Array[i] = b"9"
+
+        if CHLA_FLUORESCENCE_Adjusted_Array.mask[i] or CHLA_FLUORESCENCE_Adjusted_Array[i] == 99999.0:
+            CHLA_FLUORESCENCE_AdjustedQC_Array[i] = b"9"
 
     bgc_file.variables["CHLA_ADJUSTED"][iprof_idx] = CHLA_Adjusted_Array
     bgc_file.variables["CHLA_ADJUSTED_QC"][iprof_idx, :] = CHLA_AdjustedQC_Array
@@ -724,8 +733,10 @@ def write_BBP700_adjusted(
                 BBP700_Adjusted_Array.mask[i] = True
                 BBP700_Adjusted_ERROR_Array.mask[i] = True
 
+                BBP700_AdjustedQC_Array[i] = b"9"
+
                 if bbp_qc_arr is not None:
-                    bbp_qc_arr[i] = qc_str.encode("utf-8")
+                    bbp_qc_arr[i] = qc_str.encode("utf-8") if qc_str == "4" else b"9"
                 if bbp_data_arr is not None:
                     bbp_data_arr[i] = 99999.0
                     if hasattr(bbp_data_arr, "mask"):
@@ -736,16 +747,16 @@ def write_BBP700_adjusted(
                 BBP700_Adjusted_ERROR_Array[i] = np.float32(BBP700_Adjusted_ERROR_est)
                 BBP700_Adjusted_Array.mask[i] = False
                 BBP700_Adjusted_ERROR_Array.mask[i] = False
-
-            BBP700_AdjustedQC_Array[i] = qc_str.encode("utf-8")
+                BBP700_AdjustedQC_Array[i] = qc_str.encode("utf-8")
         else:
             BBP700_AdjustedQC_Array[i] = b"9"
 
-        # CRITICAL FIX for BD4903622_116.nc:
-        # If raw BBP700 observation is missing (99999.0 / NaN), force BBP700_QC to '9'!
         if bbp_data_arr is not None and (pd.isna(bbp_data_arr[i]) or bbp_data_arr[i] == 99999.0):
             if bbp_qc_arr is not None:
                 bbp_qc_arr[i] = b"9"
+
+        if BBP700_Adjusted_Array.mask[i] or BBP700_Adjusted_Array[i] == 99999.0:
+            BBP700_AdjustedQC_Array[i] = b"9"
 
     bgc_file.variables["BBP700_ADJUSTED"][iprof_idx] = BBP700_Adjusted_Array
     if "BBP700_ADJUSTED_QC" in bgc_file.variables:
@@ -924,7 +935,7 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
 
 
 def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
-    """Populate DOXY, DOXY_ADJUSTED, DOXY_ADJUSTED_ERROR, and QC variables from CSV."""
+    """Populate DOXY, DOXY_ADJUSTED, DOXY_ADJUSTED_ERROR, and QC variables with strict raw/adjusted QC sync."""
     var_names = ds.variables.keys()
     n_prof = ds.dimensions["N_PROF"].size
     n_levels = ds.dimensions["N_LEVELS"].size
@@ -941,26 +952,30 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
 
     cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)].copy()
 
-    DOXY_Adjusted_Array = np.ma.empty(
-        shape=(n_levels,), fill_value=99999.0, dtype="float32"
-    )
+    DOXY_Adjusted_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
     DOXY_Adjusted_Array[:] = 99999.0
     DOXY_Adjusted_Array.mask = True
 
-    DOXY_Adjusted_Error_Array = np.ma.empty(
-        shape=(n_levels,), fill_value=99999.0, dtype="float32"
-    )
+    DOXY_Adjusted_Error_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
     DOXY_Adjusted_Error_Array[:] = 99999.0
     DOXY_Adjusted_Error_Array.mask = True
 
-    DOXY_Array = np.ma.empty(
-        shape=(n_levels,), fill_value=99999.0, dtype="float32"
-    )
+    DOXY_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
     DOXY_Array[:] = 99999.0
     DOXY_Array.mask = True
 
     DOXY_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
-    DOXY_QC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
+
+    # Fetch raw NetCDF arrays for DOXY and DOXY_QC
+    has_doxy = "DOXY" in ds.variables
+    has_doxy_qc = "DOXY_QC" in ds.variables
+    raw_doxy_var = ds.variables["DOXY"][profile_idx, :] if (has_doxy and ds.variables["DOXY"].ndim > 1) else (ds.variables["DOXY"][:] if has_doxy else None)
+    raw_doxy_qc_var = ds.variables["DOXY_QC"][profile_idx, :] if (has_doxy_qc and ds.variables["DOXY_QC"].ndim > 1) else (ds.variables["DOXY_QC"][:] if has_doxy_qc else None)
+
+    doxy_data_arr = np.array(raw_doxy_var, copy=True) if raw_doxy_var is not None else None
+    doxy_qc_arr = np.array(raw_doxy_qc_var, copy=True) if raw_doxy_qc_var is not None else None
+
+    bad_doxy_levels = 0
 
     for i in range(n_levels):
         nc_pres = np.float32(pres_nc[i])
@@ -982,7 +997,6 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
             if pd.notna(raw_doxy) and raw_doxy != 99999.0:
                 DOXY_Array[i] = np.float32(raw_doxy)
                 DOXY_Array.mask[i] = False
-                DOXY_QC_Array[i] = b"1"
 
             raw_doxy_final = matched_row.get("DOXY_FINAL")
             if (
@@ -992,9 +1006,19 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
             ):
                 DOXY_Adjusted_Array[i] = 99999.0
                 DOXY_Adjusted_Array.mask[i] = True
+                DOXY_AdjustedQC_Array[i] = b"9"
+
+                if doxy_qc_arr is not None:
+                    doxy_qc_arr[i] = qc_str.encode("utf-8") if qc_str == "4" else b"9"
+                if doxy_data_arr is not None:
+                    doxy_data_arr[i] = 99999.0
+                    if hasattr(doxy_data_arr, "mask"):
+                        doxy_data_arr.mask[i] = True
+                bad_doxy_levels += 1
             else:
                 DOXY_Adjusted_Array[i] = np.float32(raw_doxy_final)
                 DOXY_Adjusted_Array.mask[i] = False
+                DOXY_AdjustedQC_Array[i] = qc_str.encode("utf-8")
 
             raw_doxy_error = matched_row.get("DOXY_ADJUSTED_ERROR")
             if (
@@ -1007,23 +1031,32 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
             else:
                 DOXY_Adjusted_Error_Array[i] = 99999.0
                 DOXY_Adjusted_Error_Array.mask[i] = True
-
-            DOXY_AdjustedQC_Array[i] = qc_str.encode("utf-8")
         else:
             DOXY_AdjustedQC_Array[i] = b"9"
+
+        # Enforcement: Ensure raw missing data forces raw QC to '9'
+        if doxy_data_arr is not None and (pd.isna(doxy_data_arr[i]) or doxy_data_arr[i] == 99999.0):
+            if doxy_qc_arr is not None:
+                doxy_qc_arr[i] = b"9"
+
+        # Enforcement: Ensure missing ADJUSTED data forces ADJUSTED_QC to '9' and raw QC to '9'
+        if DOXY_Adjusted_Array.mask[i] or DOXY_Adjusted_Array[i] == 99999.0:
+            DOXY_AdjustedQC_Array[i] = b"9"
+            if doxy_qc_arr is not None and (doxy_data_arr is None or pd.isna(doxy_data_arr[i]) or doxy_data_arr[i] == 99999.0):
+                doxy_qc_arr[i] = b"9"
 
     if "DOXY" in var_names:
         doxy_var = ds.variables["DOXY"]
         if doxy_var.ndim > 1:
             if doxy_var.shape[0] == n_prof:
                 doxy_var[profile_idx, :] = DOXY_Array
-                ds.variables["DOXY_QC"][profile_idx, :] = DOXY_QC_Array
+                ds.variables["DOXY_QC"][profile_idx, :] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
             else:
                 doxy_var[:, profile_idx] = DOXY_Array
-                ds.variables["DOXY_QC"][:, profile_idx] = DOXY_QC_Array
+                ds.variables["DOXY_QC"][:, profile_idx] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
         else:
             doxy_var[:] = DOXY_Array
-            ds.variables["DOXY_QC"][:] = DOXY_QC_Array
+            ds.variables["DOXY_QC"][:] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
 
     if "DOXY_ADJUSTED" in var_names:
         doxy_adj_var = ds.variables["DOXY_ADJUSTED"]
@@ -1056,6 +1089,8 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
             prof_qc_var[profile_idx] = qc_char
         elif prof_qc_var.ndim == 2:
             prof_qc_var[profile_idx, 0] = qc_char
+
+    print(f"  [DIAGNOSTIC] Cycle {target_cycle:03d} | DOXY Profile Index {profile_idx}: DOXY bad/missing levels = {bad_doxy_levels}/{n_levels}, PROFILE_DOXY_QC = '{prof_qc}'")
 
     return (
         DOXY_Adjusted_Array.filled(99999.0)
