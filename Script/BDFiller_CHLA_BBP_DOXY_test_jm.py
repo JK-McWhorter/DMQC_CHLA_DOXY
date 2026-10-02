@@ -68,7 +68,6 @@ CHLA_Adjusted_ERROR_est = 0.07
 BBP700_Adjusted_ERROR_est = 0.0005  # Default estimated error for BBP700
 
 data_state_indicator = ["2", "C", "", ""]
-parameter_data_mode = "D"
 
 # Standard Argo valid_min and valid_max ranges for physical & coordinate parameters
 ARGO_VALID_RANGES = {
@@ -95,11 +94,14 @@ ARGO_VALID_RANGES = {
 
 def clean_and_fill_qc_variables(bgc_file):
     """Safely inspect and clean ALL QC variables in the NetCDF file.
-    Replaces blank or null QC flags with '9' (missing data) or 'F' for profile QC.
-    Strictly avoids modifying PH and NITRATE variables, as well as PROFILE_*_QC flags
-    for profile indices where the target parameter does not exist.
+    Replaces blank or null QC flags with '9' (missing data).
+    Ensures Real-time ('R') parameters have FillValue (' ') for ADJUSTED_QC.
+    Strictly sets PROFILE_<PARAM>_QC to ' ' when parameter is not measured on profile.
     """
     n_prof = bgc_file.dimensions["N_PROF"].size
+
+    pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
+    data_mode = bgc_file.variables["DATA_MODE"][:]
 
     for var_name, var in bgc_file.variables.items():
         if not var_name.endswith("_QC"):
@@ -109,14 +111,13 @@ def clean_and_fill_qc_variables(bgc_file):
         if "PH" in var_name or "NITRATE" in var_name:
             continue
 
-        # Extract base parameter name if this is a PROFILE_<PARAM>_QC variable
         param_base = None
         if var_name.startswith("PROFILE_") and var_name.endswith("_QC"):
-            param_base = var_name[8:-3]  # e.g., 'PROFILE_BBP700_QC' -> 'BBP700'
+            param_base = var_name[8:-3]
 
         for iprof in range(n_prof):
             try:
-                # If this is a PROFILE_<PARAM>_QC variable, verify the parameter belongs to this profile index
+                # 1. Check parameter presence for PROFILE_<PARAM>_QC
                 if param_base and "STATION_PARAMETERS" in bgc_file.variables:
                     station_params = bgc_file.variables["STATION_PARAMETERS"][iprof]
                     if isinstance(station_params, np.ma.MaskedArray):
@@ -128,14 +129,42 @@ def clean_and_fill_qc_variables(bgc_file):
                             c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
                             for c in p
                         ]).strip()
-                        if p_str.startswith(param_base):
+                        if p_str == param_base:
                             has_param = True
                             break
 
-                    # If parameter is not present on this profile index, leave PROFILE_*_QC untouched (as ' ')
+                    # If parameter does NOT exist on this profile index, set PROFILE_QC to ' '
                     if not has_param:
+                        bgc_file.variables[var_name][iprof] = b" "
                         continue
 
+                # 2. Check if variable is an ADJUSTED_QC variable under Real-time Data Mode ('R')
+                if var_name.endswith("_ADJUSTED_QC") and not var_name.startswith("PROFILE_"):
+                    base_var = var_name[:-12]
+                    param_dm = "R"
+                    
+                    if "STATION_PARAMETERS" in bgc_file.variables:
+                        station_params = bgc_file.variables["STATION_PARAMETERS"][iprof]
+                        if isinstance(station_params, np.ma.MaskedArray):
+                            station_params = station_params.filled(b" ")
+                        for j, p in enumerate(station_params):
+                            p_str = "".join([
+                                c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                                for c in p
+                            ]).strip()
+                            if p_str == base_var:
+                                param_dm = pdm[iprof, j].decode("utf-8") if isinstance(pdm[iprof, j], bytes) else str(pdm[iprof, j])
+                                break
+                    else:
+                        param_dm = data_mode[iprof].decode("utf-8") if isinstance(data_mode[iprof], bytes) else str(data_mode[iprof])
+
+                    # Under 'R' mode, force _ADJUSTED_QC to FillValue ' '
+                    if param_dm == "R":
+                        fill_arr = np.full(var[iprof].shape, fill_value=b" ", dtype="|S1")
+                        bgc_file.variables[var_name][iprof] = fill_arr
+                        continue
+
+                # 3. Clean blanks in active QC fields
                 if var.dtype.kind in ["S", "U", "O"]:
                     raw_var_slice = var[iprof] if var.ndim == 1 else var[iprof, :]
                     slice_data = np.array(raw_var_slice, copy=True)
@@ -153,7 +182,8 @@ def clean_and_fill_qc_variables(bgc_file):
                     blank_count = int(np.sum(blank_mask))
 
                     if blank_count > 0:
-                        fill_code = b"F" if var_name.startswith("PROFILE_") else b"9"
+                        # FIX: Set PROFILE_*_QC fill code to b" " (blank) instead of b"F"
+                        fill_code = b" " if var_name.startswith("PROFILE_") else b"9"
                         char_arr[blank_mask] = fill_code
 
                         if var.ndim == 1:
@@ -179,9 +209,7 @@ def add_missing_valid_range_attributes(bgc_file):
 
 
 def remove_forbidden_attributes(bgc_file):
-    """Remove valid_min and valid_max attributes from variables where forbidden by Argo NetCDF standards.
-    Retains attributes for coordinate and primary measurement parameters listed in ARGO_VALID_RANGES.
-    """
+    """Remove valid_min and valid_max attributes from variables where forbidden by Argo NetCDF standards."""
     forbidden_attrs = ["valid_min", "valid_max"]
     for var_name, var in bgc_file.variables.items():
         if var_name not in ARGO_VALID_RANGES:
@@ -315,14 +343,13 @@ def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
     if isinstance(param_mat, np.ma.MaskedArray):
         param_mat = param_mat.filled(b" ")
 
-    # Only set target profile data_mode to 'D' if it contains CHLA/BBP700
     for j in range(n_param):
         param_str = "".join([
             c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
             for c in param_mat[j]
         ]).strip()
         if param_str == "PRES":
-            pdm[iprof_idx, j] = "R"  # Force PRES to 'R'
+            pdm[iprof_idx, j] = "R"
         elif param_str.startswith("CHLA") or param_str.startswith("BBP"):
             pdm[iprof_idx, j] = "D"
             data_mode[iprof_idx] = "D"
@@ -347,8 +374,9 @@ def get_profile_qc_grade(qc_masked_array):
             valid_qcs.append(s)
 
     total_points = len(valid_qcs)
+    # FIX: Return blank space ' ' if no valid points are present for unmeasured profile
     if total_points == 0:
-        return "F"  # If parameter profile was processed but has 0 valid points, fallback to 'F'
+        return " "
 
     bad_count = sum(1 for q in valid_qcs if q in ["3", "4"])
     good_count = total_points - bad_count
@@ -516,77 +544,61 @@ def write_chla_BBP_adjusted(
     CHLA_FLUORESCENCE_Adjusted_ERROR_Array[:] = 99999.0
     CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask = True
 
-    assigned_nc_pres_vals = set()
+    nc_pres_all = np.float32(bgc_file.variables["PRES"][iprof_idx, :])
 
-    for row in range(len(df_bio)):
-        row_data = df_bio.iloc[row]
-        csv_pres = np.float32(row_data["PRES"])
+    for i in range(n_levels):
+        nc_pres = nc_pres_all[i]
+        
+        matched_row = None
+        if not df_bio.empty:
+            diffs = np.abs(df_bio["PRES"].values - nc_pres)
+            min_idx = np.argmin(diffs)
+            if diffs[min_idx] <= 0.5:
+                matched_row = df_bio.iloc[min_idx]
 
-        for i in range(n_levels):
-            nc_pres = np.float32(bgc_file.variables["PRES"][iprof_idx, i])
+        if matched_row is not None:
+            raw_qc = matched_row["CHLA_FINAL_QC"] if "CHLA_FINAL_QC" in matched_row else "9"
+            qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
 
-            if nc_pres in assigned_nc_pres_vals:
-                continue
+            if qc_str in ["4", "9"]:
+                CHLA_Adjusted_Array[i] = 99999.0
+                CHLA_Adjusted_ERROR_Array[i] = 99999.0
+                CHLA_Adjusted_Array.mask[i] = True
+                CHLA_Adjusted_ERROR_Array.mask[i] = True
+            else:
+                CHLA_Adjusted_Array[i] = np.float32(matched_row["CHLA_FINAL"])
+                CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
+                CHLA_Adjusted_Array.mask[i] = False
+                CHLA_Adjusted_ERROR_Array.mask[i] = False
 
-            # Check pressure alignment with a 0.5 dbar tolerance
-            if np.isclose(csv_pres, nc_pres, atol=0.5):
-                raw_qc = row_data["CHLA_FINAL_QC"] if "CHLA_FINAL_QC" in row_data else "9"
-                qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
+            CHLA_AdjustedQC_Array[i] = qc_str.encode("utf-8")
 
-                if qc_str in ["4", "9"]:
-                    CHLA_Adjusted_Array[i] = 99999.0
-                    CHLA_Adjusted_ERROR_Array[i] = 99999.0
-                    CHLA_Adjusted_Array.mask[i] = True
-                    CHLA_Adjusted_ERROR_Array.mask[i] = True
-                else:
-                    CHLA_Adjusted_Array[i] = np.float32(row_data["CHLA_FINAL"])
-                    CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
-                    CHLA_Adjusted_Array.mask[i] = False
-                    CHLA_Adjusted_ERROR_Array.mask[i] = False
+            fluo_val = matched_row["CHLA_FLUORESCENCE"] if "CHLA_FLUORESCENCE" in matched_row else np.nan
+            if pd.isna(fluo_val) or fluo_val == 99999.0 or qc_str in ["4", "9"]:
+                CHLA_FLUORESCENCE_Adjusted_Array[i] = 99999.0
+                CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = 99999.0
+                CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = True
+                CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = True
+            else:
+                CHLA_FLUORESCENCE_Adjusted_Array[i] = np.float32(fluo_val)
+                CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
+                CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = False
+                CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = False
 
-                CHLA_AdjustedQC_Array[i] = qc_str.encode("utf-8")
-
-                fluo_val = (
-                    row_data["CHLA_FLUORESCENCE"]
-                    if "CHLA_FLUORESCENCE" in row_data
-                    else np.nan
-                )
-                if pd.isna(fluo_val) or fluo_val == 99999.0 or qc_str in ["4", "9"]:
-                    CHLA_FLUORESCENCE_Adjusted_Array[i] = 99999.0
-                    CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = 99999.0
-                    CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = True
-                    CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = True
-                else:
-                    CHLA_FLUORESCENCE_Adjusted_Array[i] = np.float32(fluo_val)
-                    CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = np.float32(
-                        CHLA_Adjusted_ERROR_est
-                    )
-                    CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = False
-                    CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = False
-
-                CHLA_FLUORESCENCE_AdjustedQC_Array[i] = qc_str.encode("utf-8")
-
-                assigned_nc_pres_vals.add(nc_pres)
-                break
+            CHLA_FLUORESCENCE_AdjustedQC_Array[i] = qc_str.encode("utf-8")
+        else:
+            CHLA_AdjustedQC_Array[i] = b"9"
+            CHLA_FLUORESCENCE_AdjustedQC_Array[i] = b"9"
 
     bgc_file.variables["CHLA_ADJUSTED"][iprof_idx] = CHLA_Adjusted_Array
     bgc_file.variables["CHLA_ADJUSTED_QC"][iprof_idx, :] = CHLA_AdjustedQC_Array
-    bgc_file.variables["CHLA_ADJUSTED_ERROR"][iprof_idx] = (
-        CHLA_Adjusted_ERROR_Array
-    )
+    bgc_file.variables["CHLA_ADJUSTED_ERROR"][iprof_idx] = CHLA_Adjusted_ERROR_Array
 
     if "CHLA_FLUORESCENCE_ADJUSTED" in bgc_file.variables:
-        bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED"][iprof_idx] = (
-            CHLA_FLUORESCENCE_Adjusted_Array
-        )
-        bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED_QC"][iprof_idx, :] = (
-            CHLA_FLUORESCENCE_AdjustedQC_Array
-        )
-        bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED_ERROR"][iprof_idx] = (
-            CHLA_FLUORESCENCE_Adjusted_ERROR_Array
-        )
+        bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED"][iprof_idx] = CHLA_FLUORESCENCE_Adjusted_Array
+        bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED_QC"][iprof_idx, :] = CHLA_FLUORESCENCE_AdjustedQC_Array
+        bgc_file.variables["CHLA_FLUORESCENCE_ADJUSTED_ERROR"][iprof_idx] = CHLA_FLUORESCENCE_Adjusted_ERROR_Array
 
-    # Compute profile QC grade strictly for CHLA on target profile iprof_idx
     prof_qc = get_profile_qc_grade(CHLA_AdjustedQC_Array)
     prof_fluo_qc = get_profile_qc_grade(CHLA_FLUORESCENCE_AdjustedQC_Array)
 
@@ -613,6 +625,17 @@ def write_BBP700_adjusted(
 
     n_levels = bgc_file.dimensions["N_LEVELS"].size
 
+    if "BBP700_QC" in bgc_file.variables:
+        raw_bbp_qc = bgc_file.variables["BBP700_QC"][iprof_idx, :]
+        clean_bbp_qc = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
+        for lvl in range(n_levels):
+            code = raw_bbp_qc[lvl].decode("utf-8") if isinstance(raw_bbp_qc[lvl], bytes) else str(raw_bbp_qc[lvl])
+            if code in ["1", "2", "3", "4", "8"]:
+                clean_bbp_qc[lvl] = code.encode("utf-8")
+            else:
+                clean_bbp_qc[lvl] = b"9"
+        bgc_file.variables["BBP700_QC"][iprof_idx, :] = clean_bbp_qc
+
     BBP700_Adjusted_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
     BBP700_Adjusted_Array[:] = 99999.0
     BBP700_Adjusted_Array.mask = True
@@ -623,39 +646,37 @@ def write_BBP700_adjusted(
     BBP700_Adjusted_ERROR_Array[:] = 99999.0
     BBP700_Adjusted_ERROR_Array.mask = True
 
-    assigned_nc_pres_vals = set()
+    nc_pres_all = np.float32(bgc_file.variables["PRES"][iprof_idx, :])
 
-    for row in range(len(df_bio)):
-        row_data = df_bio.iloc[row]
-        csv_pres = np.float32(row_data["PRES"])
+    for i in range(n_levels):
+        nc_pres = nc_pres_all[i]
+        
+        matched_row = None
+        if not df_bio.empty:
+            diffs = np.abs(df_bio["PRES"].values - nc_pres)
+            min_idx = np.argmin(diffs)
+            if diffs[min_idx] <= 0.5:
+                matched_row = df_bio.iloc[min_idx]
 
-        for i in range(n_levels):
-            nc_pres = np.float32(bgc_file.variables["PRES"][iprof_idx, i])
+        if matched_row is not None:
+            raw_qc = matched_row["BBP700_FINAL_QC"]
+            qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
+            raw_bbp = matched_row["BBP700_FINAL"]
 
-            if nc_pres in assigned_nc_pres_vals:
-                continue
+            if pd.isna(raw_bbp) or raw_bbp == 99999.0 or qc_str in ["4", "9"]:
+                BBP700_Adjusted_Array[i] = 99999.0
+                BBP700_Adjusted_ERROR_Array[i] = 99999.0
+                BBP700_Adjusted_Array.mask[i] = True
+                BBP700_Adjusted_ERROR_Array.mask[i] = True
+            else:
+                BBP700_Adjusted_Array[i] = np.float32(raw_bbp)
+                BBP700_Adjusted_ERROR_Array[i] = np.float32(BBP700_Adjusted_ERROR_est)
+                BBP700_Adjusted_Array.mask[i] = False
+                BBP700_Adjusted_ERROR_Array.mask[i] = False
 
-            # Check pressure alignment with a 0.5 dbar tolerance
-            if np.isclose(csv_pres, nc_pres, atol=0.5):
-                raw_qc = row_data["BBP700_FINAL_QC"]
-                qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
-
-                raw_bbp = row_data["BBP700_FINAL"]
-
-                if pd.isna(raw_bbp) or raw_bbp == 99999.0 or qc_str in ["4", "9"]:
-                    BBP700_Adjusted_Array[i] = 99999.0
-                    BBP700_Adjusted_ERROR_Array[i] = 99999.0
-                    BBP700_Adjusted_Array.mask[i] = True
-                    BBP700_Adjusted_ERROR_Array.mask[i] = True
-                else:
-                    BBP700_Adjusted_Array[i] = np.float32(raw_bbp)
-                    BBP700_Adjusted_ERROR_Array[i] = np.float32(BBP700_Adjusted_ERROR_est)
-                    BBP700_Adjusted_Array.mask[i] = False
-                    BBP700_Adjusted_ERROR_Array.mask[i] = False
-
-                BBP700_AdjustedQC_Array[i] = qc_str.encode("utf-8")
-                assigned_nc_pres_vals.add(nc_pres)
-                break
+            BBP700_AdjustedQC_Array[i] = qc_str.encode("utf-8")
+        else:
+            BBP700_AdjustedQC_Array[i] = b"9"
 
     bgc_file.variables["BBP700_ADJUSTED"][iprof_idx] = BBP700_Adjusted_Array
     if "BBP700_ADJUSTED_QC" in bgc_file.variables:
@@ -663,7 +684,6 @@ def write_BBP700_adjusted(
     if "BBP700_ADJUSTED_ERROR" in bgc_file.variables:
         bgc_file.variables["BBP700_ADJUSTED_ERROR"][iprof_idx] = BBP700_Adjusted_ERROR_Array
 
-    # Compute and set profile QC grade strictly for target profile iprof_idx
     prof_bbp_qc = get_profile_qc_grade(BBP700_AdjustedQC_Array)
     if "PROFILE_BBP700_QC" in bgc_file.variables:
         bgc_file.variables["PROFILE_BBP700_QC"][iprof_idx] = np.array([prof_bbp_qc], dtype="|S1")
@@ -731,9 +751,7 @@ def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
 
 
 def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
-    """Set PARAMETER_DATA_MODE and DATA_MODE strictly for DOXY on target profile iprof_idx.
-    Leaves non-target parameters (PH_IN_SITU_TOTAL, NITRATE, etc.) untouched.
-    """
+    """Set PARAMETER_DATA_MODE and DATA_MODE strictly for DOXY on target profile iprof_idx."""
     n_param = bgc_file.dimensions["N_PARAM"].size
 
     pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
@@ -749,7 +767,7 @@ def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
             for c in param_mat[j]
         ]).strip()
         if param_str == "PRES":
-            pdm[iprof_idx, j] = "R"  # Force PRES to 'R'
+            pdm[iprof_idx, j] = "R"
         elif param_str.startswith("DOXY"):
             pdm[iprof_idx, j] = "D"
             data_mode[iprof_idx] = "D"
@@ -822,7 +840,6 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
 
     cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)].copy()
 
-    # Numeric Arrays (Masked)
     DOXY_Adjusted_Array = np.ma.empty(
         shape=(n_levels,), fill_value=99999.0, dtype="float32"
     )
@@ -844,55 +861,55 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
     DOXY_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
     DOXY_QC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
 
-    assigned_nc_pres_vals = set()
+    for i in range(n_levels):
+        nc_pres = np.float32(pres_nc[i])
+        if np.isnan(nc_pres):
+            continue
 
-    if not cycle_df.empty:
-        for row in range(len(cycle_df)):
-            row_data = cycle_df.iloc[row]
-            csv_pres = np.float32(row_data["PRES"])
+        matched_row = None
+        if not cycle_df.empty:
+            diffs = np.abs(cycle_df["PRES"].values - nc_pres)
+            min_idx = np.argmin(diffs)
+            if diffs[min_idx] <= 0.5:
+                matched_row = cycle_df.iloc[min_idx]
 
-            for i in range(n_levels):
-                nc_pres = np.float32(pres_nc[i])
-                if nc_pres in assigned_nc_pres_vals or np.isnan(nc_pres):
-                    continue
+        if matched_row is not None:
+            raw_qc = matched_row.get("DOXY_FINAL_QC")
+            qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
 
-                if np.isclose(csv_pres, nc_pres, atol=0.5):
-                    raw_qc = row_data.get("DOXY_FINAL_QC")
-                    qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
+            raw_doxy = matched_row.get("DOXY")
+            if pd.notna(raw_doxy) and raw_doxy != 99999.0:
+                DOXY_Array[i] = np.float32(raw_doxy)
+                DOXY_Array.mask[i] = False
+                DOXY_QC_Array[i] = b"1"
 
-                    raw_doxy = row_data.get("DOXY")
-                    if pd.notna(raw_doxy) and raw_doxy != 99999.0:
-                        DOXY_Array[i] = np.float32(raw_doxy)
-                        DOXY_Array.mask[i] = False
-                        DOXY_QC_Array[i] = b"1"
+            raw_doxy_final = matched_row.get("DOXY_FINAL")
+            if (
+                pd.isna(raw_doxy_final)
+                or raw_doxy_final == 99999.0
+                or qc_str in ["4", "9"]
+            ):
+                DOXY_Adjusted_Array[i] = 99999.0
+                DOXY_Adjusted_Array.mask[i] = True
+            else:
+                DOXY_Adjusted_Array[i] = np.float32(raw_doxy_final)
+                DOXY_Adjusted_Array.mask[i] = False
 
-                    raw_doxy_final = row_data.get("DOXY_FINAL")
-                    if (
-                        pd.isna(raw_doxy_final)
-                        or raw_doxy_final == 99999.0
-                        or qc_str in ["4", "9"]
-                    ):
-                        DOXY_Adjusted_Array[i] = 99999.0
-                        DOXY_Adjusted_Array.mask[i] = True
-                    else:
-                        DOXY_Adjusted_Array[i] = np.float32(raw_doxy_final)
-                        DOXY_Adjusted_Array.mask[i] = False
+            raw_doxy_error = matched_row.get("DOXY_ADJUSTED_ERROR")
+            if (
+                pd.notna(raw_doxy_error)
+                and raw_doxy_error != 99999.0
+                and qc_str not in ["4", "9"]
+            ):
+                DOXY_Adjusted_Error_Array[i] = np.float32(raw_doxy_error)
+                DOXY_Adjusted_Error_Array.mask[i] = False
+            else:
+                DOXY_Adjusted_Error_Array[i] = 99999.0
+                DOXY_Adjusted_Error_Array.mask[i] = True
 
-                    raw_doxy_error = row_data.get("DOXY_ADJUSTED_ERROR")
-                    if (
-                        pd.notna(raw_doxy_error)
-                        and raw_doxy_error != 99999.0
-                        and qc_str not in ["4", "9"]
-                    ):
-                        DOXY_Adjusted_Error_Array[i] = np.float32(raw_doxy_error)
-                        DOXY_Adjusted_Error_Array.mask[i] = False
-                    else:
-                        DOXY_Adjusted_Error_Array[i] = 99999.0
-                        DOXY_Adjusted_Error_Array.mask[i] = True
-
-                    DOXY_AdjustedQC_Array[i] = qc_str.encode("utf-8")
-                    assigned_nc_pres_vals.add(nc_pres)
-                    break
+            DOXY_AdjustedQC_Array[i] = qc_str.encode("utf-8")
+        else:
+            DOXY_AdjustedQC_Array[i] = b"9"
 
     if "DOXY" in var_names:
         doxy_var = ds.variables["DOXY"]
@@ -930,7 +947,6 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
         else:
             doxy_adj_err_var[:] = DOXY_Adjusted_Error_Array
 
-    # Compute profile QC grade specifically for DOXY strictly on target profile profile_idx
     prof_qc = get_profile_qc_grade(DOXY_AdjustedQC_Array)
     if "PROFILE_DOXY_QC" in ds.variables:
         prof_qc_var = ds.variables["PROFILE_DOXY_QC"]
@@ -1039,10 +1055,9 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                 if i not in [iprof_chla, iprof_bbp]:
                     continue
                 bgc_file.variables["DATA_STATE_INDICATOR"][i] = np.ma.array(
-                    data_state_indicator, mask=[False, False, True, True], dtype="|S1"
+                    ["2", "C", "", ""], mask=[False, False, True, True], dtype="|S1"
                 )
 
-            # Write adjusted CHLA and BBP700 data
             write_chla_BBP_adjusted(
                 bgc_file, idx_profile, bio_dmqc_csv_path, iprof_chla
             )
@@ -1050,7 +1065,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                 bgc_file, idx_profile, bio_dmqc_csv_path, iprof_bbp
             )
 
-            # Clean ALL QC variables (skipping PH, NITRATE, and non-target PROFILE_*_QC) and fix missing/forbidden attributes
             clean_and_fill_qc_variables(bgc_file)
             add_missing_valid_range_attributes(bgc_file)
             remove_forbidden_attributes(bgc_file)
@@ -1153,7 +1167,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                         ds, iprof_doxy, float_df, target_cycle
                     )
 
-                    # Clean ALL QC variables (skipping PH, NITRATE, and non-target PROFILE_*_QC) and fix missing/forbidden attributes
                     clean_and_fill_qc_variables(ds)
                     add_missing_valid_range_attributes(ds)
                     remove_forbidden_attributes(ds)
