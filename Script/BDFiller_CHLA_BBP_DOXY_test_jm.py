@@ -117,10 +117,6 @@ def apply_float_override_conditions(df, WMOfloatid):
         | ((float_str == "2904011") & (cycle_num >= 24))
     )
 
-    override_count = int(override_condition.sum())
-    # if override_count > 0:
-    #     print(f"  [DIAGNOSTIC] Broken sensor override matched {override_count} rows for Float {float_str}")
-
     float_cols = [
         "CHLA_FINAL",
         "BBP700_FINAL",
@@ -156,7 +152,6 @@ def apply_float_override_conditions(df, WMOfloatid):
     # HARDCODED OVERRIDE FOR CSV DATAFRAME ON FLOAT 2904010 CYCLE 60 DOXY
     doxy_hardcode_cond = (float_str == "2904010") & (cycle_num == 60)
     if doxy_hardcode_cond.any():
-        # print(f"  [HARDCODE PATCH] Applied DOXY CSV missing data override for Float {float_str} Cycle 60")
         for doxy_col in ["DOXY", "DOXY_FINAL", "DOXY_ADJUSTED_ERROR"]:
             if doxy_col in df.columns:
                 df.loc[doxy_hardcode_cond & (df["DOXY"].isna() | (df["DOXY"] == 99999.0)), doxy_col] = 99999.0
@@ -259,67 +254,77 @@ def clean_and_fill_qc_variables(bgc_file):
                             bgc_file.variables[var_name][iprof, :] = char_arr
 
             except Exception as e:
-                # print(f"Error cleaning QC var {var_name}: {e}")
                 pass
 
     # ==========================================================================
-    # ERROR DETECTION PRINT STATEMENT
-    # Checks specifically for: Raw QC is not '9' (missing) while ADJUSTED_QC IS '9'
+    # DIAGNOSTIC ERROR PRINT STATEMENT: TARGETS ALL PROFILES FOR BD2904010_060.nc
+    # Checks for levels where DOXY is missing (99999.0 / NaN) but DOXY_QC != '9'
     # ==========================================================================
-    for iprof in range(n_prof):
-        for param in ["DOXY", "CHLA", "BBP700"]:
-            adj_qc_name = f"{param}_ADJUSTED_QC"
-            raw_qc_name = f"{param}_QC"
+    filepath = getattr(bgc_file, "filepath", "") or getattr(bgc_file, "_filename", "")
+    if "2904010" in str(filepath) and "060" in str(filepath):
+        if "DOXY" in bgc_file.variables and "DOXY_QC" in bgc_file.variables:
+            for iprof in range(n_prof):
+                doxy_raw = bgc_file.variables["DOXY"][iprof, :]
+                doxy_qc = bgc_file.variables["DOXY_QC"][iprof, :]
+                pres = bgc_file.variables["PRES"][iprof, :] if "PRES" in bgc_file.variables else None
 
-            if raw_qc_name in bgc_file.variables and adj_qc_name in bgc_file.variables:
-                raw_qc = bgc_file.variables[raw_qc_name][iprof, :]
-                adj_qc = bgc_file.variables[adj_qc_name][iprof, :]
+                doxy_vals = doxy_raw.filled(99999.0) if hasattr(doxy_raw, "filled") else np.array(doxy_raw)
+                qc_vals = np.array(doxy_qc)
 
-                for lvl, (rqc, aqc) in enumerate(zip(raw_qc, adj_qc)):
-                    rqc_str = rqc.decode("utf-8") if isinstance(rqc, bytes) else str(rqc)
-                    aqc_str = aqc.decode("utf-8") if isinstance(aqc, bytes) else str(aqc)
+                for lvl, (d_val, q_val) in enumerate(zip(doxy_vals, qc_vals)):
+                    q_str = q_val.decode("utf-8") if isinstance(q_val, bytes) else str(q_val)
+                    p_val = pres[lvl] if pres is not None else "N/A"
 
-                    # Condition: Raw QC not missing ('9') but Adjusted QC IS missing ('9')
-                    if rqc_str != "9" and aqc_str == "9":
-                        filepath = getattr(bgc_file, "filepath", "Unknown File")
+                    # Error condition: DOXY is missing/fill, but DOXY_QC is NOT '9'
+                    if (pd.isna(d_val) or d_val == 99999.0) and q_str != "9":
                         print(
-                            f"[ERROR DETECTED] File: {os.path.basename(filepath)} | "
-                            f"Profile Index: {iprof} | Level: {lvl:03d} | "
-                            f"{param}_QC='{rqc_str}' (Not missing) vs {param}_ADJUSTED_QC='{aqc_str}' (Missing)"
+                            f"[DIAGNOSTIC DETECTED - FLOAT 2904010 CYCLE 060] "
+                            f"N_PROF (0-based): {iprof} (1-based: {iprof + 1}) | Level: {lvl:03d} | PRES: {p_val} | "
+                            f"DOXY: {d_val} (Missing) | DOXY_QC: '{q_str}' (MUST BE '9')"
                         )
 
 
 def apply_hardcoded_doxy_fix_2904010_060(ds):
-    """Direct NetCDF array patch for BD2904010_060.nc to guarantee all missing DOXY levels get DOXY_QC = '9'."""
+    """Direct NetCDF array patch for ALL profiles in BD2904010_060.nc to guarantee missing DOXY gets DOXY_QC = '9'."""
     filename = getattr(ds, "filepath", "") or getattr(ds, "_filename", "")
     if "2904010" not in str(filename) or "060" not in str(filename):
         return
 
-    # print("  [CRITICAL PATCH] Running targeted NetCDF override on BD2904010_060.nc")
     n_prof = ds.dimensions["N_PROF"].size
     for iprof in range(n_prof):
         if "DOXY" in ds.variables and "DOXY_QC" in ds.variables:
             doxy_var = ds.variables["DOXY"][iprof, :]
             doxy_qc = ds.variables["DOXY_QC"][iprof, :]
 
-            # Unmask if masked
+            # Extract unmasked array
             doxy_vals = doxy_var.filled(99999.0) if hasattr(doxy_var, "filled") else np.array(doxy_var)
             qc_vals = np.array(doxy_qc, copy=True)
 
+            # Find missing data levels
             missing_mask = (pd.isna(doxy_vals)) | (doxy_vals == 99999.0) | (doxy_vals == 0.0)
             if missing_mask.any():
                 qc_vals[missing_mask] = b"9"
                 ds.variables["DOXY_QC"][iprof, :] = qc_vals
 
                 if "DOXY_ADJUSTED_QC" in ds.variables:
-                    ds.variables["DOXY_ADJUSTED_QC"][iprof, missing_mask] = b"9"
+                    adj_qc = np.array(ds.variables["DOXY_ADJUSTED_QC"][iprof, :], copy=True)
+                    adj_qc[missing_mask] = b"9"
+                    ds.variables["DOXY_ADJUSTED_QC"][iprof, :] = adj_qc
+
                 if "DOXY_ADJUSTED" in ds.variables:
                     adj = ds.variables["DOXY_ADJUSTED"][iprof, :]
                     adj_vals = adj.filled(99999.0) if hasattr(adj, "filled") else np.array(adj)
                     adj_vals[missing_mask] = 99999.0
                     ds.variables["DOXY_ADJUSTED"][iprof, :] = adj_vals
 
-                # print(f"  [CRITICAL PATCH SUCCESS] Fixed {int(missing_mask.sum())} missing DOXY levels on N_PROF={iprof} for BD2904010_060.nc")
+                # Update Profile level QC flag
+                prof_doxy_qc = get_profile_qc_grade(qc_vals)
+                if "PROFILE_DOXY_QC" in ds.variables:
+                    qc_char = np.array([prof_doxy_qc], dtype="|S1")
+                    if ds.variables["PROFILE_DOXY_QC"].ndim == 1:
+                        ds.variables["PROFILE_DOXY_QC"][iprof] = qc_char
+                    elif ds.variables["PROFILE_DOXY_QC"].ndim == 2:
+                        ds.variables["PROFILE_DOXY_QC"][iprof, 0] = qc_char
 
 
 def add_missing_valid_range_attributes(bgc_file):
@@ -671,14 +676,6 @@ def write_chla_BBP_adjusted(
                     if chla_qc_arr is not None:
                         chla_qc_arr[i] = b"9"
                 bad_chla_levels += 1
-
-                # raw_v = chla_data_arr[i] if chla_data_arr is not None else "N/A"
-                # print(
-                #     f"  [CHLA FLAG SYNC DIAGNOSTIC] Level {i:03d} | PRES: {nc_pres:.1f} | "
-                #     f"Raw CHLA: {raw_v} | CSV CHLA_FINAL: {chla_final_val} | "
-                #     f"CSV QC: {qc_str} -> NetCDF CHLA_QC: {chla_qc_arr[i].decode('utf-8') if chla_qc_arr is not None else 'N/A'} | "
-                #     f"CHLA_ADJUSTED_QC: {CHLA_AdjustedQC_Array[i].decode('utf-8')}"
-                # )
             else:
                 CHLA_Adjusted_Array[i] = np.float32(chla_final_val)
                 CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
@@ -756,13 +753,6 @@ def write_chla_BBP_adjusted(
     if "PROFILE_CHLA_FLUORESCENCE_QC" in bgc_file.variables:
         bgc_file.variables["PROFILE_CHLA_FLUORESCENCE_QC"][iprof_idx] = np.array([prof_fluo_qc], dtype="|S1")
 
-    # print(
-    #     f"  [DIAGNOSTIC] Cycle {idx_profile:03d} | Profile {iprof_idx}:"
-    #     f" CHLA bad/missing levels = {bad_chla_levels}/{n_levels},"
-    #     f" CHLA_FLUORESCENCE bad/missing levels = {bad_fluo_levels}/{n_levels},"
-    #     f" PROFILE_CHLA_QC = '{prof_qc}', PROFILE_CHLA_FLUORESCENCE_QC = '{prof_fluo_qc}'"
-    # )
-
 
 def write_BBP700_adjusted(
     bgc_file, idx_profile, df_bio, iprof_idx=0
@@ -774,7 +764,6 @@ def write_BBP700_adjusted(
     cycle_df = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
 
     if "BBP700_FINAL" not in cycle_df.columns or "BBP700_FINAL_QC" not in cycle_df.columns:
-        # print(f"Warning: BBP700_FINAL/QC columns missing in CSV for cycle {idx_profile}.")
         return
 
     n_levels = bgc_file.dimensions["N_LEVELS"].size
@@ -870,8 +859,6 @@ def write_BBP700_adjusted(
     if "PROFILE_BBP700_QC" in bgc_file.variables:
         bgc_file.variables["PROFILE_BBP700_QC"][iprof_idx] = np.array([prof_bbp_qc], dtype="|S1")
 
-    # print(f"  [DIAGNOSTIC] Cycle {idx_profile:03d} | Profile {iprof_idx}: BBP700 bad/missing levels = {bad_bbp_levels}/{n_levels}, PROFILE_BBP700_QC = '{prof_bbp_qc}'")
-
 
 # ==============================================================================
 # SECTION 4: Helper Functions - DOXY Dissolved Oxygen Processing
@@ -964,7 +951,6 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
     """Write DOXY slope and drift calibration coefficients into SCIENTIFIC_CALIB_* per Argo DOXY Cookbook standards."""
     cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)]
     if cycle_df.empty:
-        # print(f"  [Warning] No cycle data found in CSV for cycle {target_cycle}")
         return
 
     slope_val = cycle_df["DOXY_SLOPE"].iloc[0] if "DOXY_SLOPE" in cycle_df.columns else np.nan
@@ -1007,28 +993,6 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
                     ds.variables["SCIENTIFIC_CALIB_COMMENT"][iprof, 0, j, :] = char_com
                 if "SCIENTIFIC_CALIB_DATE" in ds.variables:
                     ds.variables["SCIENTIFIC_CALIB_DATE"][iprof, 0, j, :] = char_date
-
-    written_calib = "N/A"
-    if "SCIENTIFIC_CALIB_COEFFICIENT" in ds.variables:
-        calib_raw = ds.variables["SCIENTIFIC_CALIB_COEFFICIENT"][profile_idx, 0]
-        for j in range(n_param):
-            p_bytes = ds.variables["STATION_PARAMETERS"][profile_idx, j]
-            param_str = "".join([
-                c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
-                for c in p_bytes
-            ]).strip()
-            if param_str.startswith("DOXY"):
-                written_calib = "".join([
-                    c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
-                    for c in calib_raw[j]
-                ]).strip()
-                break
-
-    # print(
-    #     f"  [CONFIRMATION] Cycle {target_cycle:03d} DOXY Calibration written to BD File:"
-    #     f" CSV Slope={slope_val}, CSV Drift={drift_val} |"
-    #     f" NetCDF SCIENTIFIC_CALIB_COEFFICIENT='{written_calib}'"
-    # )
 
 
 def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
@@ -1193,8 +1157,6 @@ def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
         elif prof_qc_var.ndim == 2:
             prof_qc_var[profile_idx, 0] = qc_char
 
-    # print(f"  [DIAGNOSTIC] Cycle {target_cycle:03d} | DOXY Profile Index {profile_idx}: DOXY bad/missing levels = {bad_doxy_levels}/{n_levels}, PROFILE_DOXY_QC = '{prof_qc}'")
-
     return (
         DOXY_Adjusted_Array.filled(99999.0)
         if hasattr(DOXY_Adjusted_Array, "filled")
@@ -1212,9 +1174,6 @@ def safe_rename(from_file, to_file):
             shutil.copyfile(from_file, to_file)
             os.remove(from_file)
         except Exception as e:
-            # print(
-            #     f"Warning: Failed to rename or copy {from_file} to {to_file}: {e}"
-            # )
             pass
 
 
@@ -1225,10 +1184,6 @@ def safe_rename(from_file, to_file):
 total_floats = len(WMO_FLOAT_IDS)
 
 for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
-    # print("\n" + "=" * 70)
-    # print(f" PROCESSING WMO FLOAT ID: {WMOfloatid} ({idx_f} of {total_floats})")
-    # print("=" * 70)
-
     main_float_dir = f"/data/a1/ARGO_DELAY/DMQC_BGC/data/{WMOfloatid}/"
     bio_dmqc_csv_path = (
         f"/data/a1/ARGO_DELAY/DMQC_BGC/data/csv/CHLA_BBP_DOXY_{WMOfloatid}.csv"
@@ -1239,30 +1194,20 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
     final_doxy_out_dir = os.path.join(output_lut_dir, today_str)
 
     if not os.path.exists(bio_dmqc_csv_path):
-        # print(
-        #     f"ERROR: CSV file not found at {bio_dmqc_csv_path}. Skipping Float"
-        #     f" {WMOfloatid}..."
-        # )
         continue
 
     if not os.path.exists(main_float_dir):
-        # print(
-        #     f"ERROR: Main float directory not found at {main_float_dir}. Skipping Float"
-        #     f" {WMOfloatid}..."
-        # )
         continue
 
     os.makedirs(output_lut_dir, exist_ok=True)
     os.makedirs(final_doxy_out_dir, exist_ok=True)
 
-    df_bio_raw = pd.read_csv(bio_dmqc_csv_path)
+    df_bio_raw = pd.read_csv(bio_dmqc_csv_path, low_memory=False)
     df_bio = apply_float_override_conditions(df_bio_raw, WMOfloatid)
 
     # --------------------------------------------------------------------------
     # STEP 1: CHLA & BBP700 BD Filler
     # --------------------------------------------------------------------------
-    # print(f"\n--- [Float {WMOfloatid}] Step 1: Running CHLA & BBP700 BD Filler ---")
-
     all_bd_files = sorted(
         glob.glob(os.path.join(main_float_dir, f"BD*{WMOfloatid}_*.nc"))
     )
@@ -1275,7 +1220,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
         )
 
     sorted_b_files = organize_b_files(all_bd_files, all_br_files)
-    # print(f"{len(sorted_b_files)} relevant B files found in main directory: {main_float_dir}")
 
     new_bd_files = []
 
@@ -1289,8 +1233,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
             iprof_chla = detect_parameter_profile(bgc_file, "CHLA")
             iprof_bbp = detect_parameter_profile(bgc_file, "BBP700")
-
-            # print(f"Processing File: {os.path.basename(bgc_filename)} | Cycle: {idx_profile:03d} | CHLA Profile Index: {iprof_chla} | BBP700 Profile Index: {iprof_bbp}")
 
             write_history_chla(bgc_file, iprof_chla)
             write_parameter_data_mode_chla(bgc_file, iprof_chla)
@@ -1316,9 +1258,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
             bgc_file.close()
             new_bd_files.append(w_bgc_filename)
-            # print(f"[PASS] CHLA & BBP700 BD Filler passed for cycle {idx_profile:03d} ({os.path.basename(bgc_filename)})\n")
         except Exception as e:
-            # print(f"Error processing CHLA/BBP700 for {bgc_filename}: {e}")
             pass
 
     for file in new_bd_files:
@@ -1331,8 +1271,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
     # --------------------------------------------------------------------------
     # STEP 2: DOXY BD Filler
     # --------------------------------------------------------------------------
-    # print(f"\n--- [Float {WMOfloatid}] Step 2: Running DOXY BD Filler ---")
-
     req_cols = [
         "FLOAT_NUM",
         "CYCLE_NUMBER",
@@ -1345,10 +1283,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
         "DOXY_ADJUSTED_ERROR",
     ]
     if not all(col in df_bio.columns for col in req_cols):
-        # print(
-        #     f"Warning: CSV file for float {WMOfloatid} missing required DOXY"
-        #     " columns. Skipping Step 2..."
-        # )
         continue
 
     df_bio["CYCLE_NUMBER"] = df_bio["CYCLE_NUMBER"].astype(int)
@@ -1379,10 +1313,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                 ) or glob.glob(os.path.join(output_lut_dir, pattern_bd_raw))
 
                 if not matched_files:
-                    # print(
-                    #     f"Warning: Cycle {target_cycle} present in CSV, but no matching"
-                    #     f" BD file found in LUT directory: {output_lut_dir}"
-                    # )
                     continue
 
                 bgc_filename = matched_files[0]
@@ -1415,7 +1345,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                     add_missing_valid_range_attributes(ds)
                     remove_forbidden_attributes(ds)
 
-                    # TARGETED HARDCODED OVERRIDE FOR BD2904010_060.nc BEFORE SAVE
+                    # TARGETED HARDCODED OVERRIDE FOR ALL PROFILES IN BD2904010_060.nc BEFORE SAVE
                     apply_hardcoded_doxy_fix_2904010_060(ds)
 
                     ds.close()
@@ -1425,16 +1355,11 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                     new_path = os.path.join(final_doxy_out_dir, new_name)
 
                     safe_rename(w_bgc_filename, new_path)
-                    # print(f"[PASS] DOXY BD Filler passed for cycle {target_cycle:03d} ({new_name})")
 
                 except Exception as e:
-                    # print(f"Error updating DOXY in file {w_bgc_filename}: {e}")
                     traceback.print_exc()
                     if "ds" in locals() and ds.isopen():
                         ds.close()
 
         except Exception as e:
-            # print(f"Error processing DOXY for Float ID {floatid}: {e}")
             pass
-
-# print("\nProcessing complete for all WMO Float IDs.")
