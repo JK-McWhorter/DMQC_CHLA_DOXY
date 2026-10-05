@@ -21,17 +21,17 @@ import pandas as pd
 
 # Dynamic mapping for Float IDs and Float Types
 FLOAT_TYPES = {
-    4903622: "aoml_apex",
+    # 4903622: "aoml_apex",
     2904010: "aoml_apex",
-    2904011: "aoml_apex",
-    4903624: "aoml_apex",
-    4903625: "aoml_apex",
-    4903904: "aoml_navis",
-    6999992: "aoml_navis",
-    7902327: "aoml_navis",
-    3902693: "aoml_apex",
-    1902800: "aoml_apex",
-    7901009: "aoml_navis",
+    # 2904011: "aoml_apex",
+    # 4903624: "aoml_apex",
+    # 4903625: "aoml_apex",
+    # 4903904: "aoml_navis",
+    # 6999992: "aoml_navis",
+    # 7902327: "aoml_navis",
+    # 3902693: "aoml_apex",
+    # 1902800: "aoml_apex",
+    # 7901009: "aoml_navis",
 }
 
 # Derived list of WMO Float IDs to process
@@ -55,12 +55,12 @@ scientific_calibration_comment_CHLA = (
     " 2018, Terrats et al., 2020)"
 )
 scientific_calibration_comment_CHLA_FLU = (
-    "CHLA_FLUORESCENCE  (specified in http://dx.doi.org/10.13155/35385 and"
+    "CHLA_FLUORESCENCE (specified in http://dx.doi.org/10.13155/35385 and"
     " computed with MLD_LIMIT = 0.03)"
 )
 scientific_calibration_equation_CHLA = (
-    "CHLA_ADJUSTED = CHLA_NPQ for PRES in [0, ZMaxFluo ], CHLA_ADJUSTED ="
-    " ((FLUORESCENCE_CHLA-MEDIAN(PRELIM_DARK_CHLA)*SCALE_CHLA)/PHYSIO_RATIO"
+    "CHLA_ADJUSTED = CHLA_NPQ for PRES in [0, ZMaxFluo], where "
+    "CHLA = ((FLUORESCENCE_CHLA - MEDIAN(PRELIM_DARK_CHLA)) * SCALE_CHLA) / PHYSIO_RATIO"
 )
 scientific_calibration_coefficient_CHLA = "PHYSIO_RATIO=1.0"
 CHLA_Adjusted_ERROR_est = 0.07
@@ -76,8 +76,6 @@ scientific_calibration_comment_DOXY = (
 scientific_calibration_comment_BROKEN = "Sensor failure / broken sensor - data flagged bad or missing (Argo BGC QC Manual)"
 scientific_calibration_equation_BROKEN = "Not applicable"
 scientific_calibration_coefficient_BROKEN = "Not applicable"
-
-data_state_indicator = ["2", "C", "", ""]
 
 # Standard Argo valid_min and valid_max ranges for physical & coordinate parameters
 ARGO_VALID_RANGES = {
@@ -318,7 +316,7 @@ def clean_and_fill_qc_variables(bgc_file):
                             bgc_file.variables[var_name][iprof, :] = char_arr
 
             except Exception as e:
-                pass
+                traceback.print_exc()
 
 
 def add_missing_valid_range_attributes(bgc_file):
@@ -413,12 +411,13 @@ def organize_b_files(bd_files, br_files):
 def update_history_entry(nc_ds, dct, iprof_idx):
     """Update HISTORY array entries natively using netCDF4."""
     hix = nc_ds.dimensions["N_HISTORY"].size
+    target_hix = max(0, hix - 1)
     for name, value in dct.items():
         if name in nc_ds.variables:
             char_len = nc_ds.dimensions[nc_ds[name].dimensions[-1]].size
             padded_val = str(value).ljust(char_len)[:char_len]
             char_arr = np.array(padded_val, dtype=f"S{char_len}")
-            nc_ds[name][hix - 1, iprof_idx, :] = nc.stringtochar(char_arr)
+            nc_ds[name][target_hix, iprof_idx, :] = nc.stringtochar(char_arr)
 
 
 def write_history_metadata(bgc_file, iprof_chla, iprof_doxy):
@@ -440,7 +439,7 @@ def write_history_metadata(bgc_file, iprof_chla, iprof_doxy):
             "HISTORY_SOFTWARE_RELEASE": history_software_release_chla,
             "HISTORY_REFERENCE": history_reference_chla,
             "HISTORY_DATE": UTCcurrent,
-            "HISTORY_ACTION": "IP",
+            "HISTORY_ACTION": "IP  ",
             "HISTORY_PARAMETER": history_parameter_chla,
         },
         iprof_chla,
@@ -456,7 +455,7 @@ def write_history_metadata(bgc_file, iprof_chla, iprof_doxy):
             "HISTORY_SOFTWARE_RELEASE": "2024",
             "HISTORY_REFERENCE": "WOA2023",
             "HISTORY_DATE": UTCcurrent,
-            "HISTORY_ACTION": "IP",
+            "HISTORY_ACTION": "IP  ",
             "HISTORY_PARAMETER": "DOXY",
         },
         iprof_doxy,
@@ -495,7 +494,7 @@ def write_parameter_data_modes(bgc_file):
             if p_str == "PRES":
                 pdm[iprof, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
             elif p_str in ["CHLA", "BBP700", "DOXY"]:
-                # Setting PARAMETER_DATA_MODE = 'D' signifies DMQC calibrated data is present in DOXY_ADJUSTED, CHLA_ADJUSTED, and BBP700_ADJUSTED
+                # Setting PARAMETER_DATA_MODE = 'D' signifies DMQC calibrated data is present
                 pdm[iprof, j] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
                 data_mode[iprof] = b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
 
@@ -608,11 +607,11 @@ def write_scientific_calib_chla(bgc_file, idx_profile, df_bio):
                 for c in p_bytes
             ]).strip()
 
-            if param_str.startswith("CHLA_F"):
+            if param_str == "CHLA_FLUORESCENCE":
                 bgc_file.variables["SCIENTIFIC_CALIB_COMMENT"][iprof_idx, 0, j, :] = SciCalComArray_CHLA_FLU
                 bgc_file.variables["SCIENTIFIC_CALIB_COEFFICIENT"][iprof_idx, 0, j, :] = SciCalCoeArray_CHLA_FLU
                 bgc_file.variables["SCIENTIFIC_CALIB_DATE"][iprof_idx, 0, j, :] = SciCalDateArray
-            elif param_str.startswith("CHLA"):
+            elif param_str == "CHLA":
                 bgc_file.variables["SCIENTIFIC_CALIB_COMMENT"][iprof_idx, 0, j, :] = SciCalComArray_CHLA
                 bgc_file.variables["SCIENTIFIC_CALIB_EQUATION"][iprof_idx, 0, j, :] = SciCalEquArray_CHLA
                 bgc_file.variables["SCIENTIFIC_CALIB_COEFFICIENT"][iprof_idx, 0, j, :] = SciCalCoeArray_CHLA
@@ -669,18 +668,6 @@ def write_chla_BBP_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
             if diffs[min_idx] <= 0.5:
                 matched_row = cycle_df.iloc[min_idx]
 
-        has_raw_chla_data = (
-            chla_data_arr is not None
-            and not pd.isna(chla_data_arr[i])
-            and chla_data_arr[i] != 99999.0
-        )
-
-        has_raw_fluo_data = (
-            fluo_data_arr is not None
-            and not pd.isna(fluo_data_arr[i])
-            and fluo_data_arr[i] != 99999.0
-        )
-
         if matched_row is not None:
             raw_qc = matched_row["CHLA_FINAL_QC"] if "CHLA_FINAL_QC" in matched_row else "9"
             qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
@@ -704,16 +691,11 @@ def write_chla_BBP_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
                 CHLA_Adjusted_ERROR_Array[i] = 99999.0
                 CHLA_Adjusted_Array.mask[i] = True
                 CHLA_Adjusted_ERROR_Array.mask[i] = True
-
-                if chla_qc_arr is not None:
-                    chla_qc_arr[i] = qc_str.encode("utf-8") if (has_raw_chla_data and qc_str in ["1", "2", "3", "4"]) else b"9"
             else:
                 CHLA_Adjusted_Array[i] = np.float32(chla_final_val)
                 CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
                 CHLA_Adjusted_Array.mask[i] = False
                 CHLA_Adjusted_ERROR_Array.mask[i] = False
-                if chla_qc_arr is not None and has_raw_chla_data:
-                    chla_qc_arr[i] = b"1"
 
             fluo_val = matched_row["CHLA_FLUORESCENCE"] if "CHLA_FLUORESCENCE" in matched_row else np.nan
             
@@ -724,16 +706,11 @@ def write_chla_BBP_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
                 CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = 99999.0
                 CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = True
                 CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = True
-
-                if fluo_qc_arr is not None:
-                    fluo_qc_arr[i] = fluo_qc_str.encode("utf-8") if (has_raw_fluo_data and fluo_qc_str in ["1", "2", "3", "4"]) else b"9"
             else:
                 CHLA_FLUORESCENCE_Adjusted_Array[i] = np.float32(fluo_val)
                 CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
                 CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = False
                 CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = False
-                if fluo_qc_arr is not None and has_raw_fluo_data:
-                    fluo_qc_arr[i] = fluo_qc_str.encode("utf-8") if fluo_qc_str in ["1", "2", "3", "4"] else b"1"
         else:
             CHLA_Adjusted_Array[i] = 99999.0
             CHLA_Adjusted_Array.mask[i] = True
@@ -746,10 +723,6 @@ def write_chla_BBP_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
 
             CHLA_AdjustedQC_Array[i] = b"9"
             CHLA_FLUORESCENCE_AdjustedQC_Array[i] = b"9"
-            if chla_qc_arr is not None:
-                chla_qc_arr[i] = b"4" if has_raw_chla_data else b"9"
-            if fluo_qc_arr is not None:
-                fluo_qc_arr[i] = b"4" if has_raw_fluo_data else b"9"
 
         if chla_data_arr is not None and (pd.isna(chla_data_arr[i]) or chla_data_arr[i] == 99999.0):
             if chla_qc_arr is not None:
@@ -830,12 +803,6 @@ def write_BBP700_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
             if diffs[min_idx] <= 0.5:
                 matched_row = cycle_df.iloc[min_idx]
 
-        has_raw_bbp_data = (
-            bbp_data_arr is not None
-            and not pd.isna(bbp_data_arr[i])
-            and bbp_data_arr[i] != 99999.0
-        )
-
         if matched_row is not None:
             raw_qc = matched_row["BBP700_FINAL_QC"]
             qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
@@ -848,24 +815,17 @@ def write_BBP700_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
                 BBP700_Adjusted_ERROR_Array[i] = 99999.0
                 BBP700_Adjusted_Array.mask[i] = True
                 BBP700_Adjusted_ERROR_Array.mask[i] = True
-
-                if bbp_qc_arr is not None:
-                    bbp_qc_arr[i] = qc_str.encode("utf-8") if (has_raw_bbp_data and qc_str in ["1", "2", "3", "4"]) else b"9"
             else:
                 BBP700_Adjusted_Array[i] = np.float32(raw_bbp)
                 BBP700_Adjusted_ERROR_Array[i] = np.float32(BBP700_Adjusted_ERROR_est)
                 BBP700_Adjusted_Array.mask[i] = False
                 BBP700_Adjusted_ERROR_Array.mask[i] = False
-                if bbp_qc_arr is not None and has_raw_bbp_data:
-                    bbp_qc_arr[i] = b"1"
         else:
             BBP700_Adjusted_Array[i] = 99999.0
             BBP700_Adjusted_Array.mask[i] = True
             BBP700_Adjusted_ERROR_Array[i] = 99999.0
             BBP700_Adjusted_ERROR_Array.mask[i] = True
             BBP700_AdjustedQC_Array[i] = b"9"
-            if bbp_qc_arr is not None:
-                bbp_qc_arr[i] = b"4" if has_raw_bbp_data else b"9"
 
         if bbp_data_arr is not None and (pd.isna(bbp_data_arr[i]) or bbp_data_arr[i] == 99999.0):
             if bbp_qc_arr is not None:
@@ -924,7 +884,7 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
                 for c in p_bytes
             ]).strip()
 
-            if param_str.startswith("DOXY"):
+            if param_str == "DOXY":
                 if "SCIENTIFIC_CALIB_COEFFICIENT" in ds.variables:
                     ds.variables["SCIENTIFIC_CALIB_COEFFICIENT"][iprof, 0, j, :] = char_coef
                 if "SCIENTIFIC_CALIB_EQUATION" in ds.variables:
@@ -991,13 +951,6 @@ def write_DOXY_from_csv(ds, float_df, target_cycle):
                 if diffs[min_idx] <= 0.5:
                     matched_row = cycle_df.iloc[min_idx]
 
-            has_raw_doxy_data = (
-                doxy_data_arr is not None
-                and not pd.isna(doxy_data_arr[i])
-                and doxy_data_arr[i] != 99999.0
-                and doxy_data_arr[i] != 0.0
-            )
-
             if matched_row is not None:
                 raw_qc = matched_row.get("DOXY_FINAL_QC")
                 qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
@@ -1021,21 +974,9 @@ def write_DOXY_from_csv(ds, float_df, target_cycle):
                     DOXY_Adjusted_Array.mask[i] = True
                     DOXY_Adjusted_Error_Array[i] = 99999.0
                     DOXY_Adjusted_Error_Array.mask[i] = True
-                    
-                    if doxy_qc_arr is not None:
-                        if has_raw_doxy_data:
-                            doxy_qc_arr[i] = qc_str.encode("utf-8") if qc_str in ["1", "2", "3", "4"] else b"4"
-                        else:
-                            doxy_qc_arr[i] = b"9"
                 else:
                     DOXY_Adjusted_Array[i] = np.float32(raw_doxy_final)
                     DOXY_Adjusted_Array.mask[i] = False
-                    
-                    if doxy_qc_arr is not None:
-                        if has_raw_doxy_data:
-                            doxy_qc_arr[i] = b"1"
-                        else:
-                            doxy_qc_arr[i] = b"9"
 
                     raw_doxy_error = matched_row.get("DOXY_ADJUSTED_ERROR")
                     if (
@@ -1053,8 +994,6 @@ def write_DOXY_from_csv(ds, float_df, target_cycle):
                 DOXY_Adjusted_Error_Array[i] = 99999.0
                 DOXY_Adjusted_Error_Array.mask[i] = True
                 DOXY_AdjustedQC_Array[i] = b"9"
-                if doxy_qc_arr is not None:
-                    doxy_qc_arr[i] = b"1" if has_raw_doxy_data else b"9"
 
             if doxy_data_arr is not None and (pd.isna(doxy_data_arr[i]) or doxy_data_arr[i] == 99999.0 or doxy_data_arr[i] == 0.0):
                 if doxy_qc_arr is not None:
@@ -1115,7 +1054,7 @@ def safe_rename(from_file, to_file):
         try:
             shutil.copyfile(from_file, to_file)
             os.remove(from_file)
-        except Exception as e:
+        except Exception:
             pass
 
 
@@ -1262,7 +1201,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
             safe_rename(w_bgc_filename, new_path)
 
-        except Exception as e:
+        except Exception:
             traceback.print_exc()
             if "ds" in locals() and ds.isopen():
                 ds.close()
