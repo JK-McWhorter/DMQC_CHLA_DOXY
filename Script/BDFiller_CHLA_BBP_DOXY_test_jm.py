@@ -22,17 +22,17 @@ import pandas as pd
 
 # Dynamic mapping for Float IDs and Float Types
 FLOAT_TYPES = {
-    4903622: "aoml_apex",
+    # 4903622: "aoml_apex",
     2904010: "aoml_apex",
-    2904011: "aoml_apex",
-    4903624: "aoml_apex",
-    4903625: "aoml_apex",
-    4903904: "aoml_navis",
-    6999992: "aoml_navis",
-    7902327: "aoml_navis",
-    3902693: "aoml_apex",
-    1902800: "aoml_apex",
-    7901009: "aoml_navis",
+    # 2904011: "aoml_apex",
+    # 4903624: "aoml_apex",
+    # 4903625: "aoml_apex",
+    # 4903904: "aoml_navis",
+    # 6999992: "aoml_navis",
+    # 7902327: "aoml_navis",
+    # 3902693: "aoml_apex",
+    # 1902800: "aoml_apex",
+    # 7901009: "aoml_navis",
 }
 
 # Derived list of WMO Float IDs to process
@@ -155,8 +155,10 @@ def apply_float_override_conditions(df, WMOfloatid):
         for doxy_col in ["DOXY", "DOXY_FINAL", "DOXY_ADJUSTED_ERROR"]:
             if doxy_col in df.columns:
                 df.loc[doxy_hardcode_cond & (df["DOXY"].isna() | (df["DOXY"] == 99999.0)), doxy_col] = 99999.0
-        if "DOXY_FINAL_QC" in df.columns:
-            df.loc[doxy_hardcode_cond & (df["DOXY"].isna() | (df["DOXY"] == 99999.0)), "DOXY_FINAL_QC"] = 9
+
+        doxy_qc_target_cols = [col for col in ["DOXY_FINAL_QC", "DOXY_QC"] if col in df.columns]
+        if doxy_qc_target_cols:
+            df.loc[doxy_hardcode_cond & (df["DOXY"].isna() | (df["DOXY"] == 99999.0)), doxy_qc_target_cols] = 9
 
     return df
 
@@ -480,11 +482,13 @@ def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
             c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
             for c in param_mat[j]
         ]).strip()
+
+        # FIXED: Match base parameter names stored in STATION_PARAMETERS
         if param_str == "PRES":
-            pdm[iprof_idx, j] = "R"
-        elif param_str.startswith("CHLA") or param_str.startswith("BBP"):
-            pdm[iprof_idx, j] = "D"
-            data_mode[iprof_idx] = "D"
+            pdm[iprof_idx, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
+        elif param_str in ["CHLA", "BBP700"]:
+            pdm[iprof_idx, j] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
+            data_mode[iprof_idx] = b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
 
     bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
     bgc_file.variables["DATA_MODE"][:] = data_mode
@@ -937,11 +941,13 @@ def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
             c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
             for c in param_mat[j]
         ]).strip()
+
+        # FIXED: Match base parameter names stored in STATION_PARAMETERS
         if param_str == "PRES":
-            pdm[iprof_idx, j] = "R"
-        elif param_str.startswith("DOXY"):
-            pdm[iprof_idx, j] = "D"
-            data_mode[iprof_idx] = "D"
+            pdm[iprof_idx, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
+        elif param_str == "DOXY":
+            pdm[iprof_idx, j] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
+            data_mode[iprof_idx] = b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
 
     bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
     bgc_file.variables["DATA_MODE"][:] = data_mode
@@ -1347,6 +1353,31 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
                     # TARGETED HARDCODED OVERRIDE FOR ALL PROFILES IN BD2904010_060.nc BEFORE SAVE
                     apply_hardcoded_doxy_fix_2904010_060(ds)
+
+                    # PRINT STATEMENT: Show PARAMETER_DATA_MODE for DOXY / DOXY_ADJUSTED
+                    if "PARAMETER_DATA_MODE" in ds.variables and "STATION_PARAMETERS" in ds.variables:
+                        station_params = ds.variables["STATION_PARAMETERS"][iprof_doxy]
+                        pdm_raw = ds.variables["PARAMETER_DATA_MODE"][iprof_doxy]
+
+                        doxy_pdm = "UNKNOWN"
+                        for j, p in enumerate(station_params):
+                            p_str = "".join([
+                                c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                                for c in p
+                            ]).strip()
+                            if p_str == "DOXY":
+                                val = pdm_raw[j]
+                                doxy_pdm = val.decode("utf-8") if isinstance(val, bytes) else str(val)
+                                break
+
+                        overall_dm = ds.variables["DATA_MODE"][iprof_doxy]
+                        overall_dm_str = overall_dm.decode("utf-8") if isinstance(overall_dm, bytes) else str(overall_dm)
+
+                        print(
+                            f"[PARAM DATA MODE] Float: {floatid} | Cycle: {target_cycle:03d} | "
+                            f"N_PROF: {iprof_doxy} | DOXY PARAMETER_DATA_MODE: '{doxy_pdm}' | "
+                            f"DOXY_ADJUSTED PARAMETER_DATA_MODE: '{doxy_pdm}' | PROFILE DATA_MODE: '{overall_dm_str}'"
+                        )
 
                     ds.close()
 
