@@ -14,7 +14,6 @@ import sys
 import traceback
 from datetime import datetime as dt, timezone
 
-import netCDF4
 import netCDF4 as nc
 import numpy as np
 import pandas as pd
@@ -22,17 +21,17 @@ import pandas as pd
 
 # Dynamic mapping for Float IDs and Float Types
 FLOAT_TYPES = {
-    # 4903622: "aoml_apex",
+    4903622: "aoml_apex",
     2904010: "aoml_apex",
-    # 2904011: "aoml_apex",
-    # 4903624: "aoml_apex",
-    # 4903625: "aoml_apex",
-    # 4903904: "aoml_navis",
-    # 6999992: "aoml_navis",
-    # 7902327: "aoml_navis",
-    # 3902693: "aoml_apex",
-    # 1902800: "aoml_apex",
-    # 7901009: "aoml_navis",
+    2904011: "aoml_apex",
+    4903624: "aoml_apex",
+    4903625: "aoml_apex",
+    4903904: "aoml_navis",
+    6999992: "aoml_navis",
+    7902327: "aoml_navis",
+    3902693: "aoml_apex",
+    1902800: "aoml_apex",
+    7901009: "aoml_navis",
 }
 
 # Derived list of WMO Float IDs to process
@@ -164,15 +163,66 @@ def apply_float_override_conditions(df, WMOfloatid):
 
 
 def clean_and_fill_qc_variables(bgc_file):
-    """Safely inspect and clean ALL QC variables in the NetCDF file.
-    Replaces blank or null QC flags with '9' (missing data).
-    Ensures Real-time ('R') parameters have FillValue (' ') for ADJUSTED_QC.
-    Strictly sets PROFILE_<PARAM>_QC to ' ' when parameter is not measured on profile.
+    """Safely inspect and clean ALL QC variables across ALL profiles in the NetCDF file.
+    Enforces strict Argo rules:
+    - Missing/Fill data MUST have QC = '9'.
+    - Valid data MUST have valid QC ('1', '2', '3', '4').
     """
     n_prof = bgc_file.dimensions["N_PROF"].size
 
     pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
     data_mode = bgc_file.variables["DATA_MODE"][:]
+
+    for param in ["DOXY", "CHLA", "BBP700"]:
+        qc_var_name = f"{param}_QC"
+        adj_qc_var_name = f"{param}_ADJUSTED_QC"
+
+        if param in bgc_file.variables and qc_var_name in bgc_file.variables:
+            p_var = bgc_file.variables[param]
+            q_var = bgc_file.variables[qc_var_name]
+
+            for iprof in range(n_prof):
+                p_raw = p_var[iprof, :] if p_var.ndim > 1 else p_var[:]
+                q_raw = q_var[iprof, :] if q_var.ndim > 1 else q_var[:]
+
+                p_vals = p_raw.filled(99999.0) if hasattr(p_raw, "filled") else np.array(p_raw)
+                q_vals = np.array(q_raw, copy=True)
+
+                missing_mask = (pd.isna(p_vals)) | (p_vals == 99999.0) | (p_vals == 0.0)
+                valid_mask = ~missing_mask
+
+                if missing_mask.any():
+                    q_vals[missing_mask] = b"9"
+
+                invalid_qc_mask = valid_mask & (
+                    (q_vals == b" ") | (q_vals == b"") | (q_vals == b"0") | (q_vals == b"\x00")
+                )
+                if invalid_qc_mask.any():
+                    q_vals[invalid_qc_mask] = b"1"
+
+                if q_var.ndim > 1:
+                    bgc_file.variables[qc_var_name][iprof, :] = q_vals
+                else:
+                    bgc_file.variables[qc_var_name][:] = q_vals
+
+                if adj_qc_var_name in bgc_file.variables:
+                    adj_qc_var = bgc_file.variables[adj_qc_var_name]
+                    adj_q_raw = adj_qc_var[iprof, :] if adj_qc_var.ndim > 1 else adj_qc_var[:]
+                    adj_q_vals = np.array(adj_q_raw, copy=True)
+
+                    if missing_mask.any():
+                        adj_q_vals[missing_mask] = b"9"
+
+                    adj_invalid_mask = valid_mask & (
+                        (adj_q_vals == b" ") | (adj_q_vals == b"") | (adj_q_vals == b"0") | (adj_q_vals == b"\x00")
+                    )
+                    if adj_invalid_mask.any():
+                        adj_q_vals[adj_invalid_mask] = b"1"
+
+                    if adj_qc_var.ndim > 1:
+                        bgc_file.variables[adj_qc_var_name][iprof, :] = adj_q_vals
+                    else:
+                        bgc_file.variables[adj_qc_var_name][:] = adj_q_vals
 
     for var_name, var in bgc_file.variables.items():
         if not var_name.endswith("_QC"):
@@ -195,7 +245,7 @@ def clean_and_fill_qc_variables(bgc_file):
                     has_param = False
                     for p in station_params:
                         p_str = "".join([
-                            c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                            c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c)
                             for c in p
                         ]).strip()
                         if p_str == param_base:
@@ -216,14 +266,19 @@ def clean_and_fill_qc_variables(bgc_file):
                             station_params = station_params.filled(b" ")
                         for j, p in enumerate(station_params):
                             p_str = "".join([
-                                c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                                c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c)
                                 for c in p
                             ]).strip()
                             if p_str == base_var:
-                                param_dm = pdm[iprof, j].decode("utf-8") if isinstance(pdm[iprof, j], bytes) else str(pdm[iprof, j])
+                                raw_pdm = pdm[iprof, j]
+                                if isinstance(raw_pdm, (bytes, np.bytes_)):
+                                    param_dm = raw_pdm.tobytes().decode("utf-8") if hasattr(raw_pdm, "tobytes") else raw_pdm.decode("utf-8")
+                                else:
+                                    param_dm = str(raw_pdm)
                                 break
                     else:
-                        param_dm = data_mode[iprof].decode("utf-8") if isinstance(data_mode[iprof], bytes) else str(data_mode[iprof])
+                        raw_dm = data_mode[iprof]
+                        param_dm = raw_dm.tobytes().decode("utf-8") if hasattr(raw_dm, "tobytes") else str(raw_dm)
 
                     if param_dm == "R":
                         fill_arr = np.full(var[iprof].shape, fill_value=b" ", dtype="|S1")
@@ -258,76 +313,6 @@ def clean_and_fill_qc_variables(bgc_file):
             except Exception as e:
                 pass
 
-    # ==========================================================================
-    # DIAGNOSTIC ERROR PRINT STATEMENT: TARGETS ALL PROFILES FOR BD2904010_060.nc
-    # Checks for levels where DOXY is missing (99999.0 / NaN) but DOXY_QC != '9'
-    # ==========================================================================
-    filepath = getattr(bgc_file, "filepath", "") or getattr(bgc_file, "_filename", "")
-    if "2904010" in str(filepath) and "060" in str(filepath):
-        if "DOXY" in bgc_file.variables and "DOXY_QC" in bgc_file.variables:
-            for iprof in range(n_prof):
-                doxy_raw = bgc_file.variables["DOXY"][iprof, :]
-                doxy_qc = bgc_file.variables["DOXY_QC"][iprof, :]
-                pres = bgc_file.variables["PRES"][iprof, :] if "PRES" in bgc_file.variables else None
-
-                doxy_vals = doxy_raw.filled(99999.0) if hasattr(doxy_raw, "filled") else np.array(doxy_raw)
-                qc_vals = np.array(doxy_qc)
-
-                for lvl, (d_val, q_val) in enumerate(zip(doxy_vals, qc_vals)):
-                    q_str = q_val.decode("utf-8") if isinstance(q_val, bytes) else str(q_val)
-                    p_val = pres[lvl] if pres is not None else "N/A"
-
-                    # Error condition: DOXY is missing/fill, but DOXY_QC is NOT '9'
-                    if (pd.isna(d_val) or d_val == 99999.0) and q_str != "9":
-                        print(
-                            f"[DIAGNOSTIC DETECTED - FLOAT 2904010 CYCLE 060] "
-                            f"N_PROF (0-based): {iprof} (1-based: {iprof + 1}) | Level: {lvl:03d} | PRES: {p_val} | "
-                            f"DOXY: {d_val} (Missing) | DOXY_QC: '{q_str}' (MUST BE '9')"
-                        )
-
-
-def apply_hardcoded_doxy_fix_2904010_060(ds):
-    """Direct NetCDF array patch for ALL profiles in BD2904010_060.nc to guarantee missing DOXY gets DOXY_QC = '9'."""
-    filename = getattr(ds, "filepath", "") or getattr(ds, "_filename", "")
-    if "2904010" not in str(filename) or "060" not in str(filename):
-        return
-
-    n_prof = ds.dimensions["N_PROF"].size
-    for iprof in range(n_prof):
-        if "DOXY" in ds.variables and "DOXY_QC" in ds.variables:
-            doxy_var = ds.variables["DOXY"][iprof, :]
-            doxy_qc = ds.variables["DOXY_QC"][iprof, :]
-
-            # Extract unmasked array
-            doxy_vals = doxy_var.filled(99999.0) if hasattr(doxy_var, "filled") else np.array(doxy_var)
-            qc_vals = np.array(doxy_qc, copy=True)
-
-            # Find missing data levels
-            missing_mask = (pd.isna(doxy_vals)) | (doxy_vals == 99999.0) | (doxy_vals == 0.0)
-            if missing_mask.any():
-                qc_vals[missing_mask] = b"9"
-                ds.variables["DOXY_QC"][iprof, :] = qc_vals
-
-                if "DOXY_ADJUSTED_QC" in ds.variables:
-                    adj_qc = np.array(ds.variables["DOXY_ADJUSTED_QC"][iprof, :], copy=True)
-                    adj_qc[missing_mask] = b"9"
-                    ds.variables["DOXY_ADJUSTED_QC"][iprof, :] = adj_qc
-
-                if "DOXY_ADJUSTED" in ds.variables:
-                    adj = ds.variables["DOXY_ADJUSTED"][iprof, :]
-                    adj_vals = adj.filled(99999.0) if hasattr(adj, "filled") else np.array(adj)
-                    adj_vals[missing_mask] = 99999.0
-                    ds.variables["DOXY_ADJUSTED"][iprof, :] = adj_vals
-
-                # Update Profile level QC flag
-                prof_doxy_qc = get_profile_qc_grade(qc_vals)
-                if "PROFILE_DOXY_QC" in ds.variables:
-                    qc_char = np.array([prof_doxy_qc], dtype="|S1")
-                    if ds.variables["PROFILE_DOXY_QC"].ndim == 1:
-                        ds.variables["PROFILE_DOXY_QC"][iprof] = qc_char
-                    elif ds.variables["PROFILE_DOXY_QC"].ndim == 2:
-                        ds.variables["PROFILE_DOXY_QC"][iprof, 0] = qc_char
-
 
 def add_missing_valid_range_attributes(bgc_file):
     """Ensure required Argo valid_min and valid_max attributes exist for essential variables."""
@@ -352,11 +337,6 @@ def remove_forbidden_attributes(bgc_file):
                     var.delncattr(attr)
 
 
-# ==============================================================================
-# SECTION 3: Helper Functions - CHLA & BBP700 Bio-Optical Processing
-# ==============================================================================
-
-
 def detect_parameter_profile(ds, param_prefix):
     """Dynamically locate the profile index (N_PROF) containing the target parameter prefix."""
     if "STATION_PARAMETERS" not in ds.variables:
@@ -372,7 +352,7 @@ def detect_parameter_profile(ds, param_prefix):
 
         for j in range(n_param):
             param_str = "".join([
-                c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c)
                 for c in param_mat[j]
             ]).strip()
             if param_str.startswith(param_prefix):
@@ -380,10 +360,10 @@ def detect_parameter_profile(ds, param_prefix):
     return 0
 
 
-def create_working_bd_file(filename, dest_dir=None):
+def create_working_bd_file(filename, dest_dir):
     """Create a working copy of the B file with a leading 'w_' in the name."""
     path, name = os.path.split(filename)
-    bd_name = name.replace("BR", "BD")
+    bd_name = re.sub(r"^BR", "BD", name)
     out_dir = dest_dir if dest_dir else path
     w_filename = os.path.join(out_dir, f"w_{bd_name}")
     shutil.copyfile(filename, w_filename)
@@ -423,72 +403,108 @@ def organize_b_files(bd_files, br_files):
     return sorted_b_files
 
 
-def update_history_chla(nc_ds, dct, iprof_idx):
+def update_history_entry(nc_ds, dct, iprof_idx):
     """Update HISTORY array entries natively using netCDF4."""
     hix = nc_ds.dimensions["N_HISTORY"].size
     for name, value in dct.items():
         if name in nc_ds.variables:
             char_len = nc_ds.dimensions[nc_ds[name].dimensions[-1]].size
             padded_val = str(value).ljust(char_len)[:char_len]
-            nc_ds[name][hix, iprof_idx, :] = nc.stringtochar(
-                np.array(padded_val, dtype=f"S{char_len}")
-            )
+            char_arr = np.array(padded_val, dtype=f"S{char_len}")
+            nc_ds[name][hix - 1, iprof_idx, :] = nc.stringtochar(char_arr)
 
 
-def write_history_chla(bgc_file, iprof_idx):
-    """Write global attributes and HISTORY variables for CHLA."""
+def write_history_metadata(bgc_file, iprof_chla, iprof_doxy):
+    """Write global attributes and HISTORY variables for CHLA and DOXY."""
     bgc_file.history = datetime.datetime.now(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ creation"
     )
     bgc_file.setncattr("comment_dmqc_operator", comment_dmqc_operator_chla)
 
-    history_step = "ARSQ"
-    history_action = "IP"
     UTCcurrent = datetime.datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
-    update_history_chla(
+    # Write CHLA history
+    update_history_entry(
         bgc_file,
         {
             "HISTORY_INSTITUTION": history_institution,
-            "HISTORY_STEP": history_step,
+            "HISTORY_STEP": "ARSQ",
             "HISTORY_SOFTWARE": history_software_chla,
             "HISTORY_SOFTWARE_RELEASE": history_software_release_chla,
             "HISTORY_REFERENCE": history_reference_chla,
             "HISTORY_DATE": UTCcurrent,
-            "HISTORY_ACTION": history_action,
+            "HISTORY_ACTION": "IP",
             "HISTORY_PARAMETER": history_parameter_chla,
         },
-        iprof_idx,
+        iprof_chla,
     )
 
-    bgc_file.variables["DATE_UPDATE"][:] = nc.stringtochar(
-        np.array(UTCcurrent, dtype="S14")
+    # Write DOXY history
+    update_history_entry(
+        bgc_file,
+        {
+            "HISTORY_INSTITUTION": "AO",
+            "HISTORY_STEP": "ARSQ",
+            "HISTORY_SOFTWARE": "BITTIG",
+            "HISTORY_SOFTWARE_RELEASE": "2024",
+            "HISTORY_REFERENCE": "WOA2023",
+            "HISTORY_DATE": UTCcurrent,
+            "HISTORY_ACTION": "IP",
+            "HISTORY_PARAMETER": "DOXY",
+        },
+        iprof_doxy,
     )
 
+    if "DATE_UPDATE" in bgc_file.variables:
+        bgc_file.variables["DATE_UPDATE"][:] = nc.stringtochar(
+            np.array(UTCcurrent, dtype="S14")
+        )
 
-def write_parameter_data_mode_chla(bgc_file, iprof_idx=0):
-    """Set PARAMETER_DATA_MODE and DATA_MODE strictly for CHLA and BBP700 on target profile iprof_idx."""
+
+def write_parameter_data_modes(bgc_file):
+    """Set PARAMETER_DATA_MODE and DATA_MODE strictly for PRES, CHLA, BBP700, and DOXY across all profiles per Argo standards."""
     n_param = bgc_file.dimensions["N_PARAM"].size
+    n_prof = bgc_file.dimensions["N_PROF"].size
+    str_param_len = bgc_file.variables["STATION_PARAMETERS"].shape[2]
 
     pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
     data_mode = bgc_file.variables["DATA_MODE"][:]
 
-    param_mat = bgc_file.variables["STATION_PARAMETERS"][iprof_idx]
-    if isinstance(param_mat, np.ma.MaskedArray):
-        param_mat = param_mat.filled(b" ")
+    for iprof in range(n_prof):
+        param_mat = bgc_file.variables["STATION_PARAMETERS"][iprof]
+        if isinstance(param_mat, np.ma.MaskedArray):
+            param_mat = param_mat.filled(b" ")
 
-    for j in range(n_param):
-        param_str = "".join([
-            c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
-            for c in param_mat[j]
-        ]).strip()
+        existing_params = []
+        for j in range(n_param):
+            p_bytes = param_mat[j]
+            p_str = "".join([
+                c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c)
+                for c in p_bytes
+            ]).strip()
+            
+            existing_params.append(p_str)
 
-        # FIXED: Match base parameter names stored in STATION_PARAMETERS
-        if param_str == "PRES":
-            pdm[iprof_idx, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
-        elif param_str in ["CHLA", "BBP700"]:
-            pdm[iprof_idx, j] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
-            data_mode[iprof_idx] = b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
+            if p_str == "PRES":
+                pdm[iprof, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
+            elif p_str in ["CHLA", "BBP700", "DOXY"]:
+                # Setting PARAMETER_DATA_MODE = 'D' signifies DMQC calibrated data is present in DOXY_ADJUSTED, CHLA_ADJUSTED, and BBP700_ADJUSTED
+                pdm[iprof, j] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
+                data_mode[iprof] = b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
+
+        # Ensure base parameters exist in STATION_PARAMETERS with 'D' mode
+        for required_param in ["CHLA", "BBP700", "DOXY"]:
+            if required_param not in existing_params:
+                try:
+                    empty_slot_idx = existing_params.index("")
+                    padded_param = required_param.ljust(str_param_len)[:str_param_len]
+                    char_param = nc.stringtochar(np.array(padded_param, dtype=f"S{str_param_len}"))
+                    bgc_file.variables["STATION_PARAMETERS"][iprof, empty_slot_idx, :] = char_param
+                    pdm[iprof, empty_slot_idx] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
+                    data_mode[iprof] = b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
+                    existing_params[empty_slot_idx] = required_param
+                except ValueError:
+                    pass
 
     bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
     bgc_file.variables["DATA_MODE"][:] = data_mode
@@ -517,7 +533,7 @@ def get_profile_qc_grade(qc_masked_array):
     good_count = total_points - bad_count
     pct_good = (good_count / total_points) * 100.0
 
-    if pct_good == 100.0:
+    if bad_count == 0:
         return "A"
     elif 75.0 <= pct_good < 100.0:
         return "B"
@@ -574,9 +590,17 @@ def write_scientific_calib_chla(bgc_file, idx_profile, df_bio):
     n_param_size = bgc_file.dimensions["N_PARAM"].size
 
     for iprof_idx in range(n_prof_size):
-        param_list = bgc_file.variables["STATION_PARAMETERS"][iprof_idx].data.astype(str)
+        station_params = bgc_file.variables["STATION_PARAMETERS"][iprof_idx]
+        if isinstance(station_params, np.ma.MaskedArray):
+            station_params = station_params.filled(b" ")
+
         for j in range(n_param_size):
-            param_str = "".join(param_list[j]).strip()
+            p_bytes = station_params[j]
+            param_str = "".join([
+                c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c)
+                for c in p_bytes
+            ]).strip()
+
             if param_str.startswith("CHLA_F"):
                 bgc_file.variables["SCIENTIFIC_CALIB_COMMENT"][iprof_idx, 0, j, :] = SciCalComArray_CHLA_FLU
                 bgc_file.variables["SCIENTIFIC_CALIB_COEFFICIENT"][iprof_idx, 0, j, :] = SciCalCoeArray_CHLA_FLU
@@ -588,17 +612,13 @@ def write_scientific_calib_chla(bgc_file, idx_profile, df_bio):
                 bgc_file.variables["SCIENTIFIC_CALIB_DATE"][iprof_idx, 0, j, :] = SciCalDateArray
 
 
-def write_chla_BBP_adjusted(
-    bgc_file, idx_profile, df_bio, iprof_idx=0
-):
-    """Populate ALL bio-optical variables (CHLA and BBP series) consistently using CSV CHLA_FINAL/BBP700_FINAL."""
+def write_chla_BBP_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
+    """Populate CHLA_ADJUSTED using CSV delayed-mode data (CHLA_FINAL)."""
     cycle_df = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
-
     n_levels = bgc_file.dimensions["N_LEVELS"].size
 
-    CHLA_Adjusted_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
+    CHLA_Adjusted_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
     CHLA_Adjusted_Array[:] = 99999.0
-    CHLA_Adjusted_Array.mask = True
 
     CHLA_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
 
@@ -610,13 +630,11 @@ def write_chla_BBP_adjusted(
     chla_data_arr = np.array(raw_chla_var, copy=True) if raw_chla_var is not None else None
     chla_qc_arr = np.array(raw_chla_qc_var, copy=True) if raw_chla_qc_var is not None else None
 
-    CHLA_Adjusted_ERROR_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
+    CHLA_Adjusted_ERROR_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
     CHLA_Adjusted_ERROR_Array[:] = 99999.0
-    CHLA_Adjusted_ERROR_Array.mask = True
 
-    CHLA_FLUORESCENCE_Adjusted_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
+    CHLA_FLUORESCENCE_Adjusted_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
     CHLA_FLUORESCENCE_Adjusted_Array[:] = 99999.0
-    CHLA_FLUORESCENCE_Adjusted_Array.mask = True
 
     CHLA_FLUORESCENCE_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
 
@@ -628,14 +646,10 @@ def write_chla_BBP_adjusted(
     fluo_data_arr = np.array(raw_fluo_var, copy=True) if raw_fluo_var is not None else None
     fluo_qc_arr = np.array(raw_fluo_qc_var, copy=True) if raw_fluo_qc_var is not None else None
 
-    CHLA_FLUORESCENCE_Adjusted_ERROR_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
+    CHLA_FLUORESCENCE_Adjusted_ERROR_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
     CHLA_FLUORESCENCE_Adjusted_ERROR_Array[:] = 99999.0
-    CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask = True
 
     nc_pres_all = np.float32(bgc_file.variables["PRES"][iprof_idx, :])
-
-    bad_chla_levels = 0
-    bad_fluo_levels = 0
 
     for i in range(n_levels):
         nc_pres = nc_pres_all[i]
@@ -679,7 +693,6 @@ def write_chla_BBP_adjusted(
                     CHLA_AdjustedQC_Array[i] = b"9"
                     if chla_qc_arr is not None:
                         chla_qc_arr[i] = b"9"
-                bad_chla_levels += 1
             else:
                 CHLA_Adjusted_Array[i] = np.float32(chla_final_val)
                 CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
@@ -704,18 +717,26 @@ def write_chla_BBP_adjusted(
                     CHLA_FLUORESCENCE_AdjustedQC_Array[i] = b"9"
                     if fluo_qc_arr is not None:
                         fluo_qc_arr[i] = b"9"
-                bad_fluo_levels += 1
             else:
                 CHLA_FLUORESCENCE_Adjusted_Array[i] = np.float32(fluo_val)
                 CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
                 CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = False
-                CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = False
+                CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = False
                 CHLA_FLUORESCENCE_AdjustedQC_Array[i] = qc_str.encode("utf-8")
                 if fluo_qc_arr is not None and has_raw_fluo_data:
                     fluo_qc_arr[i] = b"1"
         else:
-            CHLA_AdjustedQC_Array[i] = b"4" if has_raw_chla_data else b"9"
-            CHLA_FLUORESCENCE_AdjustedQC_Array[i] = b"4" if has_raw_fluo_data else b"9"
+            CHLA_Adjusted_Array[i] = 99999.0
+            CHLA_Adjusted_Array.mask[i] = True
+            CHLA_Adjusted_ERROR_Array[i] = 99999.0
+            CHLA_Adjusted_ERROR_Array.mask[i] = True
+            CHLA_FLUORESCENCE_Adjusted_Array[i] = 99999.0
+            CHLA_FLUORESCENCE_Adjusted_Array.mask[i] = True
+            CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = 99999.0
+            CHLA_FLUORESCENCE_Adjusted_ERROR_Array.mask[i] = True
+
+            CHLA_AdjustedQC_Array[i] = b"9"
+            CHLA_FLUORESCENCE_AdjustedQC_Array[i] = b"9"
             if chla_qc_arr is not None:
                 chla_qc_arr[i] = b"4" if has_raw_chla_data else b"9"
             if fluo_qc_arr is not None:
@@ -758,10 +779,8 @@ def write_chla_BBP_adjusted(
         bgc_file.variables["PROFILE_CHLA_FLUORESCENCE_QC"][iprof_idx] = np.array([prof_fluo_qc], dtype="|S1")
 
 
-def write_BBP700_adjusted(
-    bgc_file, idx_profile, df_bio, iprof_idx=0
-):
-    """Populate BBP700_ADJUSTED with consistent bio-optical missing data and QC rules."""
+def write_BBP700_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
+    """Populate BBP700_ADJUSTED using CSV delayed-mode data (BBP700_FINAL)."""
     if "BBP700_ADJUSTED" not in bgc_file.variables:
         return
 
@@ -781,19 +800,15 @@ def write_BBP700_adjusted(
     bbp_data_arr = np.array(raw_bbp_var, copy=True) if raw_bbp_var is not None else None
     bbp_qc_arr = np.array(raw_bbp_qc_var, copy=True) if raw_bbp_qc_var is not None else None
 
-    BBP700_Adjusted_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
+    BBP700_Adjusted_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
     BBP700_Adjusted_Array[:] = 99999.0
-    BBP700_Adjusted_Array.mask = True
 
     BBP700_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
 
-    BBP700_Adjusted_ERROR_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
+    BBP700_Adjusted_ERROR_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
     BBP700_Adjusted_ERROR_Array[:] = 99999.0
-    BBP700_Adjusted_ERROR_Array.mask = True
 
     nc_pres_all = np.float32(bgc_file.variables["PRES"][iprof_idx, :])
-
-    bad_bbp_levels = 0
 
     for i in range(n_levels):
         nc_pres = nc_pres_all[i]
@@ -830,7 +845,6 @@ def write_BBP700_adjusted(
                     BBP700_AdjustedQC_Array[i] = b"9"
                     if bbp_qc_arr is not None:
                         bbp_qc_arr[i] = b"9"
-                bad_bbp_levels += 1
             else:
                 BBP700_Adjusted_Array[i] = np.float32(raw_bbp)
                 BBP700_Adjusted_ERROR_Array[i] = np.float32(BBP700_Adjusted_ERROR_est)
@@ -840,7 +854,11 @@ def write_BBP700_adjusted(
                 if bbp_qc_arr is not None and has_raw_bbp_data:
                     bbp_qc_arr[i] = b"1"
         else:
-            BBP700_AdjustedQC_Array[i] = b"4" if has_raw_bbp_data else b"9"
+            BBP700_Adjusted_Array[i] = 99999.0
+            BBP700_Adjusted_Array.mask[i] = True
+            BBP700_Adjusted_ERROR_Array[i] = 99999.0
+            BBP700_Adjusted_ERROR_Array.mask[i] = True
+            BBP700_AdjustedQC_Array[i] = b"9"
             if bbp_qc_arr is not None:
                 bbp_qc_arr[i] = b"4" if has_raw_bbp_data else b"9"
 
@@ -862,95 +880,6 @@ def write_BBP700_adjusted(
     prof_bbp_qc = get_profile_qc_grade(BBP700_AdjustedQC_Array)
     if "PROFILE_BBP700_QC" in bgc_file.variables:
         bgc_file.variables["PROFILE_BBP700_QC"][iprof_idx] = np.array([prof_bbp_qc], dtype="|S1")
-
-
-# ==============================================================================
-# SECTION 4: Helper Functions - DOXY Dissolved Oxygen Processing
-# ==============================================================================
-
-
-def create_working_doxy_bd_file(filename, dest_dir):
-    """Copy file to destination directory as 'w_BD...' working file."""
-    base_name = os.path.basename(filename)
-    bd_name = re.sub(r"^BR", "BD", base_name)
-    w_filename = os.path.join(dest_dir, f"w_{bd_name}")
-    shutil.copyfile(filename, w_filename)
-    return w_filename
-
-
-def update_history_doxy(nc_ds, dct, iprof_idx):
-    """Update HISTORY array entries natively using netCDF4."""
-    hix = nc_ds.dimensions["N_HISTORY"].size
-    for name, value in dct.items():
-        if name in nc_ds.variables:
-            char_len = nc_ds.dimensions[nc_ds[name].dimensions[-1]].size
-            padded_val = str(value).ljust(char_len)[:char_len]
-            nc_ds[name][hix, iprof_idx, :] = nc.stringtochar(
-                np.array(padded_val, dtype=f"S{char_len}")
-            )
-
-
-def write_history_doxy(ds, profile_idx, inst, ref, comment_op):
-    """Update global history attributes for DOXY processing."""
-    ds.history = datetime.datetime.now(timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ creation"
-    )
-    ds.setncattr("comment_dmqc_operator", comment_op)
-
-    history_step = "ARSQ"
-    history_action = "IP"
-    history_software = "BITTIG"
-    history_software_release = "2024"
-    history_parameter = "DOXY"
-    UTCcurrent = datetime.datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-
-    update_history_doxy(
-        ds,
-        {
-            "HISTORY_INSTITUTION": inst,
-            "HISTORY_STEP": history_step,
-            "HISTORY_SOFTWARE": history_software,
-            "HISTORY_SOFTWARE_RELEASE": history_software_release,
-            "HISTORY_REFERENCE": ref,
-            "HISTORY_DATE": UTCcurrent,
-            "HISTORY_ACTION": history_action,
-            "HISTORY_PARAMETER": history_parameter,
-        },
-        profile_idx,
-    )
-
-    if "DATE_UPDATE" in ds.variables:
-        ds.variables["DATE_UPDATE"][:] = nc.stringtochar(
-            np.array(UTCcurrent, dtype="S14")
-        )
-
-
-def write_parameter_data_mode_doxy(bgc_file, iprof_idx=0):
-    """Set PARAMETER_DATA_MODE and DATA_MODE strictly for DOXY on target profile iprof_idx."""
-    n_param = bgc_file.dimensions["N_PARAM"].size
-
-    pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
-    data_mode = bgc_file.variables["DATA_MODE"][:]
-
-    param_mat = bgc_file.variables["STATION_PARAMETERS"][iprof_idx]
-    if isinstance(param_mat, np.ma.MaskedArray):
-        param_mat = param_mat.filled(b" ")
-
-    for j in range(n_param):
-        param_str = "".join([
-            c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
-            for c in param_mat[j]
-        ]).strip()
-
-        # FIXED: Match base parameter names stored in STATION_PARAMETERS
-        if param_str == "PRES":
-            pdm[iprof_idx, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
-        elif param_str == "DOXY":
-            pdm[iprof_idx, j] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
-            data_mode[iprof_idx] = b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
-
-    bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
-    bgc_file.variables["DATA_MODE"][:] = data_mode
 
 
 def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
@@ -986,7 +915,7 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
         for j in range(n_param):
             p_bytes = station_params_mat[j]
             param_str = "".join([
-                c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
+                c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c)
                 for c in p_bytes
             ]).strip()
 
@@ -1001,173 +930,178 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
                     ds.variables["SCIENTIFIC_CALIB_DATE"][iprof, 0, j, :] = char_date
 
 
-def write_DOXY_from_csv(ds, profile_idx, float_df, target_cycle):
-    """Populate DOXY_ADJUSTED using DOXY_FINAL and DOXY_ADJUSTED_QC using DOXY_FINAL_QC independently from CHLA."""
+def write_DOXY_from_csv(ds, float_df, target_cycle):
+    """Populate DOXY_ADJUSTED using CSV delayed-mode data (DOXY_FINAL) across ALL profiles
+    strictly following Argo DOXY Cookbook rules for missing/bad data."""
     var_names = ds.variables.keys()
     n_prof = ds.dimensions["N_PROF"].size
     n_levels = ds.dimensions["N_LEVELS"].size
 
     pres_nc_full = ds.variables["PRES"][:]
-
-    if pres_nc_full.ndim > 1:
-        if pres_nc_full.shape[0] == n_prof:
-            pres_nc = pres_nc_full[profile_idx, :]
-        else:
-            pres_nc = pres_nc_full[:, profile_idx]
-    else:
-        pres_nc = pres_nc_full
-
     cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)].copy()
 
-    DOXY_Adjusted_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
-    DOXY_Adjusted_Array[:] = 99999.0
-    DOXY_Adjusted_Array.mask = True
+    for iprof in range(n_prof):
+        if pres_nc_full.ndim > 1:
+            pres_nc = pres_nc_full[iprof, :] if pres_nc_full.shape[0] == n_prof else pres_nc_full[:, iprof]
+        else:
+            pres_nc = pres_nc_full
 
-    DOXY_Adjusted_Error_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
-    DOXY_Adjusted_Error_Array[:] = 99999.0
-    DOXY_Adjusted_Error_Array.mask = True
+        DOXY_Adjusted_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
+        DOXY_Adjusted_Array[:] = 99999.0
 
-    DOXY_Array = np.ma.empty(shape=(n_levels,), fill_value=99999.0, dtype="float32")
-    DOXY_Array[:] = 99999.0
-    DOXY_Array.mask = True
+        DOXY_Adjusted_Error_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
+        DOXY_Adjusted_Error_Array[:] = 99999.0
 
-    DOXY_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
+        DOXY_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
+        DOXY_Array[:] = 99999.0
 
-    # Fetch raw NetCDF arrays for DOXY and DOXY_QC
-    has_doxy = "DOXY" in ds.variables
-    has_doxy_qc = "DOXY_QC" in ds.variables
-    raw_doxy_var = ds.variables["DOXY"][profile_idx, :] if (has_doxy and ds.variables["DOXY"].ndim > 1) else (ds.variables["DOXY"][:] if has_doxy else None)
-    raw_doxy_qc_var = ds.variables["DOXY_QC"][profile_idx, :] if (has_doxy_qc and ds.variables["DOXY_QC"].ndim > 1) else (ds.variables["DOXY_QC"][:] if has_doxy_qc else None)
+        DOXY_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
 
-    doxy_data_arr = np.array(raw_doxy_var, copy=True) if raw_doxy_var is not None else None
-    doxy_qc_arr = np.array(raw_doxy_qc_var, copy=True) if raw_doxy_qc_var is not None else None
+        has_doxy = "DOXY" in ds.variables
+        has_doxy_qc = "DOXY_QC" in ds.variables
+        raw_doxy_var = ds.variables["DOXY"][iprof, :] if (has_doxy and ds.variables["DOXY"].ndim > 1) else (ds.variables["DOXY"][:] if has_doxy else None)
+        raw_doxy_qc_var = ds.variables["DOXY_QC"][iprof, :] if (has_doxy_qc and ds.variables["DOXY_QC"].ndim > 1) else (ds.variables["DOXY_QC"][:] if has_doxy_qc else None)
 
-    bad_doxy_levels = 0
+        doxy_data_arr = np.array(raw_doxy_var, copy=True) if raw_doxy_var is not None else None
+        doxy_qc_arr = np.array(raw_doxy_qc_var, copy=True) if raw_doxy_qc_var is not None else None
 
-    for i in range(n_levels):
-        nc_pres = np.float32(pres_nc[i])
-        if np.isnan(nc_pres):
-            continue
-
-        matched_row = None
-        if not cycle_df.empty:
-            diffs = np.abs(cycle_df["PRES"].values - nc_pres)
-            min_idx = np.argmin(diffs)
-            if diffs[min_idx] <= 0.5:
-                matched_row = cycle_df.iloc[min_idx]
-
-        has_raw_doxy_data = (
-            doxy_data_arr is not None
-            and not pd.isna(doxy_data_arr[i])
-            and doxy_data_arr[i] != 99999.0
-        )
-
-        if matched_row is not None:
-            raw_qc = matched_row.get("DOXY_FINAL_QC")
-            qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
-
-            raw_doxy = matched_row.get("DOXY")
-            if pd.notna(raw_doxy) and raw_doxy != 99999.0:
-                DOXY_Array[i] = np.float32(raw_doxy)
-                DOXY_Array.mask[i] = False
-
-            raw_doxy_final = matched_row.get("DOXY_FINAL")
-
-            if (
-                pd.isna(raw_doxy_final)
-                or raw_doxy_final == 99999.0
-                or qc_str in ["4", "9"]
-            ):
+        for i in range(n_levels):
+            nc_pres = np.float32(pres_nc[i])
+            
+            # Rule 1: Missing pressure or coordinate level gets FillValue 99999.0 and QC '9'
+            if np.isnan(nc_pres) or nc_pres == 99999.0:
                 DOXY_Adjusted_Array[i] = 99999.0
                 DOXY_Adjusted_Array.mask[i] = True
-
-                if has_raw_doxy_data:
-                    DOXY_AdjustedQC_Array[i] = b"4"
-                    if doxy_qc_arr is not None:
-                        doxy_qc_arr[i] = b"4"
-                else:
-                    DOXY_AdjustedQC_Array[i] = b"9"
-                    if doxy_qc_arr is not None:
-                        doxy_qc_arr[i] = b"9"
-                bad_doxy_levels += 1
-            else:
-                DOXY_Adjusted_Array[i] = np.float32(raw_doxy_final)
-                DOXY_Adjusted_Array.mask[i] = False
-                DOXY_AdjustedQC_Array[i] = qc_str.encode("utf-8")
-                if doxy_qc_arr is not None and has_raw_doxy_data:
-                    doxy_qc_arr[i] = b"1"
-
-            raw_doxy_error = matched_row.get("DOXY_ADJUSTED_ERROR")
-            if (
-                pd.notna(raw_doxy_error)
-                and raw_doxy_error != 99999.0
-                and qc_str not in ["4", "9"]
-            ):
-                DOXY_Adjusted_Error_Array[i] = np.float32(raw_doxy_error)
-                DOXY_Adjusted_Error_Array.mask[i] = False
-            else:
                 DOXY_Adjusted_Error_Array[i] = 99999.0
                 DOXY_Adjusted_Error_Array.mask[i] = True
-        else:
-            DOXY_AdjustedQC_Array[i] = b"4" if has_raw_doxy_data else b"9"
-            if doxy_qc_arr is not None:
-                doxy_qc_arr[i] = b"4" if has_raw_doxy_data else b"9"
+                DOXY_AdjustedQC_Array[i] = b"9"
+                if doxy_qc_arr is not None:
+                    doxy_qc_arr[i] = b"9"
+                continue
 
-        # Enforcement: Missing raw DOXY forces raw QC = '9'
-        if doxy_data_arr is not None and (pd.isna(doxy_data_arr[i]) or doxy_data_arr[i] == 99999.0):
-            if doxy_qc_arr is not None:
-                doxy_qc_arr[i] = b"9"
+            matched_row = None
+            if not cycle_df.empty:
+                diffs = np.abs(cycle_df["PRES"].values - nc_pres)
+                min_idx = np.argmin(diffs)
+                if diffs[min_idx] <= 0.5:
+                    matched_row = cycle_df.iloc[min_idx]
 
-    if "DOXY" in var_names:
-        doxy_var = ds.variables["DOXY"]
-        if doxy_var.ndim > 1:
-            if doxy_var.shape[0] == n_prof:
-                doxy_var[profile_idx, :] = DOXY_Array
-                ds.variables["DOXY_QC"][profile_idx, :] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
+            has_raw_doxy_data = (
+                doxy_data_arr is not None
+                and not pd.isna(doxy_data_arr[i])
+                and doxy_data_arr[i] != 99999.0
+                and doxy_data_arr[i] != 0.0
+            )
+
+            if matched_row is not None:
+                raw_qc = matched_row.get("DOXY_FINAL_QC")
+                qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
+
+                raw_doxy = matched_row.get("DOXY")
+                if pd.notna(raw_doxy) and raw_doxy != 99999.0 and raw_doxy != 0.0:
+                    DOXY_Array[i] = np.float32(raw_doxy)
+                    DOXY_Array.mask[i] = False
+
+                raw_doxy_final = matched_row.get("DOXY_FINAL")
+
+                # Rule 2: Unusable/Broken/Bad Data gets FillValue 99999.0 and QC '4' (if raw existed) or '9' (if absent)
+                if (
+                    pd.isna(raw_doxy_final)
+                    or raw_doxy_final == 99999.0
+                    or qc_str in ["4", "9"]
+                ):
+                    DOXY_Adjusted_Array[i] = 99999.0
+                    DOXY_Adjusted_Array.mask[i] = True
+                    DOXY_Adjusted_Error_Array[i] = 99999.0
+                    DOXY_Adjusted_Error_Array.mask[i] = True
+
+                    if has_raw_doxy_data:
+                        # Sensor failure / bad measurement
+                        DOXY_AdjustedQC_Array[i] = b"4"
+                        if doxy_qc_arr is not None:
+                            doxy_qc_arr[i] = b"4"
+                    else:
+                        # Missing observation
+                        DOXY_AdjustedQC_Array[i] = b"9"
+                        if doxy_qc_arr is not None:
+                            doxy_qc_arr[i] = b"9"
+                else:
+                    # Valid DMQC Adjusted DOXY Data
+                    DOXY_Adjusted_Array[i] = np.float32(raw_doxy_final)
+                    DOXY_Adjusted_Array.mask[i] = False
+                    DOXY_AdjustedQC_Array[i] = qc_str.encode("utf-8")
+                    if doxy_qc_arr is not None and has_raw_doxy_data:
+                        doxy_qc_arr[i] = b"1"
+
+                    raw_doxy_error = matched_row.get("DOXY_ADJUSTED_ERROR")
+                    if (
+                        pd.notna(raw_doxy_error)
+                        and raw_doxy_error != 99999.0
+                    ):
+                        DOXY_Adjusted_Error_Array[i] = np.float32(raw_doxy_error)
+                        DOXY_Adjusted_Error_Array.mask[i] = False
+                    else:
+                        DOXY_Adjusted_Error_Array[i] = 99999.0
+                        DOXY_Adjusted_Error_Array.mask[i] = True
             else:
-                doxy_var[:, profile_idx] = DOXY_Array
-                ds.variables["DOXY_QC"][:, profile_idx] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
-        else:
-            doxy_var[:] = DOXY_Array
-            ds.variables["DOXY_QC"][:] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
+                # Rule 3: No matching DMQC profile row found -> FillValue 99999.0 and QC '9'
+                DOXY_Adjusted_Array[i] = 99999.0
+                DOXY_Adjusted_Array.mask[i] = True
+                DOXY_Adjusted_Error_Array[i] = 99999.0
+                DOXY_Adjusted_Error_Array.mask[i] = True
+                DOXY_AdjustedQC_Array[i] = b"9"
+                if doxy_qc_arr is not None:
+                    doxy_qc_arr[i] = b"4" if has_raw_doxy_data else b"9"
 
-    if "DOXY_ADJUSTED" in var_names:
-        doxy_adj_var = ds.variables["DOXY_ADJUSTED"]
-        if doxy_adj_var.ndim > 1:
-            if doxy_adj_var.shape[0] == n_prof:
-                doxy_adj_var[profile_idx, :] = DOXY_Adjusted_Array
-                ds.variables["DOXY_ADJUSTED_QC"][profile_idx, :] = DOXY_AdjustedQC_Array
+            # Enforce QC '9' on raw DOXY if raw value is missing or 0.0
+            if doxy_data_arr is not None and (pd.isna(doxy_data_arr[i]) or doxy_data_arr[i] == 99999.0 or doxy_data_arr[i] == 0.0):
+                if doxy_qc_arr is not None:
+                    doxy_qc_arr[i] = b"9"
+
+        if "DOXY" in var_names:
+            doxy_var = ds.variables["DOXY"]
+            if doxy_var.ndim > 1:
+                if doxy_var.shape[0] == n_prof:
+                    doxy_var[iprof, :] = DOXY_Array
+                    ds.variables["DOXY_QC"][iprof, :] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
+                else:
+                    doxy_var[:, iprof] = DOXY_Array
+                    ds.variables["DOXY_QC"][:, iprof] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
             else:
-                doxy_adj_var[:, profile_idx] = DOXY_Adjusted_Array
-                ds.variables["DOXY_ADJUSTED_QC"][:, profile_idx] = DOXY_AdjustedQC_Array
-        else:
-            doxy_adj_var[:] = DOXY_Adjusted_Array
-            ds.variables["DOXY_ADJUSTED_QC"][:] = DOXY_AdjustedQC_Array
+                doxy_var[:] = DOXY_Array
+                ds.variables["DOXY_QC"][:] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
 
-    if "DOXY_ADJUSTED_ERROR" in var_names:
-        doxy_adj_err_var = ds.variables["DOXY_ADJUSTED_ERROR"]
-        if doxy_adj_err_var.ndim > 1:
-            if doxy_adj_err_var.shape[0] == n_prof:
-                doxy_adj_err_var[profile_idx, :] = DOXY_Adjusted_Error_Array
+        if "DOXY_ADJUSTED" in var_names:
+            doxy_adj_var = ds.variables["DOXY_ADJUSTED"]
+            if doxy_adj_var.ndim > 1:
+                if doxy_adj_var.shape[0] == n_prof:
+                    doxy_adj_var[iprof, :] = DOXY_Adjusted_Array
+                    ds.variables["DOXY_ADJUSTED_QC"][iprof, :] = DOXY_AdjustedQC_Array
+                else:
+                    doxy_adj_var[:, iprof] = DOXY_Adjusted_Array
+                    ds.variables["DOXY_ADJUSTED_QC"][:, iprof] = DOXY_AdjustedQC_Array
             else:
-                doxy_adj_err_var[:, profile_idx] = DOXY_Adjusted_Error_Array
-        else:
-            doxy_adj_err_var[:] = DOXY_Adjusted_Error_Array
+                doxy_adj_var[:] = DOXY_Adjusted_Array
+                ds.variables["DOXY_ADJUSTED_QC"][:] = DOXY_AdjustedQC_Array
 
-    prof_qc = get_profile_qc_grade(DOXY_AdjustedQC_Array)
-    if "PROFILE_DOXY_QC" in ds.variables:
-        prof_qc_var = ds.variables["PROFILE_DOXY_QC"]
-        qc_char = np.array([prof_qc], dtype="|S1")
-        if prof_qc_var.ndim == 1:
-            prof_qc_var[profile_idx] = qc_char
-        elif prof_qc_var.ndim == 2:
-            prof_qc_var[profile_idx, 0] = qc_char
+        if "DOXY_ADJUSTED_ERROR" in var_names:
+            doxy_adj_err_var = ds.variables["DOXY_ADJUSTED_ERROR"]
+            if doxy_adj_err_var.ndim > 1:
+                if doxy_adj_err_var.shape[0] == n_prof:
+                    doxy_adj_err_var[iprof, :] = DOXY_Adjusted_Error_Array
+                else:
+                    doxy_adj_err_var[:, iprof] = DOXY_Adjusted_Error_Array
+            else:
+                doxy_adj_err_var[:] = DOXY_Adjusted_Error_Array
 
-    return (
-        DOXY_Adjusted_Array.filled(99999.0)
-        if hasattr(DOXY_Adjusted_Array, "filled")
-        else DOXY_Adjusted_Array
-    )
+        prof_qc = get_profile_qc_grade(DOXY_AdjustedQC_Array)
+        if "PROFILE_DOXY_QC" in ds.variables:
+            prof_qc_var = ds.variables["PROFILE_DOXY_QC"]
+            qc_char = np.array([prof_qc], dtype="|S1")
+            if prof_qc_var.ndim == 1:
+                prof_qc_var[iprof] = qc_char
+            elif prof_qc_var.ndim == 2:
+                prof_qc_var[iprof, 0] = qc_char
 
 
 def safe_rename(from_file, to_file):
@@ -1183,11 +1117,36 @@ def safe_rename(from_file, to_file):
             pass
 
 
-# ==============================================================================
-# SECTION 5: Processing Loop Across All Float IDs
-# ==============================================================================
+def extract_parameter_data_mode(ds, target_param, iprof):
+    """Helper to cleanly resolve parameter data mode string for a given parameter name and profile index."""
+    if "STATION_PARAMETERS" not in ds.variables or "PARAMETER_DATA_MODE" not in ds.variables:
+        return "UNKNOWN"
 
-total_floats = len(WMO_FLOAT_IDS)
+    station_params_mat = ds.variables["STATION_PARAMETERS"][iprof]
+    if isinstance(station_params_mat, np.ma.MaskedArray):
+        station_params_mat = station_params_mat.filled(b" ")
+
+    pdm_raw = ds.variables["PARAMETER_DATA_MODE"][iprof]
+
+    for j in range(ds.dimensions["N_PARAM"].size):
+        param_chars = station_params_mat[j]
+        p_str = "".join([
+            c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c)
+            for c in param_chars
+        ]).strip()
+
+        if p_str == target_param:
+            val = pdm_raw[j]
+            if isinstance(val, (bytes, np.bytes_)):
+                return val.tobytes().decode("utf-8").strip() if hasattr(val, "tobytes") else val.decode("utf-8").strip()
+            return str(val).strip()
+
+    return "NOT_FOUND"
+
+
+# ==============================================================================
+# SECTION 5: Efficient Single-Pass Processing Loop
+# ==============================================================================
 
 for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
     main_float_dir = f"/data/a1/ARGO_DELAY/DMQC_BGC/data/{WMOfloatid}/"
@@ -1197,23 +1156,18 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
     output_lut_dir = os.path.join(main_float_dir, "LUT")
     today_str = dt.now().strftime("%Y-%m-%d")
-    final_doxy_out_dir = os.path.join(output_lut_dir, today_str)
+    final_out_dir = os.path.join(output_lut_dir, today_str)
 
-    if not os.path.exists(bio_dmqc_csv_path):
-        continue
-
-    if not os.path.exists(main_float_dir):
+    if not os.path.exists(bio_dmqc_csv_path) or not os.path.exists(main_float_dir):
         continue
 
     os.makedirs(output_lut_dir, exist_ok=True)
-    os.makedirs(final_doxy_out_dir, exist_ok=True)
+    os.makedirs(final_out_dir, exist_ok=True)
 
     df_bio_raw = pd.read_csv(bio_dmqc_csv_path, low_memory=False)
     df_bio = apply_float_override_conditions(df_bio_raw, WMOfloatid)
 
-    # --------------------------------------------------------------------------
-    # STEP 1: CHLA & BBP700 BD Filler
-    # --------------------------------------------------------------------------
+    # Locate input BD files
     all_bd_files = sorted(
         glob.glob(os.path.join(main_float_dir, f"BD*{WMOfloatid}_*.nc"))
     )
@@ -1227,170 +1181,86 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
     sorted_b_files = organize_b_files(all_bd_files, all_br_files)
 
-    new_bd_files = []
-
+    # Process each BD file in a SINGLE unified pass
     for bgc_filename in sorted_b_files:
         idx_profile = int(bgc_filename[-6:-3])
-
-        w_bgc_filename = create_working_bd_file(bgc_filename, dest_dir=output_lut_dir)
-
-        try:
-            bgc_file = netCDF4.Dataset(w_bgc_filename, "a")
-
-            iprof_chla = detect_parameter_profile(bgc_file, "CHLA")
-            iprof_bbp = detect_parameter_profile(bgc_file, "BBP700")
-
-            write_history_chla(bgc_file, iprof_chla)
-            write_parameter_data_mode_chla(bgc_file, iprof_chla)
-            write_scientific_calib_chla(bgc_file, idx_profile, df_bio)
-
-            for i in range(bgc_file.dimensions["N_PROF"].size):
-                if i not in [iprof_chla, iprof_bbp]:
-                    continue
-                bgc_file.variables["DATA_STATE_INDICATOR"][i] = np.ma.array(
-                    ["2", "C", "", ""], mask=[False, False, True, True], dtype="|S1"
-                )
-
-            write_chla_BBP_adjusted(
-                bgc_file, idx_profile, df_bio, iprof_chla
-            )
-            write_BBP700_adjusted(
-                bgc_file, idx_profile, df_bio, iprof_bbp
-            )
-
-            clean_and_fill_qc_variables(bgc_file)
-            add_missing_valid_range_attributes(bgc_file)
-            remove_forbidden_attributes(bgc_file)
-
-            bgc_file.close()
-            new_bd_files.append(w_bgc_filename)
-        except Exception as e:
-            pass
-
-    for file in new_bd_files:
-        path, name = os.path.split(file)
-        new_name = re.sub(r"^w_AOML_BD", "BD", name)
-        new_name = re.sub(r"^w_BD", "BD", new_name)
-        new_path = os.path.join(output_lut_dir, new_name)
-        safe_rename(file, new_path)
-
-    # --------------------------------------------------------------------------
-    # STEP 2: DOXY BD Filler
-    # --------------------------------------------------------------------------
-    req_cols = [
-        "FLOAT_NUM",
-        "CYCLE_NUMBER",
-        "PRES",
-        "DOXY",
-        "DOXY_FINAL",
-        "DOXY_FINAL_QC",
-        "DOXY_SLOPE",
-        "DOXY_DRIFT",
-        "DOXY_ADJUSTED_ERROR",
-    ]
-    if not all(col in df_bio.columns for col in req_cols):
-        continue
-
-    df_bio["CYCLE_NUMBER"] = df_bio["CYCLE_NUMBER"].astype(int)
-    unique_floats = df_bio["FLOAT_NUM"].unique()
-
-    for float_id_raw in unique_floats:
-        floatid = int(float_id_raw)
-        float_df = df_bio[df_bio["FLOAT_NUM"] == floatid]
+        w_bgc_filename = create_working_bd_file(bgc_filename, dest_dir=final_out_dir)
 
         try:
-            inst_float = FLOAT_TYPES.get(floatid, "aoml_apex")
+            ds = nc.Dataset(w_bgc_filename, "r+")
 
-            comment_dmqc_operator = (
-                "PRIMARY | https://orcid.org/0000-0003-1297-6599 | Jennifer"
-                " McWhorter, NOAA/AOML"
+            iprof_chla = detect_parameter_profile(ds, "CHLA")
+            iprof_bbp = detect_parameter_profile(ds, "BBP700")
+
+            # 1. Update CHLA & BBP700 Delayed-Mode Data
+            write_scientific_calib_chla(ds, idx_profile, df_bio)
+            write_chla_BBP_adjusted(ds, idx_profile, df_bio, iprof_chla)
+            write_BBP700_adjusted(ds, idx_profile, df_bio, iprof_bbp)
+
+            # 2. Update DOXY Delayed-Mode Data
+            write_DOXY_slope_drift(ds, 0, df_bio, idx_profile)
+            write_DOXY_from_csv(ds, df_bio, idx_profile)
+
+            iprof_doxy = detect_parameter_profile(ds, "DOXY")
+
+            # 3. Update History Metadata for both CHLA and DOXY
+            write_history_metadata(ds, iprof_chla, iprof_doxy)
+
+            # 4. Set DATA_MODE and PARAMETER_DATA_MODE strictly per Argo standards
+            write_parameter_data_modes(ds)
+
+            # 5. Clean QC flags and valid range attributes
+            clean_and_fill_qc_variables(ds)
+            add_missing_valid_range_attributes(ds)
+            remove_forbidden_attributes(ds)
+
+            for i in range(ds.dimensions["N_PROF"].size):
+                if i in [iprof_chla, iprof_bbp, iprof_doxy]:
+                    ds.variables["DATA_STATE_INDICATOR"][i, :] = nc.stringtochar(
+                        np.array("2C  ", dtype="S4")
+                    )
+
+            # Print statements verifying mode setup for CHLA, BBP700, and DOXY
+            chla_pdm = extract_parameter_data_mode(ds, "CHLA", iprof_chla)
+            bbp_pdm = extract_parameter_data_mode(ds, "BBP700", iprof_bbp)
+            doxy_pdm = extract_parameter_data_mode(ds, "DOXY", iprof_doxy)
+
+            def get_clean_dm(ds_var, prof_idx):
+                raw = ds_var[prof_idx]
+                if isinstance(raw, (bytes, np.bytes_)):
+                    return raw.tobytes().decode("utf-8").strip() if hasattr(raw, "tobytes") else raw.decode("utf-8").strip()
+                return str(raw).strip()
+
+            dm_chla_str = get_clean_dm(ds.variables["DATA_MODE"], iprof_chla) if "DATA_MODE" in ds.variables else "N/A"
+            dm_bbp_str = get_clean_dm(ds.variables["DATA_MODE"], iprof_bbp) if "DATA_MODE" in ds.variables else "N/A"
+            dm_doxy_str = get_clean_dm(ds.variables["DATA_MODE"], iprof_doxy) if "DATA_MODE" in ds.variables else "N/A"
+
+            print(
+                f"[PARAM DATA MODE] Float: {WMOfloatid} | Cycle: {idx_profile:03d} | "
+                f"N_PROF: {iprof_chla} | CHLA (Raw) DATA_MODE: 'R' | "
+                f"CHLA_ADJUSTED PARAMETER_DATA_MODE: '{chla_pdm}' | PROFILE DATA_MODE: '{dm_chla_str}'"
             )
-            history_institution = "AO"
-            history_reference = "WOA2023"
+            print(
+                f"[PARAM DATA MODE] Float: {WMOfloatid} | Cycle: {idx_profile:03d} | "
+                f"N_PROF: {iprof_bbp} | BBP700 (Raw) DATA_MODE: 'R' | "
+                f"BBP700_ADJUSTED PARAMETER_DATA_MODE: '{bbp_pdm}' | PROFILE DATA_MODE: '{dm_bbp_str}'"
+            )
+            print(
+                f"[PARAM DATA MODE] Float: {WMOfloatid} | Cycle: {idx_profile:03d} | "
+                f"N_PROF: {iprof_doxy} | DOXY (Raw) DATA_MODE: 'R' | "
+                f"DOXY_ADJUSTED PARAMETER_DATA_MODE: '{doxy_pdm}' | PROFILE DATA_MODE: '{dm_doxy_str}'"
+            )
 
-            csv_cycles = sorted(float_df["CYCLE_NUMBER"].unique())
+            ds.close()
 
-            for target_cycle in csv_cycles:
-                pattern_bd = f"BD*{floatid}_{target_cycle:03d}.nc"
-                pattern_bd_raw = f"BD*{floatid}_{target_cycle}.nc"
+            base_name = os.path.basename(w_bgc_filename)
+            new_name = re.sub(r"^w_AOML_BD", "BD", base_name)
+            new_name = re.sub(r"^w_BD", "BD", new_name)
+            new_path = os.path.join(final_out_dir, new_name)
 
-                matched_files = glob.glob(
-                    os.path.join(output_lut_dir, pattern_bd)
-                ) or glob.glob(os.path.join(output_lut_dir, pattern_bd_raw))
-
-                if not matched_files:
-                    continue
-
-                bgc_filename = matched_files[0]
-
-                w_bgc_filename = create_working_doxy_bd_file(
-                    bgc_filename, final_doxy_out_dir
-                )
-
-                try:
-                    ds = nc.Dataset(w_bgc_filename, "r+")
-
-                    iprof_doxy = detect_parameter_profile(ds, "DOXY")
-
-                    write_history_doxy(
-                        ds,
-                        iprof_doxy,
-                        history_institution,
-                        history_reference,
-                        comment_dmqc_operator,
-                    )
-
-                    write_parameter_data_mode_doxy(ds, iprof_idx=iprof_doxy)
-                    write_DOXY_slope_drift(ds, iprof_doxy, float_df, target_cycle)
-
-                    doxy_adjusted = write_DOXY_from_csv(
-                        ds, iprof_doxy, float_df, target_cycle
-                    )
-
-                    clean_and_fill_qc_variables(ds)
-                    add_missing_valid_range_attributes(ds)
-                    remove_forbidden_attributes(ds)
-
-                    # TARGETED HARDCODED OVERRIDE FOR ALL PROFILES IN BD2904010_060.nc BEFORE SAVE
-                    apply_hardcoded_doxy_fix_2904010_060(ds)
-
-                    # PRINT STATEMENT: Show PARAMETER_DATA_MODE for DOXY / DOXY_ADJUSTED
-                    if "PARAMETER_DATA_MODE" in ds.variables and "STATION_PARAMETERS" in ds.variables:
-                        station_params = ds.variables["STATION_PARAMETERS"][iprof_doxy]
-                        pdm_raw = ds.variables["PARAMETER_DATA_MODE"][iprof_doxy]
-
-                        doxy_pdm = "UNKNOWN"
-                        for j, p in enumerate(station_params):
-                            p_str = "".join([
-                                c.decode("utf-8", errors="ignore") if isinstance(c, bytes) else str(c)
-                                for c in p
-                            ]).strip()
-                            if p_str == "DOXY":
-                                val = pdm_raw[j]
-                                doxy_pdm = val.decode("utf-8") if isinstance(val, bytes) else str(val)
-                                break
-
-                        overall_dm = ds.variables["DATA_MODE"][iprof_doxy]
-                        overall_dm_str = overall_dm.decode("utf-8") if isinstance(overall_dm, bytes) else str(overall_dm)
-
-                        print(
-                            f"[PARAM DATA MODE] Float: {floatid} | Cycle: {target_cycle:03d} | "
-                            f"N_PROF: {iprof_doxy} | DOXY PARAMETER_DATA_MODE: '{doxy_pdm}' | "
-                            f"DOXY_ADJUSTED PARAMETER_DATA_MODE: '{doxy_pdm}' | PROFILE DATA_MODE: '{overall_dm_str}'"
-                        )
-
-                    ds.close()
-
-                    base_name = os.path.basename(w_bgc_filename)
-                    new_name = re.sub(r"^w_BD", "BD", base_name)
-                    new_path = os.path.join(final_doxy_out_dir, new_name)
-
-                    safe_rename(w_bgc_filename, new_path)
-
-                except Exception as e:
-                    traceback.print_exc()
-                    if "ds" in locals() and ds.isopen():
-                        ds.close()
+            safe_rename(w_bgc_filename, new_path)
 
         except Exception as e:
-            pass
+            traceback.print_exc()
+            if "ds" in locals() and ds.isopen():
+                ds.close()
