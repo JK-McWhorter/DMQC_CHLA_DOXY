@@ -12,6 +12,7 @@ import re
 import shutil
 import sys
 import traceback
+from collections import Counter
 from datetime import datetime as dt, timezone
 
 import netCDF4 as nc
@@ -21,7 +22,7 @@ import pandas as pd
 
 # Dynamic mapping for Float IDs and Float Types
 FLOAT_TYPES = {
-    # 4903622: "aoml_apex",
+   # 4903622: "aoml_apex",
     2904010: "aoml_apex",
     # 2904011: "aoml_apex",
     # 4903624: "aoml_apex",
@@ -100,8 +101,19 @@ ARGO_VALID_RANGES = {
 # ==============================================================================
 
 
+def is_broken_sensor_float(WMOfloatid, cycle_num):
+    """Evaluates if the float and cycle represent a known broken bio-optical sensor."""
+    float_str = str(WMOfloatid)
+    cycle_num = int(cycle_num)
+    return (
+        (float_str == "4903624")
+        | ((float_str == "2904010") & (cycle_num >= 49))
+        | ((float_str == "2904011") & (cycle_num >= 24))
+    )
+
+
 def apply_float_override_conditions(df, WMOfloatid):
-    """Applies Float ID and Cycle-Specific overrides mirroring R dplyr mutate block for broken sensors."""
+    """Applies Float ID and Cycle-Specific overrides for broken bio-optical sensors in CSV data."""
     if "CYCLE_NUMBER" not in df.columns:
         return df
 
@@ -144,7 +156,7 @@ def apply_float_override_conditions(df, WMOfloatid):
 
     for col in qc_cols:
         if col in df.columns:
-            df.loc[override_condition, col] = 9
+            df.loc[override_condition, col] = 4  # Flag bad data per Argo manual
 
     # HARDCODED OVERRIDE FOR CSV DATAFRAME ON FLOAT 2904010 CYCLE 60 DOXY
     doxy_hardcode_cond = (float_str == "2904010") & (cycle_num == 60)
@@ -186,14 +198,17 @@ def clean_and_fill_qc_variables(bgc_file):
                 p_vals = p_raw.filled(99999.0) if hasattr(p_raw, "filled") else np.array(p_raw)
                 q_vals = np.array(q_raw, copy=True)
 
-                missing_mask = (pd.isna(p_vals)) | (p_vals == 99999.0) | (p_vals == 0.0)
-                valid_mask = ~missing_mask
+                # Strict Argo definition: missing data is ONLY fill_value (99999.0) or NaN
+                missing_mask = (pd.isna(p_vals)) | (p_vals == 99999.0)
+                valid_data_mask = ~missing_mask
 
+                # Assign '9' ONLY to truly missing levels
                 if missing_mask.any():
                     q_vals[missing_mask] = b"9"
 
-                invalid_qc_mask = valid_mask & (
-                    (q_vals == b" ") | (q_vals == b"") | (q_vals == b"0") | (q_vals == b"\x00")
+                # Flag any levels with valid data that have invalid/missing QC flags as '1'
+                invalid_qc_mask = valid_data_mask & (
+                    (q_vals == b" ") | (q_vals == b"") | (q_vals == b"0") | (q_vals == b"\x00") | (q_vals == b"9")
                 )
 
                 if invalid_qc_mask.any():
@@ -315,7 +330,7 @@ def clean_and_fill_qc_variables(bgc_file):
                         else:
                             bgc_file.variables[var_name][iprof, :] = char_arr
 
-            except Exception as e:
+            except Exception:
                 traceback.print_exc()
 
 
@@ -494,11 +509,9 @@ def write_parameter_data_modes(bgc_file):
             if p_str == "PRES":
                 pdm[iprof, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
             elif p_str in ["CHLA", "BBP700", "DOXY"]:
-                # Setting PARAMETER_DATA_MODE = 'D' signifies DMQC calibrated data is present
                 pdm[iprof, j] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
                 data_mode[iprof] = b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
 
-        # Ensure base parameters exist in STATION_PARAMETERS with 'D' mode
         for required_param in ["CHLA", "BBP700", "DOXY"]:
             if required_param not in existing_params:
                 try:
@@ -553,22 +566,26 @@ def get_profile_qc_grade(qc_masked_array):
         return "F"
 
 
-def write_scientific_calib_chla(bgc_file, idx_profile, df_bio):
-    """Write SCIENTIFIC_CALIB_* variables for CHLA safely, checking for broken sensor override."""
-    cycle_df = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
+def write_scientific_calib_chla(bgc_file, WMOfloatid, idx_profile, df_bio):
+    """Write SCIENTIFIC_CALIB_* variables for CHLA & BBP700 per Argo Cookbook standard for broken sensors."""
+    is_broken_chla = is_broken_sensor_float(WMOfloatid, idx_profile)
 
-    is_broken_chla = False
-    if not cycle_df.empty and "CHLA_FINAL_QC" in cycle_df.columns:
-        qcs = cycle_df["CHLA_FINAL_QC"].dropna().astype(int)
-        if not qcs.empty and (qcs.isin([4, 9])).all():
-            is_broken_chla = True
+    if not is_broken_chla:
+        cycle_df = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
+        if not cycle_df.empty and "CHLA_FINAL_QC" in cycle_df.columns:
+            qcs = cycle_df["CHLA_FINAL_QC"].dropna().astype(int)
+            if not qcs.empty and (qcs.isin([4, 9])).all():
+                is_broken_chla = True
 
     if is_broken_chla:
         comment_chla = scientific_calibration_comment_BROKEN
         comment_flu = scientific_calibration_comment_BROKEN
+        comment_bbp = scientific_calibration_comment_BROKEN
         equation_chla = scientific_calibration_equation_BROKEN
+        equation_bbp = scientific_calibration_equation_BROKEN
         coef_chla = scientific_calibration_coefficient_BROKEN
         coef_flu = scientific_calibration_coefficient_BROKEN
+        coef_bbp = scientific_calibration_coefficient_BROKEN
     else:
         dark_cols = sorted([col for col in df_bio.columns if col.startswith("MIN_FLUOCHLA_CYCLE")])
         dark_vals = df_bio[dark_cols].iloc[0].dropna().astype(int).tolist() if dark_cols else []
@@ -578,18 +595,24 @@ def write_scientific_calib_chla(bgc_file, idx_profile, df_bio):
 
         comment_chla = scientific_calibration_comment_CHLA
         comment_flu = scientific_calibration_comment_CHLA_FLU
+        comment_bbp = "BBP700 spike test and regional transformation"
         equation_chla = scientific_calibration_equation_CHLA
+        equation_bbp = "BBP700_ADJUSTED = (BBP700 - DARK_BBP700) * SCALE_BBP700"
         coef_chla = f"PRELIM_DARK_CHLA = [{dark_str}], SCALE_CHLA = {scale_val}, PHYSIO_RATIO = {physio_val}"
         coef_flu = f"PRELIM_DARK_CHLA = [{dark_str}], SCALE_CHLA = {scale_val}"
+        coef_bbp = "Not applicable"
 
     UTCcurrent = datetime.datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     str256_len = bgc_file.dimensions["STRING256"].size
 
     SciCalComArray_CHLA = nc.stringtochar(np.array(comment_chla.ljust(str256_len)[:str256_len], dtype=f"S{str256_len}"))
     SciCalComArray_CHLA_FLU = nc.stringtochar(np.array(comment_flu.ljust(str256_len)[:str256_len], dtype=f"S{str256_len}"))
+    SciCalComArray_BBP = nc.stringtochar(np.array(comment_bbp.ljust(str256_len)[:str256_len], dtype=f"S{str256_len}"))
     SciCalEquArray_CHLA = nc.stringtochar(np.array(equation_chla.ljust(str256_len)[:str256_len], dtype=f"S{str256_len}"))
+    SciCalEquArray_BBP = nc.stringtochar(np.array(equation_bbp.ljust(str256_len)[:str256_len], dtype=f"S{str256_len}"))
     SciCalCoeArray_CHLA = nc.stringtochar(np.array(coef_chla.ljust(str256_len)[:str256_len], dtype=f"S{str256_len}"))
     SciCalCoeArray_CHLA_FLU = nc.stringtochar(np.array(coef_flu.ljust(str256_len)[:str256_len], dtype=f"S{str256_len}"))
+    SciCalCoeArray_BBP = nc.stringtochar(np.array(coef_bbp.ljust(str256_len)[:str256_len], dtype=f"S{str256_len}"))
     SciCalDateArray = nc.stringtochar(np.array(UTCcurrent, dtype="S14"))
 
     n_prof_size = bgc_file.dimensions["N_PROF"].size
@@ -616,18 +639,23 @@ def write_scientific_calib_chla(bgc_file, idx_profile, df_bio):
                 bgc_file.variables["SCIENTIFIC_CALIB_EQUATION"][iprof_idx, 0, j, :] = SciCalEquArray_CHLA
                 bgc_file.variables["SCIENTIFIC_CALIB_COEFFICIENT"][iprof_idx, 0, j, :] = SciCalCoeArray_CHLA
                 bgc_file.variables["SCIENTIFIC_CALIB_DATE"][iprof_idx, 0, j, :] = SciCalDateArray
+            elif param_str == "BBP700":
+                bgc_file.variables["SCIENTIFIC_CALIB_COMMENT"][iprof_idx, 0, j, :] = SciCalComArray_BBP
+                bgc_file.variables["SCIENTIFIC_CALIB_EQUATION"][iprof_idx, 0, j, :] = SciCalEquArray_BBP
+                bgc_file.variables["SCIENTIFIC_CALIB_COEFFICIENT"][iprof_idx, 0, j, :] = SciCalCoeArray_BBP
+                bgc_file.variables["SCIENTIFIC_CALIB_DATE"][iprof_idx, 0, j, :] = SciCalDateArray
 
 
-def write_chla_BBP_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
-    """Populate CHLA_ADJUSTED using CSV delayed-mode data (CHLA_FINAL)
-    and strictly map CHLA_FLUORESCENCE_QC and CHLA_FLUORESCENCE_ADJUSTED_QC directly from CSV columns."""
+def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx=0):
+    """Populate CHLA_ADJUSTED and handle broken bio-optical sensor rules strictly."""
     cycle_df = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
     n_levels = bgc_file.dimensions["N_LEVELS"].size
+    is_broken = is_broken_sensor_float(WMOfloatid, idx_profile)
 
     CHLA_Adjusted_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
     CHLA_Adjusted_Array[:] = 99999.0
 
-    CHLA_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
+    CHLA_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"4" if is_broken else b"9", dtype="|S1")
 
     has_chla = "CHLA" in bgc_file.variables
     has_chla_qc = "CHLA_QC" in bgc_file.variables
@@ -643,7 +671,7 @@ def write_chla_BBP_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
     CHLA_FLUORESCENCE_Adjusted_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
     CHLA_FLUORESCENCE_Adjusted_Array[:] = 99999.0
 
-    CHLA_FLUORESCENCE_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
+    CHLA_FLUORESCENCE_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"4" if is_broken else b"9", dtype="|S1")
 
     has_fluo = "CHLA_FLUORESCENCE" in bgc_file.variables
     has_fluo_qc = "CHLA_FLUORESCENCE_QC" in bgc_file.variables
@@ -662,13 +690,24 @@ def write_chla_BBP_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
         nc_pres = nc_pres_all[i]
 
         matched_row = None
-        if not cycle_df.empty:
+        if not cycle_df.empty and not is_broken:
             diffs = np.abs(cycle_df["PRES"].values - nc_pres)
             min_idx = np.argmin(diffs)
             if diffs[min_idx] <= 0.5:
                 matched_row = cycle_df.iloc[min_idx]
 
-        if matched_row is not None:
+        if is_broken:
+            CHLA_Adjusted_Array[i] = 99999.0
+            CHLA_Adjusted_ERROR_Array[i] = 99999.0
+            CHLA_AdjustedQC_Array[i] = b"4"
+            CHLA_FLUORESCENCE_Adjusted_Array[i] = 99999.0
+            CHLA_FLUORESCENCE_Adjusted_ERROR_Array[i] = 99999.0
+            CHLA_FLUORESCENCE_AdjustedQC_Array[i] = b"4"
+            if chla_qc_arr is not None:
+                chla_qc_arr[i] = b"4"
+            if fluo_qc_arr is not None:
+                fluo_qc_arr[i] = b"4"
+        elif matched_row is not None:
             raw_qc = matched_row["CHLA_FINAL_QC"] if "CHLA_FINAL_QC" in matched_row else "9"
             qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
 
@@ -698,7 +737,6 @@ def write_chla_BBP_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
                 CHLA_Adjusted_ERROR_Array.mask[i] = False
 
             fluo_val = matched_row["CHLA_FLUORESCENCE"] if "CHLA_FLUORESCENCE" in matched_row else np.nan
-            
             CHLA_FLUORESCENCE_AdjustedQC_Array[i] = fluo_adj_qc_str.encode("utf-8") if fluo_adj_qc_str in ["1", "2", "3", "4", "9"] else b"9"
 
             if pd.isna(fluo_val) or fluo_val == 99999.0 or fluo_adj_qc_str in ["4", "9"]:
@@ -761,18 +799,14 @@ def write_chla_BBP_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
         bgc_file.variables["PROFILE_CHLA_FLUORESCENCE_QC"][iprof_idx] = np.array([prof_fluo_qc], dtype="|S1")
 
 
-def write_BBP700_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
-    """Populate BBP700_ADJUSTED using CSV delayed-mode data (BBP700_FINAL)
-    and strictly fill BBP700_ADJUSTED_QC directly with BBP700_FINAL_QC."""
+def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx=0):
+    """Populate BBP700_ADJUSTED and handle broken bio-optical sensor rules strictly."""
     if "BBP700_ADJUSTED" not in bgc_file.variables:
         return
 
     cycle_df = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
-
-    if "BBP700_FINAL" not in cycle_df.columns or "BBP700_FINAL_QC" not in cycle_df.columns:
-        return
-
     n_levels = bgc_file.dimensions["N_LEVELS"].size
+    is_broken = is_broken_sensor_float(WMOfloatid, idx_profile)
 
     has_bbp = "BBP700" in bgc_file.variables
     has_bbp_qc = "BBP700_QC" in bgc_file.variables
@@ -786,7 +820,7 @@ def write_BBP700_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
     BBP700_Adjusted_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
     BBP700_Adjusted_Array[:] = 99999.0
 
-    BBP700_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
+    BBP700_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"4" if is_broken else b"9", dtype="|S1")
 
     BBP700_Adjusted_ERROR_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
     BBP700_Adjusted_ERROR_Array[:] = 99999.0
@@ -797,16 +831,22 @@ def write_BBP700_adjusted(bgc_file, idx_profile, df_bio, iprof_idx=0):
         nc_pres = nc_pres_all[i]
 
         matched_row = None
-        if not cycle_df.empty:
+        if not cycle_df.empty and not is_broken:
             diffs = np.abs(cycle_df["PRES"].values - nc_pres)
             min_idx = np.argmin(diffs)
             if diffs[min_idx] <= 0.5:
                 matched_row = cycle_df.iloc[min_idx]
 
-        if matched_row is not None:
-            raw_qc = matched_row["BBP700_FINAL_QC"]
+        if is_broken:
+            BBP700_Adjusted_Array[i] = 99999.0
+            BBP700_Adjusted_ERROR_Array[i] = 99999.0
+            BBP700_AdjustedQC_Array[i] = b"4"
+            if bbp_qc_arr is not None:
+                bbp_qc_arr[i] = b"4"
+        elif matched_row is not None:
+            raw_qc = matched_row["BBP700_FINAL_QC"] if "BBP700_FINAL_QC" in matched_row else "9"
             qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
-            raw_bbp = matched_row["BBP700_FINAL"]
+            raw_bbp = matched_row["BBP700_FINAL"] if "BBP700_FINAL" in matched_row else np.nan
 
             BBP700_AdjustedQC_Array[i] = qc_str.encode("utf-8") if qc_str in ["1", "2", "3", "4", "9"] else b"9"
 
@@ -897,7 +937,7 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
 
 def write_DOXY_from_csv(ds, float_df, target_cycle):
     """Populate DOXY_ADJUSTED using CSV delayed-mode data (DOXY_FINAL) across ALL profiles
-    and strictly fill DOXY_ADJUSTED_QC directly with DOXY_FINAL_QC."""
+    and strictly enforce Argo compliance for raw DOXY_QC and DOXY_ADJUSTED_QC."""
     var_names = ds.variables.keys()
     n_prof = ds.dimensions["N_PROF"].size
     n_levels = ds.dimensions["N_LEVELS"].size
@@ -905,7 +945,9 @@ def write_DOXY_from_csv(ds, float_df, target_cycle):
     pres_nc_full = ds.variables["PRES"][:]
     cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)].copy()
 
-    # Iterate over ALL profiles in the file
+    print(f"\n--- [DOXY QC AUDIT] Cycle: {target_cycle:03d} (Total Profiles: {n_prof}) ---")
+
+    # Iterate over ALL profiles (N_PROF) in the NetCDF file
     for iprof in range(n_prof):
         if pres_nc_full.ndim > 1:
             pres_nc = pres_nc_full[iprof, :] if pres_nc_full.shape[0] == n_prof else pres_nc_full[:, iprof]
@@ -925,11 +967,15 @@ def write_DOXY_from_csv(ds, float_df, target_cycle):
 
         has_doxy = "DOXY" in ds.variables
         has_doxy_qc = "DOXY_QC" in ds.variables
+        
         raw_doxy_var = ds.variables["DOXY"][iprof, :] if (has_doxy and ds.variables["DOXY"].ndim > 1) else (ds.variables["DOXY"][:] if has_doxy else None)
         raw_doxy_qc_var = ds.variables["DOXY_QC"][iprof, :] if (has_doxy_qc and ds.variables["DOXY_QC"].ndim > 1) else (ds.variables["DOXY_QC"][:] if has_doxy_qc else None)
 
         doxy_data_arr = np.array(raw_doxy_var, copy=True) if raw_doxy_var is not None else None
         doxy_qc_arr = np.array(raw_doxy_qc_var, copy=True) if raw_doxy_qc_var is not None else None
+
+        invalid_qc_count = 0
+        valid_data_levels = 0
 
         for i in range(n_levels):
             nc_pres = np.float32(pres_nc[i])
@@ -951,18 +997,29 @@ def write_DOXY_from_csv(ds, float_df, target_cycle):
                 if diffs[min_idx] <= 0.5:
                     matched_row = cycle_df.iloc[min_idx]
 
+            # 1. Evaluate NetCDF raw data existence
+            has_valid_raw_data = (
+                doxy_data_arr is not None
+                and not pd.isna(doxy_data_arr[i])
+                and doxy_data_arr[i] != 99999.0
+            )
+
+            # 2. Evaluate CSV matched data existence & map values
             if matched_row is not None:
                 raw_qc = matched_row.get("DOXY_FINAL_QC")
                 qc_str = str(int(raw_qc)) if pd.notna(raw_qc) else "9"
 
                 raw_doxy = matched_row.get("DOXY")
-                if pd.notna(raw_doxy) and raw_doxy != 99999.0 and raw_doxy != 0.0:
+                if pd.notna(raw_doxy) and raw_doxy != 99999.0:
                     DOXY_Array[i] = np.float32(raw_doxy)
+                    DOXY_Array.mask[i] = False
+                    has_valid_raw_data = True
+                elif has_valid_raw_data:
+                    DOXY_Array[i] = np.float32(doxy_data_arr[i])
                     DOXY_Array.mask[i] = False
 
                 raw_doxy_final = matched_row.get("DOXY_FINAL")
 
-                # Direct mapping from DOXY_FINAL_QC to DOXY_ADJUSTED_QC
                 DOXY_AdjustedQC_Array[i] = qc_str.encode("utf-8") if qc_str in ["1", "2", "3", "4", "9"] else b"9"
 
                 if (
@@ -979,38 +1036,64 @@ def write_DOXY_from_csv(ds, float_df, target_cycle):
                     DOXY_Adjusted_Array.mask[i] = False
 
                     raw_doxy_error = matched_row.get("DOXY_ADJUSTED_ERROR")
-                    if (
-                        pd.notna(raw_doxy_error)
-                        and raw_doxy_error != 99999.0
-                    ):
+                    if pd.notna(raw_doxy_error) and raw_doxy_error != 99999.0:
                         DOXY_Adjusted_Error_Array[i] = np.float32(raw_doxy_error)
                         DOXY_Adjusted_Error_Array.mask[i] = False
                     else:
                         DOXY_Adjusted_Error_Array[i] = 99999.0
                         DOXY_Adjusted_Error_Array.mask[i] = True
             else:
+                if has_valid_raw_data:
+                    DOXY_Array[i] = np.float32(doxy_data_arr[i])
+                    DOXY_Array.mask[i] = False
+
                 DOXY_Adjusted_Array[i] = 99999.0
                 DOXY_Adjusted_Array.mask[i] = True
                 DOXY_Adjusted_Error_Array[i] = 99999.0
                 DOXY_Adjusted_Error_Array.mask[i] = True
                 DOXY_AdjustedQC_Array[i] = b"9"
 
-            if doxy_data_arr is not None and (pd.isna(doxy_data_arr[i]) or doxy_data_arr[i] == 99999.0 or doxy_data_arr[i] == 0.0):
-                if doxy_qc_arr is not None:
-                    doxy_qc_arr[i] = b"9"
+            if has_valid_raw_data:
+                valid_data_levels += 1
+
+            # 3. Strict Enforcement: DOXY_QC CANNOT be '9' if DOXY contains data
+            if doxy_qc_arr is not None:
+                if has_valid_raw_data:
+                    current_qc = doxy_qc_arr[i]
+                    if current_qc in [b"9", b" ", b"", b"0", b"\x00"]:
+                        doxy_qc_arr[i] = b"1"  # Default real-time flag for valid data
+                        invalid_qc_count += 1
+                else:
+                    doxy_qc_arr[i] = b"9"  # Assign '9' strictly when data is missing
+
+        # Calculate Flag Distributions for Detailed Audit Log
+        doxy_qc_list = [q.decode("utf-8") if isinstance(q, bytes) else str(q) for q in doxy_qc_arr] if doxy_qc_arr is not None else []
+        doxy_adj_qc_list = [q.decode("utf-8") if isinstance(q, bytes) else str(q) for q in DOXY_AdjustedQC_Array]
+
+        counts_doxy_qc = dict(Counter(doxy_qc_list))
+        counts_adj_qc = dict(Counter(doxy_adj_qc_list))
+
+        print(f"  [Profile N_PROF={iprof+1}] Total Levels: {n_levels} | Valid Data Levels: {valid_data_levels}")
+        print(f"    - DOXY_QC Breakdown         : {counts_doxy_qc}")
+        print(f"    - DOXY_ADJUSTED_QC Breakdown: {counts_adj_qc}")
+
+        if invalid_qc_count > 0:
+            print(
+                f"    -> [AUTO-CORRECTION] Fixed {invalid_qc_count} levels with valid DOXY data that had invalid/missing DOXY_QC flags."
+            )
 
         if "DOXY" in var_names:
             doxy_var = ds.variables["DOXY"]
             if doxy_var.ndim > 1:
                 if doxy_var.shape[0] == n_prof:
                     doxy_var[iprof, :] = DOXY_Array
-                    ds.variables["DOXY_QC"][iprof, :] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
+                    ds.variables["DOXY_QC"][iprof, :] = doxy_qc_arr
                 else:
                     doxy_var[:, iprof] = DOXY_Array
-                    ds.variables["DOXY_QC"][:, iprof] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
+                    ds.variables["DOXY_QC"][:, iprof] = doxy_qc_arr
             else:
                 doxy_var[:] = DOXY_Array
-                ds.variables["DOXY_QC"][:] = doxy_qc_arr if doxy_qc_arr is not None else DOXY_AdjustedQC_Array
+                ds.variables["DOXY_QC"][:] = doxy_qc_arr
 
         if "DOXY_ADJUSTED" in var_names:
             doxy_adj_var = ds.variables["DOXY_ADJUSTED"]
@@ -1134,9 +1217,9 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             iprof_bbp = detect_parameter_profile(ds, "BBP700")
 
             # 1. Update CHLA & BBP700 Delayed-Mode Data
-            write_scientific_calib_chla(ds, idx_profile, df_bio)
-            write_chla_BBP_adjusted(ds, idx_profile, df_bio, iprof_chla)
-            write_BBP700_adjusted(ds, idx_profile, df_bio, iprof_bbp)
+            write_scientific_calib_chla(ds, WMOfloatid, idx_profile, df_bio)
+            write_chla_BBP_adjusted(ds, WMOfloatid, idx_profile, df_bio, iprof_chla)
+            write_BBP700_adjusted(ds, WMOfloatid, idx_profile, df_bio, iprof_bbp)
 
             # 2. Update DOXY Delayed-Mode Data
             write_DOXY_slope_drift(ds, 0, df_bio, idx_profile)
@@ -1168,8 +1251,10 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
             def get_clean_dm(ds_var, prof_idx):
                 raw = ds_var[prof_idx]
+                if hasattr(raw, "item"):
+                    raw = raw.item()
                 if isinstance(raw, (bytes, np.bytes_)):
-                    return raw.tobytes().decode("utf-8").strip() if hasattr(raw, "tobytes") else raw.decode("utf-8").strip()
+                    return raw.decode("utf-8").strip()
                 return str(raw).strip()
 
             dm_chla_str = get_clean_dm(ds.variables["DATA_MODE"], iprof_chla) if "DATA_MODE" in ds.variables else "N/A"
