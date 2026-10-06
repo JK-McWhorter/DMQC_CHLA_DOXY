@@ -187,17 +187,15 @@ def apply_float_override_conditions(df, WMOfloatid):
 def clean_and_fill_qc_variables(bgc_file):
     """Safely inspect and clean ALL QC variables across ALL profiles in the NetCDF file.
 
-    FIXED: Strictly enforces that unadjusted Real-Time parameters ('R') receive
-    blank FillValues (' ') in _ADJUSTED_QC arrays, while Delayed-Mode parameters ('D')
-    receive valid/missing flags ('1', '4', '9').
+    FIXED: Audits all secondary diagnostic variables (TEMP_CPU_CHLA, FLUORESCENCE_CHLA, etc.)
+    so raw measured levels never retain '9' or blank spaces in their _QC arrays.
     """
     n_prof = bgc_file.dimensions["N_PROF"].size
 
     pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:] if "PARAMETER_DATA_MODE" in bgc_file.variables else None
-    data_mode = bgc_file.variables["DATA_MODE"][:] if "DATA_MODE" in bgc_file.variables else None
 
-    # Process all variables ending with _QC
-    for var_name, var in bgc_file.variables.items():
+    # Audit all variables ending in _QC
+    for var_name, var in list(bgc_file.variables.items()):
         if not var_name.endswith("_QC"):
             continue
 
@@ -234,7 +232,6 @@ def clean_and_fill_qc_variables(bgc_file):
                     traceback.print_exc()
             continue
 
-        # Handle level-by-level _QC and _ADJUSTED_QC variables
         is_adjusted_qc = var_name.endswith("_ADJUSTED_QC")
         base_param = var_name[:-12] if is_adjusted_qc else var_name[:-3]
 
@@ -275,7 +272,7 @@ def clean_and_fill_qc_variables(bgc_file):
                         bgc_file.variables[var_name][iprof] = fill_arr[0]
                     continue
 
-                # RULE 2: Clean level-by-level QC values
+                # RULE 2: Clean level-by-level QC values for both primary and auxiliary diagnostic variables
                 p_var_name = base_param if not is_adjusted_qc else f"{base_param}_ADJUSTED"
                 if p_var_name in bgc_file.variables:
                     p_var = bgc_file.variables[p_var_name]
@@ -296,12 +293,13 @@ def clean_and_fill_qc_variables(bgc_file):
                     if missing_mask.any():
                         q_char[missing_mask] = b"9"
 
-                    # Fix invalid/blank QC flags where valid data exists
+                    # Fix invalid/blank/9 QC flags where valid measurement data exists
                     invalid_qc_mask = valid_data_mask & (
                         (q_char == b" ")
                         | (q_char == b"")
                         | (q_char == b"0")
                         | (q_char == b"\x00")
+                        | (q_char == b"9")
                     )
 
                     if invalid_qc_mask.any():
@@ -467,11 +465,7 @@ def write_history_metadata(bgc_file, iprof_chla, iprof_doxy):
 
 
 def write_parameter_data_modes(bgc_file):
-    """Set PARAMETER_DATA_MODE and DATA_MODE strictly for PRES, CHLA, CHLA_FLUORESCENCE, BBP700, and DOXY.
-
-    FIXED: Only registers parameters into STATION_PARAMETERS if the variable
-    physically exists in the NetCDF dataset, eliminating STATION_PARAMETERS specified errors.
-    """
+    """Set PARAMETER_DATA_MODE and DATA_MODE strictly for PRES, CHLA, CHLA_FLUORESCENCE, BBP700, and DOXY."""
     n_param = bgc_file.dimensions["N_PARAM"].size
     n_prof = bgc_file.dimensions["N_PROF"].size
     str_param_len = bgc_file.variables["STATION_PARAMETERS"].shape[2]
@@ -1089,7 +1083,7 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx
         if has_fluo_qc:
             bgc_file.variables["CHLA_FLUORESCENCE_QC"][prof, :] = fluo_qc_arr
 
-        # Profile QC Grade Assignment (returns ' ' for all bad/missing profiles)
+        # Profile QC Grade Assignment
         prof_qc = get_profile_qc_grade(CHLA_AdjustedQC_Array)
         prof_fluo_qc = get_profile_qc_grade(CHLA_FLUORESCENCE_AdjustedQC_Array)
 
@@ -1880,7 +1874,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             # 4. Update History Metadata for both CHLA and DOXY
             write_history_metadata(ds, iprof_chla, iprof_doxy)
 
-            # 5. Clean QC flags and valid range attributes
+            # 5. Clean QC flags and valid range attributes across ALL variables (including secondary diagnostics)
             clean_and_fill_qc_variables(ds)
             add_missing_valid_range_attributes(ds)
             remove_forbidden_attributes(ds)
