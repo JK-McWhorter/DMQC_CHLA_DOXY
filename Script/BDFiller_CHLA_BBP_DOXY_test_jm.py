@@ -19,7 +19,6 @@ import netCDF4 as nc
 import numpy as np
 import pandas as pd
 
-
 # Dynamic mapping for Float IDs and Float Types
 FLOAT_TYPES = {
     4903622: "aoml_apex",
@@ -186,91 +185,18 @@ def apply_float_override_conditions(df, WMOfloatid):
 
 
 def clean_and_fill_qc_variables(bgc_file):
-    """Safely inspect and clean ALL QC variables across ALL profiles in the NetCDF file."""
+    """Safely inspect and clean ALL QC variables across ALL profiles in the NetCDF file.
+
+    FIXED: Strictly enforces that unadjusted Real-Time parameters ('R') receive
+    blank FillValues (' ') in _ADJUSTED_QC arrays, while Delayed-Mode parameters ('D')
+    receive valid/missing flags ('1', '4', '9').
+    """
     n_prof = bgc_file.dimensions["N_PROF"].size
 
-    pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
-    data_mode = bgc_file.variables["DATA_MODE"][:]
+    pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:] if "PARAMETER_DATA_MODE" in bgc_file.variables else None
+    data_mode = bgc_file.variables["DATA_MODE"][:] if "DATA_MODE" in bgc_file.variables else None
 
-    for param in ["DOXY", "CHLA", "BBP700", "CHLA_FLUORESCENCE"]:
-        qc_var_name = f"{param}_QC"
-        adj_qc_var_name = f"{param}_ADJUSTED_QC"
-
-        if param in bgc_file.variables and qc_var_name in bgc_file.variables:
-            p_var = bgc_file.variables[param]
-            q_var = bgc_file.variables[qc_var_name]
-
-            for iprof in range(n_prof):
-                p_raw = p_var[iprof, :] if p_var.ndim > 1 else p_var[:]
-                q_raw = q_var[iprof, :] if q_var.ndim > 1 else q_var[:]
-
-                p_vals = (
-                    p_raw.filled(99999.0) if hasattr(p_raw, "filled") else np.array(p_raw)
-                )
-                q_vals = np.array(q_raw, copy=True)
-
-                missing_mask = (pd.isna(p_vals)) | (p_vals == 99999.0)
-                valid_data_mask = ~missing_mask
-
-                if missing_mask.any():
-                    q_vals[missing_mask] = b"9"
-
-                invalid_qc_mask = valid_data_mask & (
-                    (q_vals == b" ")
-                    | (q_vals == b"")
-                    | (q_vals == b"0")
-                    | (q_vals == b"\x00")
-                    | (q_vals == b"9")
-                )
-
-                if invalid_qc_mask.any():
-                    q_vals[invalid_qc_mask] = b"1"
-
-                if q_var.ndim > 1:
-                    bgc_file.variables[qc_var_name][iprof, :] = q_vals
-                else:
-                    bgc_file.variables[qc_var_name][:] = q_vals
-
-                if adj_qc_var_name in bgc_file.variables:
-                    adj_qc_var = bgc_file.variables[adj_qc_var_name]
-                    adj_p_var = (
-                        bgc_file.variables[f"{param}_ADJUSTED"]
-                        if f"{param}_ADJUSTED" in bgc_file.variables
-                        else p_var
-                    )
-                    adj_p_raw = (
-                        adj_p_var[iprof, :] if adj_p_var.ndim > 1 else adj_p_var[:]
-                    )
-                    adj_p_vals = (
-                        adj_p_raw.filled(99999.0)
-                        if hasattr(adj_p_raw, "filled")
-                        else np.array(adj_p_raw)
-                    )
-
-                    adj_q_raw = (
-                        adj_qc_var[iprof, :] if adj_qc_var.ndim > 1 else adj_qc_var[:]
-                    )
-                    adj_q_vals = np.array(adj_q_raw, copy=True)
-
-                    adj_missing_mask = (pd.isna(adj_p_vals)) | (adj_p_vals == 99999.0)
-                    adj_invalid_mask = (
-                        (adj_q_vals == b" ")
-                        | (adj_q_vals == b"")
-                        | (adj_q_vals == b"0")
-                        | (adj_q_vals == b"\x00")
-                    )
-
-                    if adj_missing_mask.any():
-                        adj_q_vals[adj_missing_mask] = b"9"
-
-                    if adj_invalid_mask.any():
-                        adj_q_vals[adj_invalid_mask & (~adj_missing_mask)] = b"1"
-
-                    if adj_qc_var.ndim > 1:
-                        bgc_file.variables[adj_qc_var_name][iprof, :] = adj_q_vals
-                    else:
-                        bgc_file.variables[adj_qc_var_name][:] = adj_q_vals
-
+    # Process all variables ending with _QC
     for var_name, var in bgc_file.variables.items():
         if not var_name.endswith("_QC"):
             continue
@@ -278,19 +204,48 @@ def clean_and_fill_qc_variables(bgc_file):
         if "PH" in var_name or "NITRATE" in var_name:
             continue
 
-        param_base = None
-        if var_name.startswith("PROFILE_") and var_name.endswith("_QC"):
+        # Handle PROFILE_<PARAM>_QC flags
+        if var_name.startswith("PROFILE_"):
             param_base = var_name[8:-3]
+            for iprof in range(n_prof):
+                try:
+                    if "STATION_PARAMETERS" in bgc_file.variables:
+                        station_params = bgc_file.variables["STATION_PARAMETERS"][iprof]
+                        if isinstance(station_params, np.ma.MaskedArray):
+                            station_params = station_params.filled(b" ")
+
+                        has_param = False
+                        for p in station_params:
+                            p_str = "".join([
+                                (
+                                    c.decode("utf-8", errors="ignore")
+                                    if isinstance(c, (bytes, np.bytes_))
+                                    else str(c)
+                                )
+                                for c in p
+                            ]).strip()
+                            if p_str == param_base:
+                                has_param = True
+                                break
+
+                        if not has_param:
+                            bgc_file.variables[var_name][iprof] = b" "
+                except Exception:
+                    traceback.print_exc()
+            continue
+
+        # Handle level-by-level _QC and _ADJUSTED_QC variables
+        is_adjusted_qc = var_name.endswith("_ADJUSTED_QC")
+        base_param = var_name[:-12] if is_adjusted_qc else var_name[:-3]
 
         for iprof in range(n_prof):
             try:
-                if param_base and "STATION_PARAMETERS" in bgc_file.variables:
+                param_dm = "R"
+                if "STATION_PARAMETERS" in bgc_file.variables and pdm is not None:
                     station_params = bgc_file.variables["STATION_PARAMETERS"][iprof]
                     if isinstance(station_params, np.ma.MaskedArray):
                         station_params = station_params.filled(b" ")
-
-                    has_param = False
-                    for p in station_params:
+                    for j, p in enumerate(station_params):
                         p_str = "".join([
                             (
                                 c.decode("utf-8", errors="ignore")
@@ -299,45 +254,63 @@ def clean_and_fill_qc_variables(bgc_file):
                             )
                             for c in p
                         ]).strip()
-                        if p_str == param_base:
-                            has_param = True
+                        if p_str == base_param:
+                            raw_pdm = pdm[iprof, j]
+                            if isinstance(raw_pdm, (bytes, np.bytes_)):
+                                param_dm = (
+                                    raw_pdm.tobytes().decode("utf-8").strip()
+                                    if hasattr(raw_pdm, "tobytes")
+                                    else raw_pdm.decode("utf-8").strip()
+                                )
+                            else:
+                                param_dm = str(raw_pdm).strip()
                             break
 
-                    if not has_param:
-                        bgc_file.variables[var_name][iprof] = b" "
-                        continue
+                # RULE 1: If an ADJUSTED_QC variable belongs to a parameter in Real-Time mode ('R'), fill with spaces
+                if is_adjusted_qc and param_dm == "R":
+                    fill_arr = np.full(var[iprof].shape, fill_value=b" ", dtype="|S1")
+                    if var.ndim > 1:
+                        bgc_file.variables[var_name][iprof, :] = fill_arr
+                    else:
+                        bgc_file.variables[var_name][iprof] = fill_arr[0]
+                    continue
 
-                if var_name.endswith("_ADJUSTED_QC") and not var_name.startswith(
-                    "PROFILE_"
-                ):
-                    base_var = var_name[:-12]
-                    if f"{base_var}_ADJUSTED" not in bgc_file.variables:
-                        fill_arr = np.full(var[iprof].shape, fill_value=b" ", dtype="|S1")
-                        bgc_file.variables[var_name][iprof] = fill_arr
-                        continue
+                # RULE 2: Clean level-by-level QC values
+                p_var_name = base_param if not is_adjusted_qc else f"{base_param}_ADJUSTED"
+                if p_var_name in bgc_file.variables:
+                    p_var = bgc_file.variables[p_var_name]
+                    p_raw = p_var[iprof, :] if p_var.ndim > 1 else p_var[:]
+                    p_vals = p_raw.filled(99999.0) if hasattr(p_raw, "filled") else np.array(p_raw)
 
-                if var.dtype.kind in ["S", "U", "O"]:
-                    raw_var_slice = var[iprof] if var.ndim == 1 else var[iprof, :]
-                    slice_data = np.array(raw_var_slice, copy=True)
+                    q_raw = var[iprof, :] if var.ndim > 1 else var[iprof]
+                    q_vals = np.array(q_raw, copy=True)
+                    if hasattr(q_vals, "filled"):
+                        q_vals = q_vals.filled(b" ")
 
-                    if hasattr(slice_data, "filled"):
-                        slice_data = slice_data.filled(b" ")
+                    q_char = q_vals.astype("|S1")
 
-                    char_arr = slice_data.astype("|S1")
-                    blank_mask = (
-                        (char_arr == b" ") | (char_arr == b"") | (char_arr == b"\x00")
+                    missing_mask = (pd.isna(p_vals)) | (p_vals == 99999.0)
+                    valid_data_mask = ~missing_mask
+
+                    # Set QC = '9' for missing raw or adjusted data
+                    if missing_mask.any():
+                        q_char[missing_mask] = b"9"
+
+                    # Fix invalid/blank QC flags where valid data exists
+                    invalid_qc_mask = valid_data_mask & (
+                        (q_char == b" ")
+                        | (q_char == b"")
+                        | (q_char == b"0")
+                        | (q_char == b"\x00")
                     )
 
-                    blank_count = int(np.sum(blank_mask))
+                    if invalid_qc_mask.any():
+                        q_char[invalid_qc_mask] = b"1"
 
-                    if blank_count > 0:
-                        fill_code = b" " if var_name.startswith("PROFILE_") else b"9"
-                        char_arr[blank_mask] = fill_code
-
-                        if var.ndim == 1:
-                            bgc_file.variables[var_name][iprof] = char_arr[0]
-                        else:
-                            bgc_file.variables[var_name][iprof, :] = char_arr
+                    if var.ndim > 1:
+                        bgc_file.variables[var_name][iprof, :] = q_char
+                    else:
+                        bgc_file.variables[var_name][iprof] = q_char[0]
 
             except Exception:
                 traceback.print_exc()
@@ -494,7 +467,11 @@ def write_history_metadata(bgc_file, iprof_chla, iprof_doxy):
 
 
 def write_parameter_data_modes(bgc_file):
-    """Set PARAMETER_DATA_MODE and DATA_MODE strictly for PRES, CHLA, CHLA_FLUORESCENCE, BBP700, and DOXY across all profiles per Argo standards."""
+    """Set PARAMETER_DATA_MODE and DATA_MODE strictly for PRES, CHLA, CHLA_FLUORESCENCE, BBP700, and DOXY.
+
+    FIXED: Only registers parameters into STATION_PARAMETERS if the variable
+    physically exists in the NetCDF dataset, eliminating STATION_PARAMETERS specified errors.
+    """
     n_param = bgc_file.dimensions["N_PARAM"].size
     n_prof = bgc_file.dimensions["N_PROF"].size
     str_param_len = bgc_file.variables["STATION_PARAMETERS"].shape[2]
@@ -529,8 +506,9 @@ def write_parameter_data_modes(bgc_file):
                     b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
                 )
 
+        # STRICT GUARD: Only register parameters into STATION_PARAMETERS if the variable exists
         for required_param in ["CHLA", "CHLA_FLUORESCENCE", "BBP700", "DOXY"]:
-            if required_param not in existing_params:
+            if required_param in bgc_file.variables and required_param not in existing_params:
                 try:
                     empty_slot_idx = existing_params.index("")
                     padded_param = required_param.ljust(str_param_len)[:str_param_len]
@@ -557,7 +535,7 @@ def write_parameter_data_modes(bgc_file):
 def get_profile_qc_grade(qc_masked_array):
     """Calculate Argo profile QC letter grade (A-F, ' ').
 
-    FIXED: Returns ' ' (blank space) when all levels are missing ('9') or bad ('4'),
+    Returns ' ' (blank space) when all levels are missing ('9') or bad ('4'),
     strictly ensuring PROFILE_*_QC receives Expected = ' ' to pass GDAC validation.
     """
     if hasattr(qc_masked_array, "compressed"):
