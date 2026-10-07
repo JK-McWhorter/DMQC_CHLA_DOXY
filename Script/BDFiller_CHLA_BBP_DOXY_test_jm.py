@@ -214,7 +214,6 @@ def write_parameter_data_modes(bgc_file):
                 if p_str == "PRES":
                     pdm[iprof, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
                 elif p_str in ["CHLA", "CHLA_FLUORESCENCE", "BBP700", "DOXY"]:
-                    # Set 'D' to indicate delayed-mode calibration/adjusted data presence
                     pdm[iprof, j] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
                     data_mode[iprof] = (
                         b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
@@ -256,15 +255,57 @@ def write_parameter_data_modes(bgc_file):
     bgc_file.variables["DATA_MODE"][:] = data_mode
 
 
+def get_profile_qc_grade(qc_masked_array):
+    """Compute overall profile QC grade letter ('A', 'B', 'C', 'D', 'E', or ' ')."""
+    if hasattr(qc_masked_array, "compressed"):
+        unmasked_vals = qc_masked_array.compressed()
+    else:
+        unmasked_vals = qc_masked_array
+
+    raw_qcs = []
+    for q in unmasked_vals:
+        if isinstance(q, np.ma.core.MaskedConstant) or q is np.ma.masked:
+            continue
+        s = q.decode("utf-8").strip() if isinstance(q, bytes) else str(q).strip()
+        if s != "":
+            raw_qcs.append(s)
+
+    if len(raw_qcs) == 0 or all(q in ["4", "9"] for q in raw_qcs):
+        return " "
+
+    valid_qcs = [q for q in raw_qcs if q not in ["4", "9"]]
+    total_points = len(valid_qcs)
+
+    if total_points == 0:
+        return " "
+
+    bad_count = sum(1 for q in valid_qcs if q in ["3"])
+    good_count = total_points - bad_count
+    pct_good = (good_count / total_points) * 100.0
+
+    if bad_count == 0:
+        return "A"
+    elif 75.0 <= pct_good < 100.0:
+        return "B"
+    elif 50.0 <= pct_good < 75.0:
+        return "C"
+    elif 25.0 <= pct_good < 75.0:
+        return "D"
+    elif 0.0 < pct_good < 25.0:
+        return "E"
+    else:
+        return " "
+
+
 def clean_and_fill_qc_variables(bgc_file):
-    """Safely inspect, harmonize, carry over raw data/QC to adjusted arrays, and clean QC variables."""
+    """Safely inspect, harmonize, carry over raw data/QC, and fix level-QC & PROFILE_<PARAM>_QC across ALL profiles."""
     n_prof = bgc_file.dimensions["N_PROF"].size
     file_name = os.path.basename(bgc_file.filepath()) if hasattr(bgc_file, "filepath") else "File"
 
     # =========================================================================
-    # STEP A: Carry over Raw Data & Raw QC to ADJUSTED variables if missing
+    # STEP A: Carry over raw data and raw QC to ADJUSTED variables if missing
     # =========================================================================
-    base_params = ["DOXY", "CHLA", "CHLA_FLUORESCENCE", "BBP700"]
+    base_params = ["DOXY", "CHLA", "CHLA_FLUORESCENCE", "BBP700", "FLUORESCENCE_CHLA"]
     for param in base_params:
         adj_param = f"{param}_ADJUSTED"
         adj_qc_param = f"{param}_ADJUSTED_QC"
@@ -339,7 +380,7 @@ def clean_and_fill_qc_variables(bgc_file):
                     )
 
     # =========================================================================
-    # STEP B: Perform standard QC array cleanup and verification
+    # STEP B: Harmonize Level-by-Level QC & PROFILE_<PARAM>_QC for ALL profiles
     # =========================================================================
     for var_name, var in list(bgc_file.variables.items()):
         if not var_name.endswith("_QC"):
@@ -348,39 +389,42 @@ def clean_and_fill_qc_variables(bgc_file):
         if "PH" in var_name or "NITRATE" in var_name or "TEMP_CPU_CHLA" in var_name:
             continue
 
-        if var_name.startswith("PROFILE_"):
-            param_base = var_name[8:-3]
-            for iprof in range(n_prof):
-                try:
-                    if "STATION_PARAMETERS" in bgc_file.variables:
-                        station_params = bgc_file.variables["STATION_PARAMETERS"][iprof]
-                        if isinstance(station_params, np.ma.MaskedArray):
-                            station_params = station_params.filled(b" ")
-
-                        has_param = False
-                        for p in station_params:
-                            p_str = "".join([
-                                (c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c))
-                                for c in p
-                            ]).strip()
-                            if p_str == param_base:
-                                has_param = True
-                                break
-
-                        if not has_param:
-                            bgc_file.variables[var_name][iprof] = b" "
-                except Exception:
-                    traceback.print_exc()
-            continue
-
         is_adjusted_qc = var_name.endswith("_ADJUSTED_QC")
         base_param = var_name[:-12] if is_adjusted_qc else var_name[:-3]
 
+        # Process PROFILE_<PARAM>_QC grade letters ('A', 'B', 'C', etc.)
+        if var_name.startswith("PROFILE_"):
+            param_base = var_name[8:-3]
+            adj_qc_var_name = (
+                f"{param_base}_ADJUSTED_QC"
+                if f"{param_base}_ADJUSTED_QC" in bgc_file.variables
+                else f"{param_base}_QC"
+            )
+
+            for iprof in range(n_prof):
+                if adj_qc_var_name in bgc_file.variables:
+                    target_qc_array = (
+                        bgc_file.variables[adj_qc_var_name][iprof, :]
+                        if bgc_file.variables[adj_qc_var_name].ndim > 1
+                        else bgc_file.variables[adj_qc_var_name][:]
+                    )
+                    prof_grade = get_profile_qc_grade(target_qc_array)
+                    grade_char = prof_grade.encode("utf-8")
+                    bgc_file.variables[var_name][iprof] = grade_char
+
+                    print(
+                        f"[{file_name}] Profile [{iprof}] {var_name} grade calculated: '{prof_grade}'"
+                    )
+            continue
+
+        # Clean level-by-level QC codes ('1'-'4' for data, '9' for missing)
         for iprof in range(n_prof):
             try:
-                p_var_name = base_param if not is_adjusted_qc else f"{base_param}_ADJUSTED"
-                if p_var_name not in bgc_file.variables:
-                    p_var_name = base_param
+                p_var_name = (
+                    f"{base_param}_ADJUSTED"
+                    if is_adjusted_qc and f"{base_param}_ADJUSTED" in bgc_file.variables
+                    else base_param
+                )
 
                 if p_var_name in bgc_file.variables:
                     p_var = bgc_file.variables[p_var_name]
@@ -394,20 +438,14 @@ def clean_and_fill_qc_variables(bgc_file):
 
                     q_char = q_vals.astype("|S1")
 
-                    raw_data_var_name = base_param
-                    if raw_data_var_name in bgc_file.variables:
-                        raw_data_var = bgc_file.variables[raw_data_var_name]
-                        r_data = raw_data_var[iprof, :] if raw_data_var.ndim > 1 else raw_data_var[:]
-                        r_vals = r_data.filled(99999.0) if hasattr(r_data, "filled") else np.array(r_data)
-                        valid_data_mask = (~pd.isna(r_vals)) & (r_vals != 99999.0)
-                    else:
-                        valid_data_mask = (~pd.isna(p_vals)) & (p_vals != 99999.0)
-
+                    valid_data_mask = (~pd.isna(p_vals)) & (p_vals != 99999.0)
                     missing_mask = ~valid_data_mask
 
+                    # Assign '9' to missing levels
                     if missing_mask.any():
                         q_char[missing_mask] = b"9"
 
+                    # If ADJUSTED_QC is missing but raw _QC exists, copy raw QC flag
                     if is_adjusted_qc and f"{base_param}_QC" in bgc_file.variables:
                         raw_qc_var = bgc_file.variables[f"{base_param}_QC"]
                         raw_q_slice = raw_qc_var[iprof, :] if raw_qc_var.ndim > 1 else raw_qc_var[:]
@@ -420,6 +458,7 @@ def clean_and_fill_qc_variables(bgc_file):
                         if can_copy_mask.any():
                             q_char[can_copy_mask] = raw_q_char[can_copy_mask]
 
+                    # Assign '1' to any invalid/blank flags at valid data levels
                     invalid_qc_mask = valid_data_mask & (
                         (q_char == b" ")
                         | (q_char == b"")
@@ -431,11 +470,28 @@ def clean_and_fill_qc_variables(bgc_file):
                     if invalid_qc_mask.any():
                         q_char[invalid_qc_mask] = b"1"
 
-                    if var_name in ["DOXY_QC", "FLUORESCENCE_CHLA_QC", "DOXY_ADJUSTED_QC", "FLUORESCENCE_CHLA_ADJUSTED_QC"]:
+                    # Print log summaries for target QC parameters
+                    if var_name in [
+                        "DOXY_QC",
+                        "DOXY_ADJUSTED_QC",
+                        "FLUORESCENCE_CHLA_QC",
+                        "FLUORESCENCE_CHLA_ADJUSTED_QC",
+                        "CHLA_QC",
+                        "CHLA_ADJUSTED_QC",
+                        "BBP700_QC",
+                        "BBP700_ADJUSTED_QC",
+                    ]:
                         q_str_vals = [c.decode("utf-8", errors="ignore") for c in q_char[valid_data_mask]]
                         unique_qcs, counts = np.unique(q_str_vals, return_counts=True)
-                        qc_summary = ", ".join([f"'{k}': {v}" for k, v in zip(unique_qcs, counts)]) if len(unique_qcs) > 0 else "None"
-                        print(f"[{file_name}] Profile [{iprof}] {var_name} values at valid data levels ({np.sum(valid_data_mask)} total levels): {qc_summary}")
+                        qc_summary = (
+                            ", ".join([f"'{k}': {v}" for k, v in zip(unique_qcs, counts)])
+                            if len(unique_qcs) > 0
+                            else "None"
+                        )
+                        print(
+                            f"[{file_name}] Profile [{iprof}] {var_name} values at valid data levels "
+                            f"({np.sum(valid_data_mask)} total levels): {qc_summary}"
+                        )
 
                     if var.ndim == 2:
                         bgc_file.variables[var_name][iprof, :] = q_char
@@ -588,47 +644,6 @@ def write_history_metadata(bgc_file, iprof_chla, iprof_doxy):
         bgc_file.variables["DATE_UPDATE"][:] = nc.stringtochar(
             np.array(UTCcurrent, dtype="S14")
         )
-
-
-def get_profile_qc_grade(qc_masked_array):
-    if hasattr(qc_masked_array, "compressed"):
-        unmasked_vals = qc_masked_array.compressed()
-    else:
-        unmasked_vals = qc_masked_array
-
-    raw_qcs = []
-    for q in unmasked_vals:
-        if isinstance(q, np.ma.core.MaskedConstant) or q is np.ma.masked:
-            continue
-        s = q.decode("utf-8").strip() if isinstance(q, bytes) else str(q).strip()
-        if s != "":
-            raw_qcs.append(s)
-
-    if len(raw_qcs) == 0 or all(q in ["4", "9"] for q in raw_qcs):
-        return " "
-
-    valid_qcs = [q for q in raw_qcs if q not in ["4", "9"]]
-    total_points = len(valid_qcs)
-
-    if total_points == 0:
-        return " "
-
-    bad_count = sum(1 for q in valid_qcs if q in ["3"])
-    good_count = total_points - bad_count
-    pct_good = (good_count / total_points) * 100.0
-
-    if bad_count == 0:
-        return "A"
-    elif 75.0 <= pct_good < 100.0:
-        return "B"
-    elif 50.0 <= pct_good < 75.0:
-        return "C"
-    elif 25.0 <= pct_good < 75.0:
-        return "D"
-    elif 0.0 < pct_good < 25.0:
-        return "E"
-    else:
-        return " "
 
 
 def write_scientific_calib_chla(bgc_file, WMOfloatid, idx_profile, df_bio):
@@ -1083,19 +1098,6 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx
         if has_fluo_qc:
             bgc_file.variables["CHLA_FLUORESCENCE_QC"][prof, :] = fluo_qc_arr
 
-        prof_qc = get_profile_qc_grade(CHLA_AdjustedQC_Array)
-        prof_fluo_qc = get_profile_qc_grade(CHLA_FLUORESCENCE_AdjustedQC_Array)
-
-        if "PROFILE_CHLA_QC" in bgc_file.variables:
-            bgc_file.variables["PROFILE_CHLA_QC"][prof] = np.array(
-                [prof_qc], dtype="|S1"
-            )
-
-        if "PROFILE_CHLA_FLUORESCENCE_QC" in bgc_file.variables:
-            bgc_file.variables["PROFILE_CHLA_FLUORESCENCE_QC"][prof] = np.array(
-                [prof_fluo_qc], dtype="|S1"
-            )
-
 
 def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx=0):
     if "BBP700_ADJUSTED" not in bgc_file.variables:
@@ -1271,12 +1273,6 @@ def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx=0
             bgc_file.variables["BBP700"][prof, :] = bbp_data_arr
         if has_bbp_qc:
             bgc_file.variables["BBP700_QC"][prof, :] = bbp_qc_arr
-
-        prof_bbp_qc = get_profile_qc_grade(BBP700_AdjustedQC_Array)
-        if "PROFILE_BBP700_QC" in bgc_file.variables:
-            bgc_file.variables["PROFILE_BBP700_QC"][prof] = np.array(
-                [prof_bbp_qc], dtype="|S1"
-            )
 
 
 def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
@@ -1555,15 +1551,6 @@ def write_DOXY_from_csv(ds, float_df, target_cycle):
             else:
                 doxy_adj_err_var[:] = DOXY_Adjusted_Error_Array
 
-        prof_qc = get_profile_qc_grade(DOXY_AdjustedQC_Array)
-        if "PROFILE_DOXY_QC" in ds.variables:
-            prof_qc_var = ds.variables["PROFILE_DOXY_QC"]
-            qc_char = np.array([prof_qc], dtype="|S1")
-            if prof_qc_var.ndim == 1:
-                prof_qc_var[iprof] = qc_char
-            elif prof_qc_var.ndim == 2:
-                prof_qc_var[iprof, 0] = qc_char
-
 
 def add_missing_valid_range_attributes(bgc_file):
     for var_name, (vmin, vmax) in ARGO_VALID_RANGES.items():
@@ -1783,7 +1770,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             write_DOXY_slope_drift(ds, 0, df_bio, idx_profile)
             write_DOXY_from_csv(ds, df_bio, idx_profile)
 
-            # 3. Carry over missing adjusted levels and clean QC variables across ALL profiles
+            # 3. Carry over missing adjusted levels and clean QC & PROFILE_<PARAM>_QC variables
             clean_and_fill_qc_variables(ds)
 
             # 4. Metadata and attributes
