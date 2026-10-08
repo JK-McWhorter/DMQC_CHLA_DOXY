@@ -222,7 +222,7 @@ def write_parameter_data_modes(bgc_file):
             ]).strip()
 
             if p_str:
-                if p_str == "PRES":
+                if p_str == "PRES" or p_str.startswith("DOWN_IRRADIANCE") or p_str.startswith("UP_RADIANCE"):
                     pdm[iprof, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
                 elif p_str in ["CHLA", "CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA", "BBP700", "DOXY"]:
                     if has_valid_measurements(bgc_file, p_str, iprof):
@@ -313,7 +313,6 @@ def get_param_data_mode(bgc_file, iprof, param_base):
             m_val = pdm_array[j]
             return m_val.decode("utf-8").strip() if isinstance(m_val, bytes) else str(m_val).strip()
 
-    # Default to main DATA_MODE if parameter not found explicitly in STATION_PARAMETERS
     dm_var = bgc_file.variables.get("DATA_MODE")
     if dm_var is not None:
         m = dm_var[iprof]
@@ -503,30 +502,6 @@ def clean_and_fill_qc_variables(bgc_file):
                     else:
                         bgc_file.variables[var_name][:] = q_char
 
-                    if var_name in [
-                        "DOXY_QC",
-                        "DOXY_ADJUSTED_QC",
-                        "FLUORESCENCE_CHLA_QC",
-                        "FLUORESCENCE_CHLA_ADJUSTED_QC",
-                        "CHLA_QC",
-                        "CHLA_ADJUSTED_QC",
-                        "CHLA_FLUORESCENCE_QC",
-                        "CHLA_FLUORESCENCE_ADJUSTED_QC",
-                        "BBP700_QC",
-                        "BBP700_ADJUSTED_QC",
-                    ]:
-                        q_str_vals = [c.decode("utf-8", errors="ignore") for c in q_char[valid_data_mask]]
-                        unique_qcs, counts = np.unique(q_str_vals, return_counts=True)
-                        qc_summary = (
-                            ", ".join([f"'{k}': {v}" for k, v in zip(unique_qcs, counts)])
-                            if len(unique_qcs) > 0
-                            else "None"
-                        )
-                        print(
-                            f"[{file_name}] Profile [{iprof}] {var_name} values at valid data levels "
-                            f"({np.sum(valid_data_mask)} total levels): {qc_summary}"
-                        )
-
             except Exception:
                 traceback.print_exc()
 
@@ -538,13 +513,9 @@ def clean_and_fill_qc_variables(bgc_file):
             continue
 
         param_base = var_name[8:-3]
-        adj_qc_var_name = (
-            f"{param_base}_ADJUSTED_QC"
-            if f"{param_base}_ADJUSTED_QC" in bgc_file.variables
-            else f"{param_base}_QC"
-        )
 
         for iprof in range(n_prof):
+            mode = get_param_data_mode(bgc_file, iprof, param_base)
             param_is_present = False
 
             if "STATION_PARAMETERS" in bgc_file.variables:
@@ -561,8 +532,18 @@ def clean_and_fill_qc_variables(bgc_file):
                         param_is_present = True
                         break
 
-            if adj_qc_var_name in bgc_file.variables:
-                target_qc_var = bgc_file.variables[adj_qc_var_name]
+            # If mode is Real-Time ('R'), use raw _QC array; if Delayed ('D'/'A'), prefer _ADJUSTED_QC
+            if mode == "R":
+                target_qc_name = f"{param_base}_QC"
+            else:
+                target_qc_name = (
+                    f"{param_base}_ADJUSTED_QC"
+                    if f"{param_base}_ADJUSTED_QC" in bgc_file.variables
+                    else f"{param_base}_QC"
+                )
+
+            if target_qc_name in bgc_file.variables:
+                target_qc_var = bgc_file.variables[target_qc_name]
                 target_qc_array = (
                     target_qc_var[iprof, :] if target_qc_var.ndim > 1 else target_qc_var[:]
                 )
@@ -575,7 +556,7 @@ def clean_and_fill_qc_variables(bgc_file):
                     bgc_file.variables[var_name][iprof, 0] = grade_bytes
 
                 print(
-                    f"[{file_name}] Profile [{iprof}] {var_name} grade calculated: '{prof_grade}'"
+                    f"[{file_name}] Profile [{iprof}] {var_name} grade calculated: '{prof_grade}' (Mode: {mode}, Var: {target_qc_name})"
                 )
 
 
