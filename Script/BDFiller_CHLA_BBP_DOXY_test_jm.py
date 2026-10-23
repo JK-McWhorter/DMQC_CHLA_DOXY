@@ -35,6 +35,9 @@ FLOAT_TYPES = {
 
 WMO_FLOAT_IDS = list(FLOAT_TYPES.keys())
 
+# Float IDs where DOXY data manipulation/filling should be skipped
+DOXY_EXCLUDE_FLOAT_IDS = {4903910, 4903911, 7902327, 3902693, 1902800}
+
 # Common Configuration Defaults
 comment_dmqc_operator_chla = (
     "PRIMARY | https://orcid.org/0000-0003-1297-6599 | Jennifer"
@@ -184,14 +187,24 @@ def apply_float_override_conditions(df, WMOfloatid):
 
 
 def has_valid_measurements(bgc_file, param, iprof):
-    """Check if a parameter has actual numerical measurements at profile iprof."""
-    if param not in bgc_file.variables:
-        return False
-    var = bgc_file.variables[param]
-    p_slice = var[iprof, :] if var.ndim > 1 else var[:]
-    p_vals = p_slice.filled(99999.0) if hasattr(p_slice, "filled") else np.array(p_slice)
-    valid_mask = (~pd.isna(p_vals)) & (p_vals != 99999.0)
-    return valid_mask.any()
+    """Check if a parameter or its alias has actual numerical measurements at profile iprof."""
+    param_candidates = [param]
+    if param == "CHLA":
+        param_candidates.extend(["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA", "CHLA_ADJUSTED"])
+    elif param == "BBP700":
+        param_candidates.extend(["BBP700_ADJUSTED"])
+    elif param == "DOXY":
+        param_candidates.extend(["DOXY_ADJUSTED"])
+
+    for p in param_candidates:
+        if p in bgc_file.variables:
+            var = bgc_file.variables[p]
+            p_slice = var[iprof, :] if var.ndim > 1 else var[:]
+            p_vals = p_slice.filled(99999.0) if hasattr(p_slice, "filled") else np.array(p_slice)
+            valid_mask = (~pd.isna(p_vals)) & (p_vals != 99999.0)
+            if valid_mask.any():
+                return True
+    return False
 
 
 def write_parameter_data_modes(bgc_file):
@@ -244,6 +257,7 @@ def write_parameter_data_modes(bgc_file):
 def get_profile_qc_grade(qc_masked_array, parameter_present=True):
     """
     Compute overall profile QC grade letter ('A', 'B', 'C', 'D', 'E', 'F', or ' ').
+    Following standard Argo BGC QC rules.
     """
     if not parameter_present:
         return " "
@@ -261,26 +275,26 @@ def get_profile_qc_grade(qc_masked_array, parameter_present=True):
         if s != "":
             raw_qcs.append(s)
 
-    if len(raw_qcs) == 0 or all(q in ["4", "9"] for q in raw_qcs):
-        return "F"
-
-    valid_qcs = [q for q in raw_qcs if q not in ["4", "9"]]
+    # Filter out empty/unfilled levels
+    valid_qcs = [q for q in raw_qcs if q not in ["", " ", "9"]]
     total_points = len(valid_qcs)
 
-    if total_points == 0:
+    if total_points == 0 or all(q == "4" for q in valid_qcs):
         return "F"
 
-    bad_count = sum(1 for q in valid_qcs if q in ["3"])
-    good_count = total_points - bad_count
+    # Count good measurements (QC 1 or 2)
+    good_count = sum(1 for q in valid_qcs if q in ["1", "2"])
+    bad_count = sum(1 for q in valid_qcs if q in ["3", "4"])
+
     pct_good = (good_count / total_points) * 100.0
 
-    if bad_count == 0:
+    if bad_count == 0 and pct_good == 100.0:
         return "A"
     elif 75.0 <= pct_good < 100.0:
         return "B"
     elif 50.0 <= pct_good < 75.0:
         return "C"
-    elif 25.0 <= pct_good < 75.0:
+    elif 25.0 <= pct_good < 50.0:
         return "D"
     elif 0.0 < pct_good < 25.0:
         return "E"
@@ -320,14 +334,16 @@ def get_param_data_mode(bgc_file, iprof, param_base):
     return "R"
 
 
-def clean_and_fill_qc_variables(bgc_file):
+def clean_and_fill_qc_variables(bgc_file, WMOfloatid=None):
     """
     Safely inspect, harmonize, carry over raw data/QC, and fix level-QC 
     and PROFILE_<PARAM>_QC across ALL profiles (iprof = 0, 1, 2, ...),
     strictly enforcing FillValue on _ADJUSTED_QC when in 'R' mode.
+    Excludes DOXY if WMOfloatid is in DOXY_EXCLUDE_FLOAT_IDS.
     """
     n_prof = bgc_file.dimensions["N_PROF"].size
     file_name = os.path.basename(bgc_file.filepath()) if hasattr(bgc_file, "filepath") else "File"
+    skip_doxy = WMOfloatid in DOXY_EXCLUDE_FLOAT_IDS if WMOfloatid is not None else False
 
     # =========================================================================
     # STEP A: Carry over raw data and raw QC to ADJUSTED variables if missing
@@ -337,6 +353,9 @@ def clean_and_fill_qc_variables(bgc_file):
         "DOWN_IRRADIANCE380", "DOWN_IRRADIANCE443", "DOWN_IRRADIANCE490", "DOWN_IRRADIANCE555"
     ]
     for param in base_params:
+        if skip_doxy and "DOXY" in param:
+            continue
+
         adj_param = f"{param}_ADJUSTED"
         adj_qc_param = f"{param}_ADJUSTED_QC"
         raw_qc_param = f"{param}_QC"
@@ -418,6 +437,9 @@ def clean_and_fill_qc_variables(bgc_file):
             continue
 
         if "PH" in var_name or "NITRATE" in var_name or "TEMP_CPU_CHLA" in var_name:
+            continue
+
+        if skip_doxy and "DOXY" in var_name:
             continue
 
         is_adjusted_qc = var_name.endswith("_ADJUSTED_QC")
@@ -513,24 +535,12 @@ def clean_and_fill_qc_variables(bgc_file):
             continue
 
         param_base = var_name[8:-3]
+        if skip_doxy and "DOXY" in param_base:
+            continue
 
         for iprof in range(n_prof):
             mode = get_param_data_mode(bgc_file, iprof, param_base)
-            param_is_present = False
-
-            if "STATION_PARAMETERS" in bgc_file.variables:
-                station_params = bgc_file.variables["STATION_PARAMETERS"][iprof]
-                if isinstance(station_params, np.ma.MaskedArray):
-                    station_params = station_params.filled(b" ")
-
-                for p in station_params:
-                    p_str = "".join([
-                        (c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c))
-                        for c in p
-                    ]).strip()
-                    if p_str == param_base and has_valid_measurements(bgc_file, param_base, iprof):
-                        param_is_present = True
-                        break
+            param_is_present = has_valid_measurements(bgc_file, param_base, iprof)
 
             # If mode is Real-Time ('R'), use raw _QC array; if Delayed ('D'/'A'), prefer _ADJUSTED_QC
             if mode == "R":
@@ -660,7 +670,7 @@ def update_history_entry(nc_ds, dct, iprof_idx):
             nc_ds[name][target_hix, iprof_idx, :] = nc.stringtochar(char_arr)
 
 
-def write_history_metadata(bgc_file, iprof_chla, iprof_doxy):
+def write_history_metadata(bgc_file, iprof_chla, iprof_doxy, WMOfloatid=None):
     bgc_file.history = datetime.datetime.now(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ creation"
     )
@@ -683,20 +693,21 @@ def write_history_metadata(bgc_file, iprof_chla, iprof_doxy):
         iprof_chla,
     )
 
-    update_history_entry(
-        bgc_file,
-        {
-            "HISTORY_INSTITUTION": "AO",
-            "HISTORY_STEP": "ARSQ",
-            "HISTORY_SOFTWARE": "BITTIG",
-            "HISTORY_SOFTWARE_RELEASE": "2024",
-            "HISTORY_REFERENCE": "WOA2023",
-            "HISTORY_DATE": UTCcurrent,
-            "HISTORY_ACTION": "IP  ",
-            "HISTORY_PARAMETER": "DOXY",
-        },
-        iprof_doxy,
-    )
+    if WMOfloatid not in DOXY_EXCLUDE_FLOAT_IDS:
+        update_history_entry(
+            bgc_file,
+            {
+                "HISTORY_INSTITUTION": "AO",
+                "HISTORY_STEP": "ARSQ",
+                "HISTORY_SOFTWARE": "BITTIG",
+                "HISTORY_SOFTWARE_RELEASE": "2024",
+                "HISTORY_REFERENCE": "WOA2023",
+                "HISTORY_DATE": UTCcurrent,
+                "HISTORY_ACTION": "IP  ",
+                "HISTORY_PARAMETER": "DOXY",
+            },
+            iprof_doxy,
+        )
 
     if "DATE_UPDATE" in bgc_file.variables:
         bgc_file.variables["DATE_UPDATE"][:] = nc.stringtochar(
@@ -1359,7 +1370,10 @@ def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx=0
             bgc_file.variables["BBP700_QC"][prof, :] = bbp_qc_arr
 
 
-def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
+def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle, WMOfloatid=None):
+    if WMOfloatid in DOXY_EXCLUDE_FLOAT_IDS:
+        return
+
     cycle_df = float_df[float_df["CYCLE_NUMBER"] == int(target_cycle)]
     if cycle_df.empty:
         return
@@ -1436,8 +1450,11 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle):
                     ds.variables["SCIENTIFIC_CALIB_DATE"][iprof, 0, j, :] = char_date
 
 
-def write_DOXY_from_csv(ds, float_df, target_cycle):
+def write_DOXY_from_csv(ds, float_df, target_cycle, WMOfloatid=None):
     """Populate DOXY_ADJUSTED and synchronize DOXY_ADJUSTED_QC across ALL profiles."""
+    if WMOfloatid in DOXY_EXCLUDE_FLOAT_IDS:
+        return
+
     var_names = ds.variables.keys()
     n_prof = ds.dimensions["N_PROF"].size
     n_levels = ds.dimensions["N_LEVELS"].size
@@ -1562,9 +1579,9 @@ def write_DOXY_from_csv(ds, float_df, target_cycle):
                     or raw_doxy_final == 99999.0
                 ):
                     DOXY_Adjusted_Array[i] = 99999.0
-                    DOXY_Adjusted_ERROR_Array[i] = 99999.0
+                    DOXY_Adjusted_Error_Array[i] = 99999.0
                     DOXY_Adjusted_Array.mask[i] = True
-                    DOXY_Adjusted_ERROR_Array.mask[i] = True
+                    DOXY_Adjusted_Error_Array.mask[i] = True
                     target_flag = b"4" if (raw_qc_char == "4" or qc_str == "4") else b"1"
                     DOXY_AdjustedQC_Array[i] = target_flag
                     if doxy_qc_arr is not None:
@@ -1713,14 +1730,14 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             write_scientific_calib_chla(ds, WMOfloatid, idx_profile, df_bio)
             write_chla_BBP_adjusted(ds, WMOfloatid, idx_profile, df_bio, iprof_chla)
             write_BBP700_adjusted(ds, WMOfloatid, idx_profile, df_bio, iprof_bbp)
-            write_DOXY_slope_drift(ds, 0, df_bio, idx_profile)
-            write_DOXY_from_csv(ds, df_bio, idx_profile)
+            write_DOXY_slope_drift(ds, 0, df_bio, idx_profile, WMOfloatid=WMOfloatid)
+            write_DOXY_from_csv(ds, df_bio, idx_profile, WMOfloatid=WMOfloatid)
 
             # 3. Carry over missing adjusted levels and clean QC & PROFILE_<PARAM>_QC variables across ALL profiles
-            clean_and_fill_qc_variables(ds)
+            clean_and_fill_qc_variables(ds, WMOfloatid=WMOfloatid)
 
             # 4. Metadata and attributes
-            write_history_metadata(ds, iprof_chla, iprof_doxy)
+            write_history_metadata(ds, iprof_chla, iprof_doxy, WMOfloatid=WMOfloatid)
             add_missing_valid_range_attributes(ds)
             remove_forbidden_attributes(ds)
 
