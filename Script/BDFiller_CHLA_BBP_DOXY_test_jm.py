@@ -14,6 +14,8 @@ import sys
 import traceback
 from datetime import datetime as dt, timezone
 
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import netCDF4 as nc
 import numpy as np
 import pandas as pd
@@ -1670,10 +1672,259 @@ def safe_rename(from_file, to_file):
 
 
 # ==============================================================================
-# SECTION 3: Processing Loop
+# SECTION 3: Plotting Function
+# ==============================================================================
+
+def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
+    """
+    Generate a DMQC status plot matching the provided layout and styling,
+    plotting Data Mode and PARAM Grade (Profile QC) across all cycle numbers.
+    Saves output figure to a 'DMQC_status_plot' folder located in `output_dir`.
+    """
+    if not sorted_b_files:
+        return
+
+    plot_out_dir = os.path.join(output_dir, "DMQC_status_plot")
+    os.makedirs(plot_out_dir, exist_ok=True)
+
+    cycles = []
+    dates = []
+    max_pres_list = []
+
+    # Variables to track for Data Mode and Profile QC
+    params = [
+        "DATA_TYPE", "POSITION", "PRES", "TEMP", "PSAL", 
+        "DOXY", "BBP700", "CHLA", "PH", "NITRATE", "CHLA_FLUORESCENCE"
+    ]
+
+    mode_data = {p: [] for p in params}
+    qc_data = {p: [] for p in params}
+
+    for fpath in sorted_b_files:
+        try:
+            ds = nc.Dataset(fpath, "r")
+            
+            # Extract cycle number
+            cycle_num = int(fpath[-6:-3])
+            cycles.append(cycle_num)
+
+            # Extract cycle date if available
+            if "JULD" in ds.variables and ds.variables["JULD"][:].size > 0:
+                juld = ds.variables["JULD"][0]
+                if not np.ma.is_masked(juld):
+                    ref_date = dt(1950, 1, 1, tzinfo=timezone.utc)
+                    c_date = ref_date + datetime.timedelta(days=float(juld))
+                    dates.append(c_date.strftime("%Y-%m-%d"))
+                else:
+                    dates.append("")
+            else:
+                dates.append("")
+
+            # Get maximum pressure
+            if "PRES" in ds.variables:
+                pres_vals = ds.variables["PRES"][:].filled(np.nan)
+                valid_pres = pres_vals[~np.isnan(pres_vals) & (pres_vals != 99999.0)]
+                max_pres_list.append(np.max(valid_pres) if len(valid_pres) > 0 else np.nan)
+            else:
+                max_pres_list.append(np.nan)
+
+            # Extract Data Mode and Profile QC Grade for each parameter
+            for p in params:
+                mode_val = "R"
+                qc_grade = " "
+
+                if p == "DATA_TYPE":
+                    if "DATA_MODE" in ds.variables:
+                        m = ds.variables["DATA_MODE"][0]
+                        mode_val = m.decode("utf-8") if isinstance(m, bytes) else str(m)
+                    qc_grade = " "
+                elif p == "POSITION":
+                    mode_val = "R"
+                    if "POSITION_QC" in ds.variables:
+                        q = ds.variables["POSITION_QC"][0]
+                        q_str = q.decode("utf-8") if isinstance(q, bytes) else str(q)
+                        qc_grade = q_str
+                else:
+                    mode_val = get_param_data_mode(ds, 0, p)
+                    prof_qc_var = f"PROFILE_{p}_QC"
+                    if prof_qc_var in ds.variables:
+                        g = ds.variables[prof_qc_var][0]
+                        if isinstance(g, np.ndarray) and g.ndim > 0:
+                            g = g[0]
+                        qc_grade = g.decode("utf-8") if isinstance(g, bytes) else str(g)
+
+                mode_data[p].append(mode_val.strip())
+                qc_data[p].append(qc_grade.strip())
+
+            ds.close()
+        except Exception:
+            traceback.print_exc()
+
+    if not cycles:
+        return
+
+    n_cycles = len(cycles)
+    cycle_indices = np.arange(n_cycles)
+
+    # Setup Plot Dimensions & Figure
+    fig, ax = plt.subplots(figsize=(10, 10), dpi=300)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    # Define Color Maps
+    data_mode_colors = {"D": "#647ed5", "A": "#c07ab8", "R": "#ff4d6d"}
+    pos_qc_colors = {
+        "1": "#1b7837", "2": "#ffffbf", "3": "#fdae61", 
+        "4": "#d73027", "5": "#404040", "8": "#7fbf7b", "9": "#808080"
+    }
+    param_grade_colors = {
+        "A": "#1b7837", "B": "#a6dba0", "C": "#ffffbf", 
+        "D": "#fdae61", "E": "#f46d43", "F": "#d73027", " ": "#ffffff"
+    }
+
+    # Vertical bar placement rows
+    rows = [
+        ("Data Type (R/A/D)", "DATA_TYPE"),
+        ("Positioning System\nPosition QC", "POSITION"),
+        ("Profile Depth", "DEPTH"),
+        ("PRES Data Mode\nProfile PRES QC", "PRES"),
+        ("TEMP Data Mode\nProfile TEMP QC", "TEMP"),
+        ("PSAL Data Mode\nProfile PSAL QC", "PSAL"),
+        ("DOXY Data Mode\nProfile DOXY QC", "DOXY"),
+        ("BBP700 Data Mode\nProfile BBP700 QC", "BBP700"),
+        ("CHLA Data Mode\nProfile CHLA QC", "CHLA"),
+        ("PH Data Mode\nProfile PH QC", "PH"),
+        ("NITRATE Data Mode\nProfile NITRATE QC", "NITRATE"),
+        ("CHLA_FLUORESCENCE Data Mode\nProfile CHLA_FLUORESCENCE QC", "CHLA_FLUORESCENCE"),
+    ]
+
+    y_positions = np.arange(len(rows))[::-1]
+
+    for y_idx, (label, p_key) in zip(y_positions, rows):
+        for c_idx in range(n_cycles):
+            x_left = c_idx
+            x_width = 1.0
+
+            if p_key == "DEPTH":
+                # Depth Bar Styling
+                ax.barh(y_idx, x_width, left=x_left, height=0.7, color="#4bb0d1", align="center")
+            elif p_key == "DATA_TYPE":
+                m = mode_data[p_key][c_idx]
+                c_mode = data_mode_colors.get(m, "#647ed5")
+                ax.barh(y_idx, x_width, left=x_left, height=0.7, color=c_mode, align="center")
+            elif p_key == "POSITION":
+                q = qc_data[p_key][c_idx]
+                c_mode = "#af43f0"
+                c_qc = pos_qc_colors.get(q, "#1b7837")
+                ax.barh(y_idx + 0.175, x_width, left=x_left, height=0.35, color=c_mode, align="center")
+                ax.barh(y_idx - 0.175, x_width, left=x_left, height=0.35, color=c_qc, align="center")
+            else:
+                m = mode_data[p_key][c_idx]
+                q = qc_data[p_key][c_idx]
+                c_mode = data_mode_colors.get(m, "#ff4d6d")
+                c_qc = param_grade_colors.get(q, "#d73027" if m == "R" else "#1b7837")
+
+                ax.barh(y_idx + 0.175, x_width, left=x_left, height=0.35, color=c_mode, align="center")
+                ax.barh(y_idx - 0.175, x_width, left=x_left, height=0.35, color=c_qc, align="center")
+
+    # Annotate Maximum Pressure
+    valid_max_pres = [p for p in max_pres_list if not np.isnan(p)]
+    if valid_max_pres:
+        overall_max_p = int(np.round(np.max(valid_max_pres)))
+        depth_y_idx = y_positions[2]
+        ax.text(-1, depth_y_idx - 0.35, f"Max: ~{overall_max_p} dbar", 
+                va="top", ha="right", color="#4bb0d1", fontsize=9, fontweight="bold")
+
+    # Title & Metadata Labels
+    ax.text(n_cycles / 2, len(rows) + 0.2, f"WMOID {WMOfloatid}", 
+            fontsize=18, fontweight="normal", ha="center", va="bottom")
+    ax.text(n_cycles + 2, len(rows) + 0.2, "Status: Active", 
+            fontsize=16, fontweight="bold", color="#78db88", ha="left", va="bottom")
+
+    # Set Axes & Labels
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels([r[0] for r in rows], fontsize=9)
+    ax.set_xlim(0, n_cycles)
+    ax.set_ylim(-0.8, len(rows) - 0.2)
+
+    # Custom X-Axis Ticks
+    tick_indices = [0]
+    if n_cycles > 18:
+        tick_indices.append(17)
+    if n_cycles > 35:
+        tick_indices.append(34)
+    tick_indices.append(n_cycles - 1)
+    tick_indices = sorted(list(set(tick_indices)))
+
+    ax.set_xticks([i + 0.5 for i in tick_indices])
+    ax.set_xticklabels([str(cycles[i]) for i in tick_indices], fontsize=10)
+    ax.set_xlabel("Cycle Number", fontsize=12, labelpad=15)
+
+    # Dates annotation at key cycle points
+    first_date = dates[0] if dates else ""
+    last_date = dates[-1] if dates else ""
+    ax.text(0, -1.3, f"Cycle {cycles[0]}: {first_date}", ha="left", va="top", fontsize=9)
+    ax.text(n_cycles, -1.3, f"Cycle {cycles[-1]}: {last_date}", ha="right", va="top", fontsize=9)
+
+    # Remove Outer Spines
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(axis="both", which="both", length=0)
+
+    # Legend 1: Data Mode
+    dm_patches = [
+        mpatches.Patch(color="#647ed5", label="Delayed Mode"),
+        mpatches.Patch(color="#c07ab8", label="Adjusted Mode"),
+        mpatches.Patch(color="#ff4d6d", label="Real Time Mode"),
+    ]
+    leg1 = ax.legend(handles=dm_patches, title="Data Mode:", loc="upper left", 
+                     bbox_to_anchor=(1.02, 0.95), frameon=False, fontsize=9, title_fontsize=10)
+    ax.add_artist(leg1)
+
+    # Legend 2: Positioning System QC
+    pos_patches = [
+        mpatches.Patch(color="#1b7837", label="1 - Good data"),
+        mpatches.Patch(color="#ffffbf", label="2 - Probably good"),
+        mpatches.Patch(color="#fdae61", label="3 - Probably bad"),
+        mpatches.Patch(color="#d73027", label="4 - Bad data"),
+        mpatches.Patch(color="#404040", label="5 - Value changed"),
+        mpatches.Patch(color="#7fbf7b", label="8 - Interpolated"),
+        mpatches.Patch(color="#808080", label="9 - Missing"),
+    ]
+    leg2 = ax.legend(handles=pos_patches, title="Positioning System QC:", loc="upper left", 
+                     bbox_to_anchor=(1.02, 0.75), frameon=False, fontsize=9, title_fontsize=10)
+    ax.add_artist(leg2)
+
+    # Legend 3: Profile PARAM Grade
+    grade_patches = [
+        mpatches.Patch(color="#1b7837", label="A - 100% good data"),
+        mpatches.Patch(color="#a6dba0", label="B - 75-99% good data"),
+        mpatches.Patch(color="#ffffbf", label="C - 50-75% good data"),
+        mpatches.Patch(color="#fdae61", label="D - 25-50% good data"),
+        mpatches.Patch(color="#f46d43", label="E - 0-25% good data"),
+        mpatches.Patch(color="#d73027", label="F - 0% good data"),
+    ]
+    ax.legend(handles=grade_patches, title="Profile PARAM Grade:", loc="upper left", 
+              bbox_to_anchor=(1.02, 0.45), frameon=False, fontsize=9, title_fontsize=10)
+
+    # Timestamp Footer
+    today_stamp = dt.now().strftime("%Y-%m-%d")
+    plt.text(0.02, 0.01, f"Figure Created: {today_stamp}", transform=fig.transFigure, 
+             fontsize=8, fontweight="bold", ha="left")
+
+    plt.tight_layout()
+    plot_filename = os.path.join(plot_out_dir, f"{WMOfloatid}_DMQC_status.png")
+    plt.savefig(plot_filename, bbox_inches="tight", dpi=300)
+    plt.close()
+    print(f"[{WMOfloatid}] DMQC Status Plot saved to: {plot_filename}")
+
+
+# ==============================================================================
+# SECTION 4: Processing Loop
 # ==============================================================================
 
 processed_output_paths = []
+script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
 
 for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
     main_float_dir = f"/data/a1/ARGO_DELAY/DMQC_BGC/data/{WMOfloatid}/"
@@ -1766,3 +2017,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
         new_path = os.path.join(final_out_dir, new_name)
         safe_rename(w_file, new_path)
         processed_output_paths.append(new_path)
+
+    # 5. Generate DMQC Status Plot and save to 'DMQC_status_plot' folder
+    generate_dmqc_status_plot(WMOfloatid, sorted_b_files, script_dir)
