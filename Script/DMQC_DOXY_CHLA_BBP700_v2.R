@@ -200,7 +200,7 @@ calib_df <- read.csv(calib_csv_path) %>%
 
 # Extract float IDs to loop over
 float_ids     <- calib_df$float_ids 
-# Special target list for floats requiring specific manual overrides later
+# Special target list for floats requiring specific manual overrides later, these will not have the CHLA LUT applied - Caribbean floats and a broken sensor
 target_floats <- c(6999992, 4903904, 1902800, 5907206, 4903624)
 today_str     <- format(Sys.Date(), "%Y-%m-%d")               # Store current date as text (YYYY-MM-DD)
 
