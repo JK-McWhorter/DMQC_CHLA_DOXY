@@ -557,7 +557,7 @@ def clean_and_fill_qc_variables(bgc_file, WMOfloatid=None):
             if target_qc_name in bgc_file.variables:
                 target_qc_var = bgc_file.variables[target_qc_name]
                 target_qc_array = (
-                    target_qc_var[iprof, :] if target_qc_var.ndim > 1 else target_qc_var[:]
+                    target_qc_var[iprof, :] if target_qc_var.ndim > 1 else target_qc_array[:]
                 )
                 prof_grade = get_profile_qc_grade(target_qc_array, parameter_present=param_is_present)
                 grade_bytes = prof_grade.encode("utf-8")
@@ -1675,13 +1675,13 @@ def safe_rename(from_file, to_file):
 # SECTION 3: Plotting Function
 # ==============================================================================
 
-def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
+def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
     """
-    Generate a DMQC status plot matching the provided layout and styling,
-    plotting Data Mode and PARAM Grade (Profile QC) across all cycle numbers.
-    Saves output figure to a 'DMQC_status_plot' folder located in `output_dir`.
+    Generate a DMQC status plot using the final processed output BD NetCDF files.
+    Plots PARAM Grade (Profile QC) derived from <PARAM>_ADJUSTED and <PARAM>_ADJUSTED_QC.
+    Saves output figure to 'DMQC_status_plot' inside `output_dir`.
     """
-    if not sorted_b_files:
+    if not processed_bd_files:
         return
 
     plot_out_dir = os.path.join(output_dir, "DMQC_status_plot")
@@ -1691,7 +1691,6 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
     dates = []
     max_pres_list = []
 
-    # Variables to track for Data Mode and Profile QC
     params = [
         "DATA_TYPE", "POSITION", "PRES", "TEMP", "PSAL", 
         "DOXY", "BBP700", "CHLA", "PH", "NITRATE", "CHLA_FLUORESCENCE"
@@ -1700,15 +1699,15 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
     mode_data = {p: [] for p in params}
     qc_data = {p: [] for p in params}
 
-    for fpath in sorted_b_files:
+    for fpath in processed_bd_files:
         try:
             ds = nc.Dataset(fpath, "r")
             
-            # Extract cycle number
+            # Profile Cycle Number
             cycle_num = int(fpath[-6:-3])
             cycles.append(cycle_num)
 
-            # Extract cycle date if available
+            # Date
             if "JULD" in ds.variables and ds.variables["JULD"][:].size > 0:
                 juld = ds.variables["JULD"][0]
                 if not np.ma.is_masked(juld):
@@ -1720,7 +1719,7 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
             else:
                 dates.append("")
 
-            # Get maximum pressure
+            # Max Depth/Pressure
             if "PRES" in ds.variables:
                 pres_vals = ds.variables["PRES"][:].filled(np.nan)
                 valid_pres = pres_vals[~np.isnan(pres_vals) & (pres_vals != 99999.0)]
@@ -1728,7 +1727,6 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
             else:
                 max_pres_list.append(np.nan)
 
-            # Extract Data Mode and Profile QC Grade for each parameter
             for p in params:
                 mode_val = "R"
                 qc_grade = " "
@@ -1746,12 +1744,32 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
                         qc_grade = q_str
                 else:
                     mode_val = get_param_data_mode(ds, 0, p)
-                    prof_qc_var = f"PROFILE_{p}_QC"
-                    if prof_qc_var in ds.variables:
-                        g = ds.variables[prof_qc_var][0]
-                        if isinstance(g, np.ndarray) and g.ndim > 0:
-                            g = g[0]
-                        qc_grade = g.decode("utf-8") if isinstance(g, bytes) else str(g)
+                    
+                    # Evaluate presence and quality using output _ADJUSTED & _ADJUSTED_QC
+                    adj_p_name = f"{p}_ADJUSTED"
+                    adj_qc_name = f"{p}_ADJUSTED_QC"
+
+                    target_p = adj_p_name if adj_p_name in ds.variables else p
+                    target_qc = adj_qc_name if adj_qc_name in ds.variables else f"{p}_QC"
+
+                    has_p_data = False
+                    if target_p in ds.variables:
+                        p_var = ds.variables[target_p]
+                        p_vals = p_var[0, :] if p_var.ndim > 1 else p_var[:]
+                        p_arr = p_vals.filled(99999.0) if hasattr(p_vals, "filled") else np.array(p_vals)
+                        has_p_data = ((~pd.isna(p_arr)) & (p_arr != 99999.0)).any()
+
+                    if target_qc in ds.variables:
+                        qc_var = ds.variables[target_qc]
+                        qc_arr = qc_var[0, :] if qc_var.ndim > 1 else qc_var[:]
+                        qc_grade = get_profile_qc_grade(qc_arr, parameter_present=has_p_data)
+                    else:
+                        prof_qc_var = f"PROFILE_{p}_QC"
+                        if prof_qc_var in ds.variables:
+                            g = ds.variables[prof_qc_var][0]
+                            if isinstance(g, np.ndarray) and g.ndim > 0:
+                                g = g[0]
+                            qc_grade = g.decode("utf-8") if isinstance(g, bytes) else str(g)
 
                 mode_data[p].append(mode_val.strip())
                 qc_data[p].append(qc_grade.strip())
@@ -1764,14 +1782,13 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
         return
 
     n_cycles = len(cycles)
-    cycle_indices = np.arange(n_cycles)
 
-    # Setup Plot Dimensions & Figure
+    # Setup Figure Layout
     fig, ax = plt.subplots(figsize=(10, 10), dpi=300)
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
 
-    # Define Color Maps
+    # Define Colors
     data_mode_colors = {"D": "#647ed5", "A": "#c07ab8", "R": "#ff4d6d"}
     pos_qc_colors = {
         "1": "#1b7837", "2": "#ffffbf", "3": "#fdae61", 
@@ -1782,7 +1799,6 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
         "D": "#fdae61", "E": "#f46d43", "F": "#d73027", " ": "#ffffff"
     }
 
-    # Vertical bar placement rows
     rows = [
         ("Data Type (R/A/D)", "DATA_TYPE"),
         ("Positioning System\nPosition QC", "POSITION"),
@@ -1806,7 +1822,6 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
             x_width = 1.0
 
             if p_key == "DEPTH":
-                # Depth Bar Styling
                 ax.barh(y_idx, x_width, left=x_left, height=0.7, color="#4bb0d1", align="center")
             elif p_key == "DATA_TYPE":
                 m = mode_data[p_key][c_idx]
@@ -1827,7 +1842,7 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
                 ax.barh(y_idx + 0.175, x_width, left=x_left, height=0.35, color=c_mode, align="center")
                 ax.barh(y_idx - 0.175, x_width, left=x_left, height=0.35, color=c_qc, align="center")
 
-    # Annotate Maximum Pressure
+    # Annotate Pressure
     valid_max_pres = [p for p in max_pres_list if not np.isnan(p)]
     if valid_max_pres:
         overall_max_p = int(np.round(np.max(valid_max_pres)))
@@ -1835,19 +1850,18 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
         ax.text(-1, depth_y_idx - 0.35, f"Max: ~{overall_max_p} dbar", 
                 va="top", ha="right", color="#4bb0d1", fontsize=9, fontweight="bold")
 
-    # Title & Metadata Labels
+    # Title & Metadata
     ax.text(n_cycles / 2, len(rows) + 0.2, f"WMOID {WMOfloatid}", 
             fontsize=18, fontweight="normal", ha="center", va="bottom")
     ax.text(n_cycles + 2, len(rows) + 0.2, "Status: Active", 
             fontsize=16, fontweight="bold", color="#78db88", ha="left", va="bottom")
 
-    # Set Axes & Labels
+    # Set Axes
     ax.set_yticks(y_positions)
     ax.set_yticklabels([r[0] for r in rows], fontsize=9)
     ax.set_xlim(0, n_cycles)
     ax.set_ylim(-0.8, len(rows) - 0.2)
 
-    # Custom X-Axis Ticks
     tick_indices = [0]
     if n_cycles > 18:
         tick_indices.append(17)
@@ -1860,18 +1874,16 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
     ax.set_xticklabels([str(cycles[i]) for i in tick_indices], fontsize=10)
     ax.set_xlabel("Cycle Number", fontsize=12, labelpad=15)
 
-    # Dates annotation at key cycle points
     first_date = dates[0] if dates else ""
     last_date = dates[-1] if dates else ""
     ax.text(0, -1.3, f"Cycle {cycles[0]}: {first_date}", ha="left", va="top", fontsize=9)
     ax.text(n_cycles, -1.3, f"Cycle {cycles[-1]}: {last_date}", ha="right", va="top", fontsize=9)
 
-    # Remove Outer Spines
     for spine in ax.spines.values():
         spine.set_visible(False)
     ax.tick_params(axis="both", which="both", length=0)
 
-    # Legend 1: Data Mode
+    # Legends
     dm_patches = [
         mpatches.Patch(color="#647ed5", label="Delayed Mode"),
         mpatches.Patch(color="#c07ab8", label="Adjusted Mode"),
@@ -1881,7 +1893,6 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
                      bbox_to_anchor=(1.02, 0.95), frameon=False, fontsize=9, title_fontsize=10)
     ax.add_artist(leg1)
 
-    # Legend 2: Positioning System QC
     pos_patches = [
         mpatches.Patch(color="#1b7837", label="1 - Good data"),
         mpatches.Patch(color="#ffffbf", label="2 - Probably good"),
@@ -1895,7 +1906,6 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
                      bbox_to_anchor=(1.02, 0.75), frameon=False, fontsize=9, title_fontsize=10)
     ax.add_artist(leg2)
 
-    # Legend 3: Profile PARAM Grade
     grade_patches = [
         mpatches.Patch(color="#1b7837", label="A - 100% good data"),
         mpatches.Patch(color="#a6dba0", label="B - 75-99% good data"),
@@ -1907,7 +1917,6 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
     ax.legend(handles=grade_patches, title="Profile PARAM Grade:", loc="upper left", 
               bbox_to_anchor=(1.02, 0.45), frameon=False, fontsize=9, title_fontsize=10)
 
-    # Timestamp Footer
     today_stamp = dt.now().strftime("%Y-%m-%d")
     plt.text(0.02, 0.01, f"Figure Created: {today_stamp}", transform=fig.transFigure, 
              fontsize=8, fontweight="bold", ha="left")
@@ -1916,7 +1925,7 @@ def generate_dmqc_status_plot(WMOfloatid, sorted_b_files, output_dir):
     plot_filename = os.path.join(plot_out_dir, f"{WMOfloatid}_DMQC_status.png")
     plt.savefig(plot_filename, bbox_inches="tight", dpi=300)
     plt.close()
-    print(f"[{WMOfloatid}] DMQC Status Plot saved to: {plot_filename}")
+    print(f"[{WMOfloatid}] Final Output BD DMQC Status Plot saved to: {plot_filename}")
 
 
 # ==============================================================================
@@ -2006,6 +2015,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             if "ds" in locals() and ds.isopen():
                 ds.close()
 
+    final_processed_files = []
     for w_file in new_bd_files:
         path, name = os.path.split(w_file)
 
@@ -2017,6 +2027,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
         new_path = os.path.join(final_out_dir, new_name)
         safe_rename(w_file, new_path)
         processed_output_paths.append(new_path)
+        final_processed_files.append(new_path)
 
-    # 5. Generate DMQC Status Plot and save to 'DMQC_status_plot' folder
-    generate_dmqc_status_plot(WMOfloatid, sorted_b_files, script_dir)
+    # 5. Generate DMQC Status Plot reading directly from output BD files
+    generate_dmqc_status_plot(WMOfloatid, final_processed_files, script_dir)
