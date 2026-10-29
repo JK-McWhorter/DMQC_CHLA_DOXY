@@ -396,7 +396,6 @@ def match_csv_row_by_pres(cycle_df, nc_pres):
 
 
 def sanitize_qc_char(val, default="9"):
-    """Validates and extracts a single character Argo QC flag."""
     if pd.isna(val) or val is None or val == "":
         return default
     s = str(val).strip()
@@ -407,15 +406,9 @@ def sanitize_qc_char(val, default="9"):
 
 
 def clean_and_fill_qc_variables(bgc_file, WMOfloatid=None):
-    """
-    Ensures missing adjusted levels are marked with QC '9' (or '4' for broken sensors).
-    Does NOT modify or overwrite raw variables or copy raw QC onto adjusted QC.
-    Updates PROFILE_<PARAM>_QC accordingly.
-    """
     n_prof = bgc_file.dimensions["N_PROF"].size
     skip_doxy = WMOfloatid in DOXY_EXCLUDE_FLOAT_IDS if WMOfloatid is not None else False
 
-    # Clean only ADJUSTED_QC variables
     for var_name, var in list(bgc_file.variables.items()):
         if not var_name.endswith("_ADJUSTED_QC") or var_name.startswith("PROFILE_"):
             continue
@@ -453,8 +446,6 @@ def clean_and_fill_qc_variables(bgc_file, WMOfloatid=None):
 
                     missing_mask = pd.isna(p_vals) | (p_vals == 99999.0)
                     if missing_mask.any():
-                        # Unadjusted or missing levels in D-mode receive QC '9'
-                        # Preserve existing '4' if explicitly marked bad
                         keep_four_mask = missing_mask & (q_char == b"4")
                         q_char[missing_mask] = b"9"
                         q_char[keep_four_mask] = b"4"
@@ -469,7 +460,6 @@ def clean_and_fill_qc_variables(bgc_file, WMOfloatid=None):
             except Exception:
                 traceback.print_exc()
 
-    # Update PROFILE_<PARAM>_QC
     for var_name in list(bgc_file.variables.keys()):
         if not var_name.startswith("PROFILE_") or not var_name.endswith("_QC"):
             continue
@@ -706,10 +696,6 @@ def write_scientific_calib_chla(bgc_file, WMOfloatid, idx_profile, df_bio):
 
 
 def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx=0):
-    """
-    Fills CHLA_ADJUSTED with CHLA_FINAL and CHLA_ADJUSTED_QC with CHLA_FINAL_QC.
-    Retains input netCDF raw values and flags for CHLA and CHLA_QC.
-    """
     n_prof = bgc_file.dimensions["N_PROF"].size
     cycle_df = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
     n_levels = bgc_file.dimensions["N_LEVELS"].size
@@ -744,7 +730,6 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx
 
                 matched_row = match_csv_row_by_pres(cycle_df, nc_pres) if not (is_broken or is_pres_missing_or_bad) else None
 
-                # Process CHLA_ADJUSTED & CHLA_ADJUSTED_QC
                 if is_broken:
                     CHLA_Adjusted_Array[i] = 99999.0
                     CHLA_Adjusted_ERROR_Array[i] = 99999.0
@@ -775,7 +760,6 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx
                     CHLA_Adjusted_ERROR_Array.mask[i] = True
                     CHLA_AdjustedQC_Array[i] = b"9"
 
-                # Process FLUORESCENCE_CHLA_ADJUSTED
                 if is_broken:
                     FLUORESCENCE_CHLA_Adjusted_Array[i] = 99999.0
                     FLUORESCENCE_CHLA_Adjusted_ERROR_Array[i] = 99999.0
@@ -827,10 +811,6 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx
 
 
 def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx=0):
-    """
-    Fills BBP700_ADJUSTED with BBP700_FINAL and BBP700_ADJUSTED_QC with BBP700_FINAL_QC.
-    Retains input netCDF raw values and flags for BBP700 and BBP700_QC.
-    """
     if "BBP700_ADJUSTED" not in bgc_file.variables:
         return
 
@@ -944,10 +924,6 @@ def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle, WMOfloatid=N
 
 
 def write_DOXY_from_csv(ds, float_df, target_cycle, WMOfloatid=None):
-    """
-    Fills DOXY_ADJUSTED with DOXY_FINAL and DOXY_ADJUSTED_QC with DOXY_FINAL_QC.
-    Retains input netCDF raw values and flags for DOXY and DOXY_QC.
-    """
     is_excluded = WMOfloatid in DOXY_EXCLUDE_FLOAT_IDS if WMOfloatid is not None else False
 
     var_names = ds.variables.keys()
@@ -1052,7 +1028,7 @@ def safe_rename(from_file, to_file):
 
 
 # ==============================================================================
-# SECTION 3: Plotly DMQC Status Plot Generation
+# SECTION 3: Plotly DMQC Status Plot Generation (Overlap & PRES Fixes)
 # ==============================================================================
 
 data_type_color_map = {"D": "#647ed5", "A": "#c07ab8", "R": "#ff4d6d"}
@@ -1107,7 +1083,7 @@ def add_Data_mode_sp(fig, float_map_inst, std_fig_width=1000):
 
     for n_prof in float_map_inst["NPROF_list"]:
         x_nprof.append(str(n_prof + 1))
-        y_dataType.append(" ")
+        y_dataType.append("Data Mode")
         df_sub = float_map_inst["NPROF_NPARAM_df"]
         modes = df_sub[df_sub["N_PROF"] == n_prof]["PARAMETER_DATA_MODE"].tolist()
         best_mode = min(modes, key=lambda m: data_mode_rank_map.get(m, 99)) if modes else "R"
@@ -1122,7 +1098,7 @@ def add_Data_mode_sp(fig, float_map_inst, std_fig_width=1000):
         col=1,
     )
 
-    marker_line_w = max(0.9 * (std_fig_width - 170) / max(n_profs, 1), 1.0)
+    marker_line_w = max(0.9 * (std_fig_width - 240) / max(n_profs, 1), 1.0)
     fig.add_trace(
         go.Scatter(
             x=x_nprof,
@@ -1140,6 +1116,16 @@ def add_Data_mode_sp(fig, float_map_inst, std_fig_width=1000):
         col=1,
     )
 
+    fig.update_yaxes(
+        tickmode="array",
+        tickvals=["Data Mode"],
+        ticktext=["<b>Data Type</b><br>(R/A/D)"],
+        tickfont=dict(size=10, color=TEXT_COLOR),
+        side="left",
+        row=1,
+        col=1,
+    )
+
 
 def add_positioning_system_sp(fig, float_map_inst, std_fig_width=1000):
     x1_nprof = []
@@ -1153,12 +1139,12 @@ def add_positioning_system_sp(fig, float_map_inst, std_fig_width=1000):
         pos_sys = float_map_inst["NPROF_df"]["POSITIONING_SYSTEM"].get(n_prof, "GPS").strip()
         pos_qc = float_map_inst["NPROF_df"]["POSITION_QC"].get(n_prof, "1").strip()
         x1_nprof.append(str(n_prof + 1))
-        y1_positioning_system.append(" ")
-        y1_position_qc.append("  ")
+        y1_positioning_system.append("System")
+        y1_position_qc.append("Pos QC")
         color1_positioning_system.append(position_system_color_map.get(pos_sys, "#af43f0"))
         color1_position_qc.append(position_qc_color_map.get(pos_qc, "#808080"))
 
-    marker_line_w = max(0.9 * (std_fig_width - 170) / max(n_profs, 1), 1.0)
+    marker_line_w = max(0.9 * (std_fig_width - 240) / max(n_profs, 1), 1.0)
     fig.add_trace(
         go.Scatter(
             x=x1_nprof,
@@ -1192,6 +1178,16 @@ def add_positioning_system_sp(fig, float_map_inst, std_fig_width=1000):
         col=1,
     )
 
+    fig.update_yaxes(
+        tickmode="array",
+        tickvals=["Pos QC", "System"],
+        ticktext=["<b>Position QC</b>", "<b>Pos System</b>"],
+        tickfont=dict(size=10, color=TEXT_COLOR),
+        side="left",
+        row=2,
+        col=1,
+    )
+
 
 def add_profile_depth_sp(fig, float_map_inst, std_fig_width=1000):
     x2_nprof = []
@@ -1218,7 +1214,13 @@ def add_profile_depth_sp(fig, float_map_inst, std_fig_width=1000):
         col=1,
     )
 
-    fig.update_yaxes(range=[max_prof_depth, 0], visible=False, row=3, col=1)
+    fig.update_yaxes(
+        range=[max_prof_depth, 0],
+        title=dict(text="<b>Profile Depth</b>", font=dict(size=10, color=TEXT_COLOR)),
+        side="left",
+        row=3,
+        col=1,
+    )
     return np.rint(max_prof_depth)
 
 
@@ -1235,7 +1237,7 @@ def add_param_QC_sp(fig, float_map_inst, PARAM, subplotNum, std_fig_width=1000):
     for n_prof in float_map_inst["NPROF_list"]:
         cyc_str = str(n_prof + 1)
         x3_nprof.append(cyc_str)
-        y3_p1.append("Grade")
+        y3_p1.append("QC")
         y3_p2.append("Mode")
 
         flag = float_map_inst["NPROF_df"].get(f"PROFILE_{PARAM}_QC", {}).get(n_prof, " ")
@@ -1246,7 +1248,7 @@ def add_param_QC_sp(fig, float_map_inst, PARAM, subplotNum, std_fig_width=1000):
         color3_pdm.append(data_type_color_map.get(pdm, "#FFFFFF"))
         hover_texts_pdm.append(f"Cycle {cyc_str}<br>Param: {PARAM}<br>Data Mode: {pdm}")
 
-    marker_line_w = max(0.9 * (std_fig_width - 170) / max(n_profs, 1), 1.0)
+    marker_line_w = max(0.9 * (std_fig_width - 240) / max(n_profs, 1), 1.0)
 
     fig.add_trace(
         go.Scatter(
@@ -1286,14 +1288,25 @@ def add_param_QC_sp(fig, float_map_inst, PARAM, subplotNum, std_fig_width=1000):
         col=1,
     )
 
+    clean_param = "PH" if PARAM == "PH_IN_SITU_TOTAL" else ("FLUOR" if PARAM in ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"] else PARAM)
+    fig.update_yaxes(
+        tickmode="array",
+        tickvals=["QC", "Mode"],
+        ticktext=[f"<b>{clean_param} QC</b>", f"<b>{clean_param} Mode</b>"],
+        tickfont=dict(size=9, color=TEXT_COLOR),
+        side="left",
+        row=subplotNum,
+        col=1,
+    )
+
 
 def update_layout_DMQC_STATUS(fig, float_map_inst, max_prof_depth, subplotList, num_rows, std_fig_width=1000):
     n_profs = len(float_map_inst["NPROF_list"])
-    fig.update_xaxes(range=[-0.05 * n_profs, n_profs * 1.05], dtick=n_profs * 0.33)
+    fig.update_xaxes(range=[-0.05 * n_profs, n_profs * 1.05], dtick=max(1, int(n_profs * 0.33)))
 
     fig.update_layout(
         autosize=False,
-        height=max(850, 45 * num_rows + 200),
+        height=max(900, 52 * num_rows + 220),
         width=std_fig_width,
         bargap=0,
         bargroupgap=0,
@@ -1305,47 +1318,9 @@ def update_layout_DMQC_STATUS(fig, float_map_inst, max_prof_depth, subplotList, 
             xanchor="center",
             yanchor="top",
         ),
-        annotations=[
-            dict(
-                text="Data Type (R/A/D)",
-                xref="paper", yref="paper",
-                x=0, y=0.9,
-                xanchor="right", yanchor="top",
-                showarrow=False, font=dict(size=11),
-            ),
-            dict(
-                text="Positioning System",
-                xref="paper", yref="paper",
-                x=0, y=sum(fig.layout["yaxis2"].domain) / 2,
-                xanchor="right", yanchor="bottom",
-                showarrow=False, font=dict(size=11),
-            ),
-            dict(
-                text="Position QC",
-                xref="paper", yref="paper",
-                x=0, y=sum(fig.layout["yaxis2"].domain) / 2,
-                xanchor="right", yanchor="top",
-                showarrow=False, font=dict(size=11),
-            ),
-            dict(
-                text="Profile Depth",
-                xref="paper", yref="paper",
-                x=0, y=sum(fig.layout["yaxis3"].domain) / 2,
-                xanchor="right", yanchor="bottom",
-                showarrow=False, font=dict(size=11),
-            ),
-            dict(
-                text=f"Max: ~{max_prof_depth:.0f} dbar",
-                xref="paper", yref="paper",
-                x=0, y=sum(fig.layout["yaxis3"].domain) / 2,
-                xanchor="right", yanchor="top",
-                showarrow=False,
-                font=dict(size=11, color="#41AACE"),
-            ),
-        ],
         plot_bgcolor=BG_COLOR,
         paper_bgcolor=BG_COLOR,
-        margin=dict(l=175, r=20, t=110, b=80),
+        margin=dict(l=140, r=30, t=110, b=80),
     )
 
     for mode_name, hex_color in label_data_type_color_map.items():
@@ -1387,25 +1362,6 @@ def update_layout_DMQC_STATUS(fig, float_map_inst, max_prof_depth, subplotList, 
         )
     fig.update_traces(legendgrouptitle_text="<b>Position QC</b>", selector=dict(legendgroup="PositioningSystemQC"))
 
-    for PARAM, subplotidx in zip(float_map_inst["param_list"], subplotList):
-        tempPARAM = "PH" if PARAM == "PH_IN_SITU_TOTAL" else PARAM
-        domain_center = sum(fig.layout[f"yaxis{subplotidx}"].domain) / 2
-
-        fig.add_annotation(
-            text=f"{tempPARAM} Mode",
-            xref="paper", yref="paper",
-            x=0, y=domain_center + 0.007,
-            xanchor="right", yanchor="bottom",
-            showarrow=False, font=dict(size=11),
-        )
-        fig.add_annotation(
-            text=f"Profile {tempPARAM} QC",
-            xref="paper", yref="paper",
-            x=0, y=domain_center - 0.007,
-            xanchor="right", yanchor="top",
-            showarrow=False, font=dict(size=11),
-        )
-
     total_slots = 0
     d_mode_count = 0
     for p in float_map_inst["param_list"]:
@@ -1438,7 +1394,7 @@ def update_layout_DMQC_STATUS(fig, float_map_inst, max_prof_depth, subplotList, 
         xanchor="left", yanchor="top",
         showarrow=False,
         font=dict(size=11),
-        xshift=-150, yshift=-60,
+        xshift=-120, yshift=-60,
     )
 
     prof_dates = float_map_inst.get("JULD_list", [])
@@ -1476,7 +1432,7 @@ def make_DMQC_STATUS_fig(float_map_inst, output_filepath, show_grid=True):
         shared_xaxes=True,
         x_title="Cycle Number",
         shared_yaxes=False,
-        vertical_spacing=0.015,
+        vertical_spacing=0.012,
         row_heights=row_heights,
         print_grid=show_grid,
     )
@@ -1515,7 +1471,7 @@ def make_DMQC_STATUS_fig(float_map_inst, output_filepath, show_grid=True):
         except Exception:
             pass
 
-    fig.write_image(output_filepath, format="png", width=1050, height=max(850, 45 * num_rows + 200), scale=2)
+    fig.write_image(output_filepath, format="png", width=1100, height=max(900, 52 * num_rows + 220), scale=2)
     return fig
 
 
@@ -1527,6 +1483,7 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
     os.makedirs(plot_out_dir, exist_ok=True)
     out_png = os.path.join(plot_out_dir, f"{WMOfloatid}_DMQC_status.png")
 
+    # PRES is placed first to guarantee its Profile QC appears directly under Profile Depth
     candidate_params = ["PRES", "TEMP", "PSAL", "DOXY", "BBP700", "CHLA", "PH_IN_SITU_TOTAL", "NITRATE", "CHLA_FLUORESCENCE"]
     present_params = set()
 
@@ -1742,7 +1699,6 @@ def generate_section_qc_plot(
     cax_qc = divider_qc.append_axes("right", size="3%", pad=0.15)
     cax_qc.axis("off")
 
-    # TOP PANEL: Scientific Contour or Tile Plot
     if interp_res is not None:
         xi_grid, yi_grid, zi_grid = interp_res
 
@@ -1770,7 +1726,6 @@ def generate_section_qc_plot(
     ax_data.set_ylabel("Pressure (dbar)", fontsize=11)
     ax_data.grid(True, linestyle="--", alpha=0.4)
 
-    # BOTTOM PANEL: Discrete QC Flag Map
     unique_qcs = sorted(df_qc["QC_VAL"].unique(), key=lambda q: int(q) if q.isdigit() else 99)
     for q_flag in unique_qcs:
         sub = df_qc[df_qc["QC_VAL"] == q_flag]
