@@ -110,6 +110,17 @@ ARGO_VALID_RANGES = {
 }
 
 VALID_QC_CHARS = {"0", "1", "2", "3", "4", "5", "8", "9"}
+MISSING_VAL = -99999.0
+
+
+def is_missing_value(val):
+    if val is None or pd.isna(val):
+        return True
+    try:
+        f = float(val)
+        return f == -99999.0 or f == 99999.0
+    except (ValueError, TypeError):
+        return False
 
 
 # ==============================================================================
@@ -154,7 +165,7 @@ def apply_float_override_conditions(df, WMOfloatid):
 
     for col in float_cols:
         if col in df.columns:
-            df.loc[override_condition, col] = 99999.0
+            df.loc[override_condition, col] = MISSING_VAL
 
     for col in qc_cols:
         if col in df.columns:
@@ -165,13 +176,13 @@ def apply_float_override_conditions(df, WMOfloatid):
         for doxy_col in ["DOXY_FINAL", "DOXY_ADJUSTED_ERROR"]:
             if doxy_col in df.columns:
                 df.loc[
-                    doxy_hardcode_cond & (df["DOXY"].isna() | (df["DOXY"] == 99999.0)),
+                    doxy_hardcode_cond & (df["DOXY"].isna() | (df["DOXY"] == 99999.0) | (df["DOXY"] == MISSING_VAL)),
                     doxy_col,
-                ] = 99999.0
+                ] = MISSING_VAL
 
         if "DOXY_FINAL_QC" in df.columns:
             df.loc[
-                doxy_hardcode_cond & (df["DOXY"].isna() | (df["DOXY"] == 99999.0)),
+                doxy_hardcode_cond & (df["DOXY"].isna() | (df["DOXY"] == 99999.0) | (df["DOXY"] == MISSING_VAL)),
                 "DOXY_FINAL_QC",
             ] = 9
 
@@ -179,6 +190,10 @@ def apply_float_override_conditions(df, WMOfloatid):
 
 
 def detect_parameter_profile(ds, param_prefix):
+    """
+    Robust profile index detection handling padding, byte string decodings,
+    and parameter aliases across N_PROF.
+    """
     if "STATION_PARAMETERS" not in ds.variables:
         return 0
 
@@ -189,8 +204,11 @@ def detect_parameter_profile(ds, param_prefix):
     if param_prefix in ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"]:
         target_prefixes = ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"]
     elif param_prefix in ["PH", "PH_IN_SITU_TOTAL"]:
-        target_prefixes = ["PH", "PH_IN_SITU_TOTAL"]
+        target_prefixes = ["PH_IN_SITU_TOTAL", "PH"]
+    elif param_prefix in ["NITRATE"]:
+        target_prefixes = ["NITRATE"]
 
+    # 1. Search for exact prefix match inside STATION_PARAMETERS
     for iprof in range(n_prof):
         param_mat = ds.variables["STATION_PARAMETERS"][iprof]
         if isinstance(param_mat, np.ma.MaskedArray):
@@ -206,6 +224,18 @@ def detect_parameter_profile(ds, param_prefix):
             for tp in target_prefixes:
                 if param_str == tp or param_str.startswith(tp):
                     return iprof
+
+    # 2. Fallback: inspect actual 2D data variables directly across N_PROF
+    for tp in target_prefixes:
+        for candidate_var in [tp, f"{tp}_ADJUSTED"]:
+            if candidate_var in ds.variables:
+                var = ds.variables[candidate_var]
+                if var.ndim > 1:
+                    for iprof in range(var.shape[0]):
+                        sl = var[iprof, :]
+                        vals = sl.filled(MISSING_VAL) if hasattr(sl, "filled") else np.array(sl)
+                        if (~pd.isna(vals) & (vals != MISSING_VAL) & (vals != 99999.0)).any():
+                            return iprof
     return 0
 
 
@@ -226,13 +256,15 @@ def has_valid_measurements(bgc_file, param, iprof=None):
         param_candidates.extend(["DOXY_ADJUSTED"])
     elif param in ["PH", "PH_IN_SITU_TOTAL"]:
         param_candidates.extend(["PH_IN_SITU_TOTAL", "PH_IN_SITU_TOTAL_ADJUSTED"])
+    elif param == "NITRATE":
+        param_candidates.extend(["NITRATE", "NITRATE_ADJUSTED"])
 
     for p in param_candidates:
         if p in bgc_file.variables:
             var = bgc_file.variables[p]
             p_slice = var[iprof, :] if var.ndim > 1 else var[:]
-            p_vals = p_slice.filled(99999.0) if hasattr(p_slice, "filled") else np.array(p_slice)
-            valid_mask = (~pd.isna(p_vals)) & (p_vals != 99999.0)
+            p_vals = p_slice.filled(MISSING_VAL) if hasattr(p_slice, "filled") else np.array(p_slice)
+            valid_mask = (~pd.isna(p_vals)) & (p_vals != MISSING_VAL) & (p_vals != 99999.0)
             if valid_mask.any():
                 return True
     return False
@@ -249,7 +281,7 @@ def get_param_data_mode(bgc_file, iprof, param_base):
         dm_var = bgc_file.variables.get("DATA_MODE")
         if dm_var is not None:
             m = dm_var[iprof] if dm_var.ndim > 0 else dm_var[:]
-            return m.decode("utf-8").strip() if isinstance(m, bytes) else str(m).strip()
+            return m.decode("utf-8").strip() if isinstance(m, (bytes, np.bytes_)) else str(m).strip()
         return "R"
 
     station_params = bgc_file.variables["STATION_PARAMETERS"][iprof]
@@ -262,7 +294,7 @@ def get_param_data_mode(bgc_file, iprof, param_base):
     if param_base in ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"]:
         target_names = ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"]
     elif param_base in ["PH", "PH_IN_SITU_TOTAL"]:
-        target_names = ["PH", "PH_IN_SITU_TOTAL"]
+        target_names = ["PH_IN_SITU_TOTAL", "PH"]
 
     for j, p_bytes in enumerate(station_params):
         p_str = "".join([
@@ -272,16 +304,20 @@ def get_param_data_mode(bgc_file, iprof, param_base):
 
         if p_str in target_names or any(p_str.startswith(tn) for tn in target_names):
             m_val = pdm_array[j]
-            return m_val.decode("utf-8").strip() if isinstance(m_val, bytes) else str(m_val).strip()
+            return m_val.decode("utf-8").strip() if isinstance(m_val, (bytes, np.bytes_)) else str(m_val).strip()
 
     dm_var = bgc_file.variables.get("DATA_MODE")
     if dm_var is not None:
         m = dm_var[iprof] if dm_var.ndim > 0 else dm_var[:]
-        return m.decode("utf-8").strip() if isinstance(m, bytes) else str(m).strip()
+        return m.decode("utf-8").strip() if isinstance(m, (bytes, np.bytes_)) else str(m).strip()
     return "R"
 
 
 def write_parameter_data_modes(bgc_file):
+    """
+    Updates PARAMETER_DATA_MODE and DATA_MODE.
+    Explicitly ignores PH and NITRATE so their original modes are never modified.
+    """
     n_param = bgc_file.dimensions["N_PARAM"].size
     n_prof = bgc_file.dimensions["N_PROF"].size
 
@@ -300,81 +336,95 @@ def write_parameter_data_modes(bgc_file):
                 for c in p_bytes
             ]).strip()
 
-            if p_str:
-                if p_str == "PRES" or p_str.startswith("DOWN_IRRADIANCE") or p_str.startswith("UP_RADIANCE"):
+            if not p_str or "PH" in p_str or "NITRATE" in p_str:
+                continue
+
+            if p_str == "PRES" or p_str.startswith("DOWN_IRRADIANCE") or p_str.startswith("UP_RADIANCE"):
+                pdm[iprof, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
+            elif p_str in ["CHLA", "CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA", "BBP700", "DOXY"]:
+                if has_valid_measurements(bgc_file, p_str, iprof):
+                    pdm[iprof, j] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
+                    data_mode[iprof] = b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
+                else:
                     pdm[iprof, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
-                elif p_str in ["CHLA", "CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA", "BBP700", "DOXY", "NITRATE", "PH_IN_SITU_TOTAL"]:
-                    if has_valid_measurements(bgc_file, p_str, iprof):
-                        pdm[iprof, j] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
-                        data_mode[iprof] = b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
-                    else:
-                        pdm[iprof, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
 
     bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
     bgc_file.variables["DATA_MODE"][:] = data_mode
 
 
-def get_profile_qc_grade(qc_masked_array, parameter_present=True):
+def get_profile_qc_grade(qc_array, parameter_present=True):
+    """
+    Implements Argo Users Manual Table 2a (consistent with get_profile_param_qc):
+    - Values of 1, 2, 5, 8 are GOOD data.
+    - Flag 9 and blanks (' ', '') are NOT USED in computation.
+    - All other flags are BAD data.
+    - If no valid measurements exist: returns 'F' if parameter exists on float, otherwise ' '.
+    """
     if not parameter_present:
         return " "
 
-    if hasattr(qc_masked_array, "compressed"):
-        unmasked_vals = qc_masked_array.compressed()
-    else:
-        unmasked_vals = qc_masked_array
-
     raw_qcs = []
-    for q in np.ravel(unmasked_vals):
+    has_any_point = False
+    for q in np.ravel(qc_array):
         if isinstance(q, np.ma.core.MaskedConstant) or q is np.ma.masked:
             continue
-        s = q.decode("utf-8", errors="ignore").strip() if isinstance(q, bytes) else str(q).strip()
+        s = q.decode("utf-8", errors="ignore").strip() if isinstance(q, (bytes, np.bytes_)) else str(q).strip()
         if s != "":
+            has_any_point = True
+        if s not in ["", " ", "9"]:
             raw_qcs.append(s)
 
-    valid_qcs = [q for q in raw_qcs if q not in ["", " ", "9"]]
-    total_points = len(valid_qcs)
+    total_points = len(raw_qcs)
+    if total_points == 0:
+        return "F" if has_any_point else " "
 
-    if total_points == 0 or all(q == "4" for q in valid_qcs):
-        return "F"
+    good_qc = {"1", "2", "5", "8"}
+    good_count = sum(1 for q in raw_qcs if q in good_qc)
+    good_fraction = good_count / total_points
 
-    good_count = sum(1 for q in valid_qcs if q in ["1", "2"])
-    pct_good = (good_count / total_points) * 100.0
-
-    if pct_good == 100.0:
+    if good_count == total_points:
         return "A"
-    elif 75.0 <= pct_good < 100.0:
+    elif good_fraction >= 0.75:
         return "B"
-    elif 50.0 <= pct_good < 75.0:
+    elif good_fraction >= 0.50:
         return "C"
-    elif 25.0 <= pct_good < 50.0:
+    elif good_fraction >= 0.25:
         return "D"
-    elif 0.0 < pct_good < 25.0:
+    elif good_fraction > 0.0:
         return "E"
     else:
         return "F"
 
 
-def get_pres_array_for_profile(ds, iprof):
-    for p_var in ["PRES_ADJUSTED", "PRES"]:
-        if p_var in ds.variables:
-            v = ds.variables[p_var]
-            arr = v[iprof, :] if v.ndim > 1 else v[:]
-            p_vals = arr.filled(99999.0) if hasattr(arr, "filled") else np.array(arr)
-            valid = (~np.isnan(p_vals)) & (p_vals != 99999.0)
-            if valid.any():
-                return np.float32(p_vals)
+def get_pres_and_qc_for_profile(ds, iprof):
+    n_levels = ds.dimensions["N_LEVELS"].size
+    pres_vals = np.full((n_levels,), MISSING_VAL, dtype="float32")
+    pres_qcs = np.full((n_levels,), b"9", dtype="|S1")
 
-    if "PRES" in ds.variables:
-        v = ds.variables["PRES"]
-        arr = v[0, :] if v.ndim > 1 else v[:]
-        p_vals = arr.filled(99999.0) if hasattr(arr, "filled") else np.array(arr)
-        return np.float32(p_vals)
+    p_var_name = "PRES_ADJUSTED" if "PRES_ADJUSTED" in ds.variables else ("PRES" if "PRES" in ds.variables else None)
+    if p_var_name:
+        v = ds.variables[p_var_name]
+        arr = v[iprof, :] if v.ndim > 1 else v[:]
+        p_raw = arr.filled(MISSING_VAL) if hasattr(arr, "filled") else np.array(arr)
+        if (~np.isnan(p_raw) & (p_raw != MISSING_VAL) & (p_raw != 99999.0)).any():
+            pres_vals = np.float32(p_raw)
+        elif "PRES" in ds.variables:
+            arr0 = ds.variables["PRES"][0, :] if ds.variables["PRES"].ndim > 1 else ds.variables["PRES"][:]
+            pres_vals = np.float32(arr0.filled(MISSING_VAL) if hasattr(arr0, "filled") else np.array(arr0))
 
-    return np.full((ds.dimensions["N_LEVELS"].size,), 99999.0, dtype="float32")
+    q_var_name = "PRES_ADJUSTED_QC" if "PRES_ADJUSTED_QC" in ds.variables else ("PRES_QC" if "PRES_QC" in ds.variables else None)
+    if q_var_name:
+        qv = ds.variables[q_var_name]
+        q_slice = qv[iprof, :] if qv.ndim > 1 else qv[:]
+        if hasattr(q_slice, "filled"):
+            q_slice = q_slice.filled(b"9")
+        pres_qcs = np.array(q_slice).astype("|S1")
+
+    return pres_vals, pres_qcs
 
 
 def match_csv_row_by_pres(cycle_df, nc_pres):
-    if cycle_df.empty or np.isnan(nc_pres) or nc_pres == 99999.0:
+    if cycle_df.empty or is_missing_value(nc_pres):
         return None
 
     csv_pres = cycle_df["PRES"].values
@@ -405,12 +455,73 @@ def sanitize_qc_char(val, default="9"):
     return default
 
 
+def parse_raw_qc_char(q_arr, idx):
+    if q_arr is None or idx >= len(q_arr):
+        return "9"
+    val = q_arr[idx]
+    if isinstance(val, (bytes, np.bytes_)):
+        val = val.decode("utf-8", errors="ignore").strip()
+    else:
+        val = str(val).strip()
+    return val if val in VALID_QC_CHARS else "9"
+
+
+def standardize_raw_missing_data(bgc_file):
+    """
+    Standardizes ONLY the raw variables (CHLA, DOXY, CHLA_FLUORESCENCE/FLUORESCENCE_CHLA, BBP700)
+    to fill missing values with -99999.0 and assign a QC flag of '9'.
+    Explicitly excludes and does NOT touch pH or Nitrate.
+    """
+    n_prof = bgc_file.dimensions["N_PROF"].size
+    raw_params = ["CHLA", "DOXY", "BBP700", "CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"]
+
+    for param in raw_params:
+        if param in bgc_file.variables:
+            var = bgc_file.variables[param]
+            qc_name = f"{param}_QC"
+            qc_var = bgc_file.variables.get(qc_name)
+
+            for iprof in range(n_prof):
+                arr = var[iprof, :] if var.ndim > 1 else var[:]
+                vals = arr.filled(MISSING_VAL) if hasattr(arr, "filled") else np.array(arr, copy=True)
+                missing_mask = pd.isna(vals) | (vals == 99999.0) | (vals == MISSING_VAL)
+
+                if missing_mask.any():
+                    vals[missing_mask] = MISSING_VAL
+                    if var.ndim > 1:
+                        bgc_file.variables[param][iprof, :] = vals
+                    else:
+                        bgc_file.variables[param][:] = vals
+
+                    if qc_var is not None:
+                        q_slice = qc_var[iprof, :] if qc_var.ndim > 1 else qc_var[:]
+                        q_vals = np.array(q_slice, copy=True)
+                        if hasattr(q_vals, "filled"):
+                            q_vals = q_vals.filled(b" ")
+                        q_char = q_vals.astype("|S1")
+                        q_char[missing_mask] = b"9"
+
+                        if qc_var.ndim > 1:
+                            bgc_file.variables[qc_name][iprof, :] = q_char
+                        else:
+                            bgc_file.variables[qc_name][:] = q_char
+
+
 def clean_and_fill_qc_variables(bgc_file, WMOfloatid=None):
+    """
+    Cleans adjusted QC flags:
+    - Missing/unadjusted levels receive QC '9' and value -99999.0.
+    - Broken sensors remain flagged '4'.
+    - Updates PROFILE_<PARAM>_QC across its proper profile index.
+    - Excludes pH and Nitrate entirely.
+    """
     n_prof = bgc_file.dimensions["N_PROF"].size
     skip_doxy = WMOfloatid in DOXY_EXCLUDE_FLOAT_IDS if WMOfloatid is not None else False
 
     for var_name, var in list(bgc_file.variables.items()):
         if not var_name.endswith("_ADJUSTED_QC") or var_name.startswith("PROFILE_"):
+            continue
+        if "PH" in var_name or "NITRATE" in var_name:
             continue
         if skip_doxy and "DOXY" in var_name:
             continue
@@ -436,7 +547,7 @@ def clean_and_fill_qc_variables(bgc_file, WMOfloatid=None):
                 if adj_data_var_name in bgc_file.variables:
                     adj_p_var = bgc_file.variables[adj_data_var_name]
                     p_raw = adj_p_var[iprof, :] if adj_p_var.ndim > 1 else adj_p_var[:]
-                    p_vals = p_raw.filled(99999.0) if hasattr(p_raw, "filled") else np.array(p_raw)
+                    p_vals = p_raw.filled(MISSING_VAL) if hasattr(p_raw, "filled") else np.array(p_raw)
 
                     q_raw = var[iprof, :] if var.ndim > 1 else var[iprof]
                     q_vals = np.array(q_raw, copy=True)
@@ -444,8 +555,14 @@ def clean_and_fill_qc_variables(bgc_file, WMOfloatid=None):
                         q_vals = q_vals.filled(b" ")
                     q_char = q_vals.astype("|S1")
 
-                    missing_mask = pd.isna(p_vals) | (p_vals == 99999.0)
+                    missing_mask = pd.isna(p_vals) | (p_vals == 99999.0) | (p_vals == MISSING_VAL)
                     if missing_mask.any():
+                        p_vals[missing_mask] = MISSING_VAL
+                        if adj_p_var.ndim > 1:
+                            bgc_file.variables[adj_data_var_name][iprof, :] = p_vals
+                        else:
+                            bgc_file.variables[adj_data_var_name][:] = p_vals
+
                         keep_four_mask = missing_mask & (q_char == b"4")
                         q_char[missing_mask] = b"9"
                         q_char[keep_four_mask] = b"4"
@@ -460,34 +577,37 @@ def clean_and_fill_qc_variables(bgc_file, WMOfloatid=None):
             except Exception:
                 traceback.print_exc()
 
+    # Recalculate and populate PROFILE_<PARAM>_QC on the exact parameter sub-profile
     for var_name in list(bgc_file.variables.keys()):
         if not var_name.startswith("PROFILE_") or not var_name.endswith("_QC"):
             continue
+        if "PH" in var_name or "NITRATE" in var_name:
+            continue
 
         param_base = var_name[8:-3]
-        for iprof in range(n_prof):
-            if param_base == "PRES":
-                target_qc_name = "PRES_QC"
-                source_prof = 0
-            else:
-                mode = get_param_data_mode(bgc_file, iprof, param_base)
-                target_qc_name = (
-                    f"{param_base}_ADJUSTED_QC"
-                    if mode in ["D", "A"] and f"{param_base}_ADJUSTED_QC" in bgc_file.variables
-                    else f"{param_base}_QC"
-                )
-                source_prof = iprof
+        target_prof = detect_parameter_profile(bgc_file, param_base)
 
-            param_is_present = has_valid_measurements(bgc_file, param_base, source_prof)
+        mode = get_param_data_mode(bgc_file, target_prof, param_base)
+        target_qc_name = (
+            f"{param_base}_ADJUSTED_QC"
+            if mode in ["D", "A"] and f"{param_base}_ADJUSTED_QC" in bgc_file.variables
+            else f"{param_base}_QC"
+        )
+        if param_base == "PRES":
+            target_qc_name = "PRES_QC"
 
-            if target_qc_name in bgc_file.variables:
-                target_qc_var = bgc_file.variables[target_qc_name]
-                target_qc_array = (
-                    target_qc_var[source_prof, :] if target_qc_var.ndim > 1 else target_qc_var[:]
-                )
-                prof_grade = get_profile_qc_grade(target_qc_array, parameter_present=param_is_present)
-                grade_bytes = prof_grade.encode("utf-8")
+        param_is_present = has_valid_measurements(bgc_file, param_base, target_prof)
 
+        if target_qc_name in bgc_file.variables:
+            target_qc_var = bgc_file.variables[target_qc_name]
+            target_qc_array = (
+                target_qc_var[target_prof, :] if target_qc_var.ndim > 1 else target_qc_var[:]
+            )
+            prof_grade = get_profile_qc_grade(target_qc_array, parameter_present=param_is_present)
+            grade_bytes = prof_grade.encode("utf-8")
+
+            # Update ALL profile slots so any reader looking at iprof=0 or target_prof sees the grade
+            for iprof in range(n_prof):
                 if bgc_file.variables[var_name].ndim == 1:
                     bgc_file.variables[var_name][iprof] = grade_bytes
                 elif bgc_file.variables[var_name].ndim == 2:
@@ -708,87 +828,91 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx
         mode = get_param_data_mode(bgc_file, prof, "CHLA")
 
         CHLA_Adjusted_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
-        CHLA_Adjusted_Array[:] = 99999.0
+        CHLA_Adjusted_Array[:] = MISSING_VAL
         CHLA_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9" if mode in ["D", "A"] else b" ", dtype="|S1")
-
         CHLA_Adjusted_ERROR_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
-        CHLA_Adjusted_ERROR_Array[:] = 99999.0
+        CHLA_Adjusted_ERROR_Array[:] = MISSING_VAL
 
         FLUORESCENCE_CHLA_Adjusted_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
-        FLUORESCENCE_CHLA_Adjusted_Array[:] = 99999.0
+        FLUORESCENCE_CHLA_Adjusted_Array[:] = MISSING_VAL
         FLUORESCENCE_CHLA_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9" if mode in ["D", "A"] else b" ", dtype="|S1")
-
         FLUORESCENCE_CHLA_Adjusted_ERROR_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
-        FLUORESCENCE_CHLA_Adjusted_ERROR_Array[:] = 99999.0
+        FLUORESCENCE_CHLA_Adjusted_ERROR_Array[:] = MISSING_VAL
 
-        nc_pres_all = get_pres_array_for_profile(bgc_file, prof)
+        raw_chla_arr = bgc_file.variables["CHLA"][prof, :] if "CHLA" in bgc_file.variables else None
+        raw_chla_qc_arr = bgc_file.variables["CHLA_QC"][prof, :] if "CHLA_QC" in bgc_file.variables else None
+
+        fluo_name = "FLUORESCENCE_CHLA" if "FLUORESCENCE_CHLA" in bgc_file.variables else "CHLA_FLUORESCENCE"
+        raw_fluo_arr = bgc_file.variables[fluo_name][prof, :] if fluo_name in bgc_file.variables else None
+        raw_fluo_qc_arr = bgc_file.variables[f"{fluo_name}_QC"][prof, :] if f"{fluo_name}_QC" in bgc_file.variables else None
+
+        nc_pres_all, nc_pres_qc_all = get_pres_and_qc_for_profile(bgc_file, prof)
 
         if mode in ["D", "A"]:
             for i in range(n_levels):
                 nc_pres = nc_pres_all[i]
-                is_pres_missing_or_bad = np.isnan(nc_pres) or nc_pres == 99999.0
+                pres_qc_char = nc_pres_qc_all[i].decode("utf-8") if isinstance(nc_pres_qc_all[i], (bytes, np.bytes_)) else str(nc_pres_qc_all[i])
 
-                matched_row = match_csv_row_by_pres(cycle_df, nc_pres) if not (is_broken or is_pres_missing_or_bad) else None
+                is_pres_missing = is_missing_value(nc_pres) or pres_qc_char == "9"
+                is_pres_bad = pres_qc_char == "4"
 
-                if is_broken:
-                    CHLA_Adjusted_Array[i] = 99999.0
-                    CHLA_Adjusted_ERROR_Array[i] = 99999.0
-                    CHLA_Adjusted_Array.mask[i] = True
-                    CHLA_Adjusted_ERROR_Array.mask[i] = True
-                    CHLA_AdjustedQC_Array[i] = b"4"
-                elif matched_row is not None and "CHLA_FINAL" in matched_row:
-                    chla_final_val = matched_row.get("CHLA_FINAL")
-                    csv_chla_qc = matched_row.get("CHLA_FINAL_QC", "1")
-                    qc_char = sanitize_qc_char(csv_chla_qc, default="1")
+                raw_chla_val = raw_chla_arr[i] if raw_chla_arr is not None else MISSING_VAL
+                raw_chla_qc = parse_raw_qc_char(raw_chla_qc_arr, i)
 
-                    if pd.isna(chla_final_val) or chla_final_val == 99999.0 or qc_char in ["4", "9"]:
-                        CHLA_Adjusted_Array[i] = 99999.0
-                        CHLA_Adjusted_ERROR_Array[i] = 99999.0
-                        CHLA_Adjusted_Array.mask[i] = True
-                        CHLA_Adjusted_ERROR_Array.mask[i] = True
-                        CHLA_AdjustedQC_Array[i] = qc_char.encode("utf-8")
-                    else:
-                        CHLA_Adjusted_Array[i] = np.float32(chla_final_val)
-                        CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
-                        CHLA_Adjusted_Array.mask[i] = False
-                        CHLA_Adjusted_ERROR_Array.mask[i] = False
-                        CHLA_AdjustedQC_Array[i] = qc_char.encode("utf-8")
-                else:
-                    CHLA_Adjusted_Array[i] = 99999.0
-                    CHLA_Adjusted_ERROR_Array[i] = 99999.0
-                    CHLA_Adjusted_Array.mask[i] = True
-                    CHLA_Adjusted_ERROR_Array.mask[i] = True
+                raw_fluo_val = raw_fluo_arr[i] if raw_fluo_arr is not None else MISSING_VAL
+                raw_fluo_qc = parse_raw_qc_char(raw_fluo_qc_arr, i)
+
+                # CHLA_ADJUSTED
+                if is_pres_missing:
                     CHLA_AdjustedQC_Array[i] = b"9"
-
-                if is_broken:
-                    FLUORESCENCE_CHLA_Adjusted_Array[i] = 99999.0
-                    FLUORESCENCE_CHLA_Adjusted_ERROR_Array[i] = 99999.0
-                    FLUORESCENCE_CHLA_Adjusted_Array.mask[i] = True
-                    FLUORESCENCE_CHLA_Adjusted_ERROR_Array.mask[i] = True
-                    FLUORESCENCE_CHLA_AdjustedQC_Array[i] = b"4"
-                elif matched_row is not None and fluo_csv_col is not None and pd.notna(matched_row.get(fluo_csv_col)):
-                    fluo_csv_val = matched_row.get(fluo_csv_col)
-                    fluo_adj_qc_val = matched_row.get(fluo_qc_csv_col, "1")
-                    fluo_qc_char = sanitize_qc_char(fluo_adj_qc_val, default="1")
-
-                    if pd.isna(fluo_csv_val) or fluo_csv_val == 99999.0 or fluo_qc_char in ["4", "9"]:
-                        FLUORESCENCE_CHLA_Adjusted_Array[i] = 99999.0
-                        FLUORESCENCE_CHLA_Adjusted_ERROR_Array[i] = 99999.0
-                        FLUORESCENCE_CHLA_Adjusted_Array.mask[i] = True
-                        FLUORESCENCE_CHLA_Adjusted_ERROR_Array.mask[i] = True
-                        FLUORESCENCE_CHLA_AdjustedQC_Array[i] = fluo_qc_char.encode("utf-8")
-                    else:
-                        FLUORESCENCE_CHLA_Adjusted_Array[i] = np.float32(fluo_csv_val)
-                        FLUORESCENCE_CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
-                        FLUORESCENCE_CHLA_Adjusted_Array.mask[i] = False
-                        FLUORESCENCE_CHLA_Adjusted_ERROR_Array.mask[i] = False
-                        FLUORESCENCE_CHLA_AdjustedQC_Array[i] = fluo_qc_char.encode("utf-8")
+                elif is_pres_bad:
+                    CHLA_AdjustedQC_Array[i] = b"4"
+                elif is_broken or raw_chla_qc == "4":
+                    CHLA_AdjustedQC_Array[i] = b"4"
+                elif raw_chla_qc == "9" or is_missing_value(raw_chla_val):
+                    CHLA_AdjustedQC_Array[i] = b"9"
                 else:
-                    FLUORESCENCE_CHLA_Adjusted_Array[i] = 99999.0
-                    FLUORESCENCE_CHLA_Adjusted_ERROR_Array[i] = 99999.0
-                    FLUORESCENCE_CHLA_Adjusted_Array.mask[i] = True
-                    FLUORESCENCE_CHLA_Adjusted_ERROR_Array.mask[i] = True
+                    matched_row = match_csv_row_by_pres(cycle_df, nc_pres)
+                    if matched_row is not None and "CHLA_FINAL" in matched_row:
+                        chla_final_val = matched_row.get("CHLA_FINAL")
+                        csv_chla_qc = sanitize_qc_char(matched_row.get("CHLA_FINAL_QC"), default="1")
+
+                        if is_missing_value(chla_final_val) or csv_chla_qc in ["4", "9"]:
+                            CHLA_AdjustedQC_Array[i] = csv_chla_qc.encode("utf-8")
+                        else:
+                            CHLA_Adjusted_Array[i] = np.float32(chla_final_val)
+                            CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
+                            CHLA_Adjusted_Array.mask[i] = False
+                            CHLA_Adjusted_ERROR_Array.mask[i] = False
+                            CHLA_AdjustedQC_Array[i] = csv_chla_qc.encode("utf-8")
+                    else:
+                        CHLA_AdjustedQC_Array[i] = b"9"
+
+                # FLUORESCENCE_CHLA_ADJUSTED
+                if is_pres_missing:
                     FLUORESCENCE_CHLA_AdjustedQC_Array[i] = b"9"
+                elif is_pres_bad:
+                    FLUORESCENCE_CHLA_AdjustedQC_Array[i] = b"4"
+                elif is_broken or raw_fluo_qc == "4":
+                    FLUORESCENCE_CHLA_AdjustedQC_Array[i] = b"4"
+                elif raw_fluo_qc == "9" or is_missing_value(raw_fluo_val):
+                    FLUORESCENCE_CHLA_AdjustedQC_Array[i] = b"9"
+                else:
+                    matched_row = match_csv_row_by_pres(cycle_df, nc_pres)
+                    if matched_row is not None and fluo_csv_col is not None and pd.notna(matched_row.get(fluo_csv_col)):
+                        fluo_csv_val = matched_row.get(fluo_csv_col)
+                        fluo_qc_char = sanitize_qc_char(matched_row.get(fluo_qc_csv_col), default="1")
+
+                        if is_missing_value(fluo_csv_val) or fluo_qc_char in ["4", "9"]:
+                            FLUORESCENCE_CHLA_AdjustedQC_Array[i] = fluo_qc_char.encode("utf-8")
+                        else:
+                            FLUORESCENCE_CHLA_Adjusted_Array[i] = np.float32(fluo_csv_val)
+                            FLUORESCENCE_CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
+                            FLUORESCENCE_CHLA_Adjusted_Array.mask[i] = False
+                            FLUORESCENCE_CHLA_Adjusted_ERROR_Array.mask[i] = False
+                            FLUORESCENCE_CHLA_AdjustedQC_Array[i] = fluo_qc_char.encode("utf-8")
+                    else:
+                        FLUORESCENCE_CHLA_AdjustedQC_Array[i] = b"9"
 
         if "CHLA_ADJUSTED" in bgc_file.variables:
             bgc_file.variables["CHLA_ADJUSTED"][prof, :] = CHLA_Adjusted_Array
@@ -823,49 +947,51 @@ def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx=0
         mode = get_param_data_mode(bgc_file, prof, "BBP700")
 
         BBP700_Adjusted_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
-        BBP700_Adjusted_Array[:] = 99999.0
+        BBP700_Adjusted_Array[:] = MISSING_VAL
         BBP700_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9" if mode in ["D", "A"] else b" ", dtype="|S1")
         BBP700_Adjusted_ERROR_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
-        BBP700_Adjusted_ERROR_Array[:] = 99999.0
+        BBP700_Adjusted_ERROR_Array[:] = MISSING_VAL
 
-        nc_pres_all = get_pres_array_for_profile(bgc_file, prof)
+        raw_bbp_arr = bgc_file.variables["BBP700"][prof, :] if "BBP700" in bgc_file.variables else None
+        raw_bbp_qc_arr = bgc_file.variables["BBP700_QC"][prof, :] if "BBP700_QC" in bgc_file.variables else None
+
+        nc_pres_all, nc_pres_qc_all = get_pres_and_qc_for_profile(bgc_file, prof)
 
         if mode in ["D", "A"]:
             for i in range(n_levels):
                 nc_pres = nc_pres_all[i]
-                is_pres_missing_or_bad = np.isnan(nc_pres) or nc_pres == 99999.0
+                pres_qc_char = nc_pres_qc_all[i].decode("utf-8") if isinstance(nc_pres_qc_all[i], (bytes, np.bytes_)) else str(nc_pres_qc_all[i])
 
-                matched_row = match_csv_row_by_pres(cycle_df, nc_pres) if not (is_broken or is_pres_missing_or_bad) else None
+                is_pres_missing = is_missing_value(nc_pres) or pres_qc_char == "9"
+                is_pres_bad = pres_qc_char == "4"
 
-                if is_broken:
-                    BBP700_Adjusted_Array[i] = 99999.0
-                    BBP700_Adjusted_ERROR_Array[i] = 99999.0
-                    BBP700_Adjusted_Array.mask[i] = True
-                    BBP700_Adjusted_ERROR_Array.mask[i] = True
-                    BBP700_AdjustedQC_Array[i] = b"4"
-                elif matched_row is not None and "BBP700_FINAL" in matched_row:
-                    csv_qc = matched_row.get("BBP700_FINAL_QC", "1")
-                    qc_char = sanitize_qc_char(csv_qc, default="1")
-                    raw_bbp = matched_row.get("BBP700_FINAL")
+                raw_bbp_val = raw_bbp_arr[i] if raw_bbp_arr is not None else MISSING_VAL
+                raw_bbp_qc = parse_raw_qc_char(raw_bbp_qc_arr, i)
 
-                    if pd.isna(raw_bbp) or raw_bbp == 99999.0 or qc_char in ["4", "9"]:
-                        BBP700_Adjusted_Array[i] = 99999.0
-                        BBP700_Adjusted_ERROR_Array[i] = 99999.0
-                        BBP700_Adjusted_Array.mask[i] = True
-                        BBP700_Adjusted_ERROR_Array.mask[i] = True
-                        BBP700_AdjustedQC_Array[i] = qc_char.encode("utf-8")
-                    else:
-                        BBP700_Adjusted_Array[i] = np.float32(raw_bbp)
-                        BBP700_Adjusted_ERROR_Array[i] = np.float32(BBP700_Adjusted_ERROR_est)
-                        BBP700_Adjusted_Array.mask[i] = False
-                        BBP700_Adjusted_ERROR_Array.mask[i] = False
-                        BBP700_AdjustedQC_Array[i] = qc_char.encode("utf-8")
-                else:
-                    BBP700_Adjusted_Array[i] = 99999.0
-                    BBP700_Adjusted_ERROR_Array[i] = 99999.0
-                    BBP700_Adjusted_Array.mask[i] = True
-                    BBP700_Adjusted_ERROR_Array.mask[i] = True
+                if is_pres_missing:
                     BBP700_AdjustedQC_Array[i] = b"9"
+                elif is_pres_bad:
+                    BBP700_AdjustedQC_Array[i] = b"4"
+                elif is_broken or raw_bbp_qc == "4":
+                    BBP700_AdjustedQC_Array[i] = b"4"
+                elif raw_bbp_qc == "9" or is_missing_value(raw_bbp_val):
+                    BBP700_AdjustedQC_Array[i] = b"9"
+                else:
+                    matched_row = match_csv_row_by_pres(cycle_df, nc_pres)
+                    if matched_row is not None and "BBP700_FINAL" in matched_row:
+                        raw_bbp_final = matched_row.get("BBP700_FINAL")
+                        csv_qc = sanitize_qc_char(matched_row.get("BBP700_FINAL_QC"), default="1")
+
+                        if is_missing_value(raw_bbp_final) or csv_qc in ["4", "9"]:
+                            BBP700_AdjustedQC_Array[i] = csv_qc.encode("utf-8")
+                        else:
+                            BBP700_Adjusted_Array[i] = np.float32(raw_bbp_final)
+                            BBP700_Adjusted_ERROR_Array[i] = np.float32(BBP700_Adjusted_ERROR_est)
+                            BBP700_Adjusted_Array.mask[i] = False
+                            BBP700_Adjusted_ERROR_Array.mask[i] = False
+                            BBP700_AdjustedQC_Array[i] = csv_qc.encode("utf-8")
+                    else:
+                        BBP700_AdjustedQC_Array[i] = b"9"
 
         bgc_file.variables["BBP700_ADJUSTED"][prof, :] = BBP700_Adjusted_Array
         if "BBP700_ADJUSTED_QC" in bgc_file.variables:
@@ -949,49 +1075,57 @@ def write_DOXY_from_csv(ds, float_df, target_cycle, WMOfloatid=None):
         if mode == "R":
             continue
 
-        nc_pres_all = get_pres_array_for_profile(ds, iprof)
+        raw_doxy_arr = ds.variables["DOXY"][iprof, :] if "DOXY" in ds.variables else None
+        raw_doxy_qc_arr = ds.variables["DOXY_QC"][iprof, :] if "DOXY_QC" in ds.variables else None
+
+        nc_pres_all, nc_pres_qc_all = get_pres_and_qc_for_profile(ds, iprof)
 
         DOXY_Adjusted_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
-        DOXY_Adjusted_Array[:] = 99999.0
+        DOXY_Adjusted_Array[:] = MISSING_VAL
         DOXY_Adjusted_Error_Array = np.ma.masked_all(shape=(n_levels,), dtype="float32")
-        DOXY_Adjusted_Error_Array[:] = 99999.0
+        DOXY_Adjusted_Error_Array[:] = MISSING_VAL
         DOXY_AdjustedQC_Array = np.full(shape=(n_levels,), fill_value=b"9", dtype="|S1")
 
         for i in range(n_levels):
             nc_pres = nc_pres_all[i]
-            is_pres_missing_or_bad = np.isnan(nc_pres) or nc_pres == 99999.0
+            pres_qc_char = nc_pres_qc_all[i].decode("utf-8") if isinstance(nc_pres_qc_all[i], (bytes, np.bytes_)) else str(nc_pres_qc_all[i])
 
-            matched_row = match_csv_row_by_pres(cycle_df, nc_pres) if not is_pres_missing_or_bad else None
+            is_pres_missing = is_missing_value(nc_pres) or pres_qc_char == "9"
+            is_pres_bad = pres_qc_char == "4"
 
-            if matched_row is not None and "DOXY_FINAL" in matched_row:
-                csv_qc = matched_row.get("DOXY_FINAL_QC", "1")
-                qc_char = sanitize_qc_char(csv_qc, default="1")
-                raw_doxy_final = matched_row.get("DOXY_FINAL")
+            raw_doxy_val = raw_doxy_arr[i] if raw_doxy_arr is not None else MISSING_VAL
+            raw_doxy_qc = parse_raw_qc_char(raw_doxy_qc_arr, i)
 
-                if pd.isna(raw_doxy_final) or raw_doxy_final == 99999.0 or qc_char in ["4", "9"]:
-                    DOXY_Adjusted_Array[i] = 99999.0
-                    DOXY_Adjusted_Error_Array[i] = 99999.0
-                    DOXY_Adjusted_Array.mask[i] = True
-                    DOXY_Adjusted_Error_Array.mask[i] = True
-                    DOXY_AdjustedQC_Array[i] = qc_char.encode("utf-8")
-                else:
-                    DOXY_Adjusted_Array[i] = np.float32(raw_doxy_final)
-                    DOXY_Adjusted_Array.mask[i] = False
-                    DOXY_AdjustedQC_Array[i] = qc_char.encode("utf-8")
-
-                    raw_doxy_error = matched_row.get("DOXY_ADJUSTED_ERROR")
-                    if pd.notna(raw_doxy_error) and raw_doxy_error != 99999.0:
-                        DOXY_Adjusted_Error_Array[i] = np.float32(raw_doxy_error)
-                        DOXY_Adjusted_Error_Array.mask[i] = False
-                    else:
-                        DOXY_Adjusted_Error_Array[i] = np.float32(DOXY_Adjusted_ERROR_est_default)
-                        DOXY_Adjusted_Error_Array.mask[i] = False
-            else:
-                DOXY_Adjusted_Array[i] = 99999.0
-                DOXY_Adjusted_Error_Array[i] = 99999.0
-                DOXY_Adjusted_Array.mask[i] = True
-                DOXY_Adjusted_Error_Array.mask[i] = True
+            if is_pres_missing:
                 DOXY_AdjustedQC_Array[i] = b"9"
+            elif is_pres_bad:
+                DOXY_AdjustedQC_Array[i] = b"4"
+            elif raw_doxy_qc == "4":
+                DOXY_AdjustedQC_Array[i] = b"4"
+            elif raw_doxy_qc == "9" or is_missing_value(raw_doxy_val):
+                DOXY_AdjustedQC_Array[i] = b"9"
+            else:
+                matched_row = match_csv_row_by_pres(cycle_df, nc_pres)
+                if matched_row is not None and "DOXY_FINAL" in matched_row:
+                    raw_doxy_final = matched_row.get("DOXY_FINAL")
+                    csv_qc = sanitize_qc_char(matched_row.get("DOXY_FINAL_QC"), default="1")
+
+                    if is_missing_value(raw_doxy_final) or csv_qc in ["4", "9"]:
+                        DOXY_AdjustedQC_Array[i] = csv_qc.encode("utf-8")
+                    else:
+                        DOXY_Adjusted_Array[i] = np.float32(raw_doxy_final)
+                        DOXY_Adjusted_Array.mask[i] = False
+                        DOXY_AdjustedQC_Array[i] = csv_qc.encode("utf-8")
+
+                        raw_doxy_error = matched_row.get("DOXY_ADJUSTED_ERROR")
+                        if pd.notna(raw_doxy_error) and not is_missing_value(raw_doxy_error):
+                            DOXY_Adjusted_Error_Array[i] = np.float32(raw_doxy_error)
+                            DOXY_Adjusted_Error_Array.mask[i] = False
+                        else:
+                            DOXY_Adjusted_Error_Array[i] = np.float32(DOXY_Adjusted_ERROR_est_default)
+                            DOXY_Adjusted_Error_Array.mask[i] = False
+                else:
+                    DOXY_AdjustedQC_Array[i] = b"9"
 
         if "DOXY_ADJUSTED" in var_names:
             doxy_adj_var = ds.variables["DOXY_ADJUSTED"]
@@ -1028,7 +1162,7 @@ def safe_rename(from_file, to_file):
 
 
 # ==============================================================================
-# SECTION 3: Plotly DMQC Status Plot Generation (Overlap & PRES Fixes)
+# SECTION 3: Plotly DMQC Status Plot Generation
 # ==============================================================================
 
 data_type_color_map = {"D": "#647ed5", "A": "#c07ab8", "R": "#ff4d6d"}
@@ -1069,8 +1203,6 @@ label_param_qc_color_map = {
 
 
 def get_subsample_prof_idx(temp_list, n):
-    if len(temp_list) <= n:
-        return temp_list
     idx = np.round(np.linspace(0, len(temp_list) - 1, n)).astype(int)
     return [temp_list[i] for i in idx]
 
@@ -1079,17 +1211,16 @@ def add_Data_mode_sp(fig, float_map_inst, std_fig_width=1000):
     x_nprof = []
     y_dataType = []
     color_dataType = []
-    n_profs = len(float_map_inst["NPROF_list"])
 
     for n_prof in float_map_inst["NPROF_list"]:
         x_nprof.append(str(n_prof + 1))
-        y_dataType.append("Data Mode")
+        y_dataType.append(" ")
         df_sub = float_map_inst["NPROF_NPARAM_df"]
         modes = df_sub[df_sub["N_PROF"] == n_prof]["PARAMETER_DATA_MODE"].tolist()
-        best_mode = min(modes, key=lambda m: data_mode_rank_map.get(m, 99)) if modes else "R"
+        best_mode = min(modes, key=lambda x: data_mode_rank_map.get(x, 99)) if modes else "R"
         color_dataType.append(data_type_color_map.get(best_mode, "#FFFFFF"))
 
-    x_ticks = get_subsample_prof_idx(x_nprof, min(7, n_profs))
+    x_ticks = get_subsample_prof_idx(x_nprof, min(7, len(x_nprof)))
     fig.update_xaxes(
         tickmode="array",
         tickvals=x_ticks,
@@ -1098,7 +1229,7 @@ def add_Data_mode_sp(fig, float_map_inst, std_fig_width=1000):
         col=1,
     )
 
-    marker_line_w = max(0.9 * (std_fig_width - 240) / max(n_profs, 1), 1.0)
+    marker_line_w = max(0.9 * (std_fig_width - 170) / max(len(float_map_inst["NPROF_list"]), 1), 1.0)
     fig.add_trace(
         go.Scatter(
             x=x_nprof,
@@ -1116,16 +1247,6 @@ def add_Data_mode_sp(fig, float_map_inst, std_fig_width=1000):
         col=1,
     )
 
-    fig.update_yaxes(
-        tickmode="array",
-        tickvals=["Data Mode"],
-        ticktext=["<b>Data Type</b><br>(R/A/D)"],
-        tickfont=dict(size=10, color=TEXT_COLOR),
-        side="left",
-        row=1,
-        col=1,
-    )
-
 
 def add_positioning_system_sp(fig, float_map_inst, std_fig_width=1000):
     x1_nprof = []
@@ -1133,18 +1254,19 @@ def add_positioning_system_sp(fig, float_map_inst, std_fig_width=1000):
     y1_position_qc = []
     color1_positioning_system = []
     color1_position_qc = []
-    n_profs = len(float_map_inst["NPROF_list"])
 
     for n_prof in float_map_inst["NPROF_list"]:
-        pos_sys = float_map_inst["NPROF_df"]["POSITIONING_SYSTEM"].get(n_prof, "GPS").strip()
-        pos_qc = float_map_inst["NPROF_df"]["POSITION_QC"].get(n_prof, "1").strip()
+        positioning_system = float_map_inst["NPROF_df"]["POSITIONING_SYSTEM"][n_prof].rstrip()
+        position_qc = float_map_inst["NPROF_df"]["POSITION_QC"][n_prof]
         x1_nprof.append(str(n_prof + 1))
-        y1_positioning_system.append("System")
-        y1_position_qc.append("Pos QC")
-        color1_positioning_system.append(position_system_color_map.get(pos_sys, "#af43f0"))
-        color1_position_qc.append(position_qc_color_map.get(pos_qc, "#808080"))
+        y1_positioning_system.append(" ")
+        y1_position_qc.append("  ")
 
-    marker_line_w = max(0.9 * (std_fig_width - 240) / max(n_profs, 1), 1.0)
+        color1_positioning_system.append(position_system_color_map.get(positioning_system, "#ff00f7"))
+        color1_position_qc.append(position_qc_color_map.get(position_qc, "#808080"))
+
+    marker_line_w = max(0.9 * (std_fig_width - 170) / max(len(float_map_inst["NPROF_list"]), 1), 1.0)
+    
     fig.add_trace(
         go.Scatter(
             x=x1_nprof,
@@ -1178,16 +1300,6 @@ def add_positioning_system_sp(fig, float_map_inst, std_fig_width=1000):
         col=1,
     )
 
-    fig.update_yaxes(
-        tickmode="array",
-        tickvals=["Pos QC", "System"],
-        ticktext=["<b>Position QC</b>", "<b>Pos System</b>"],
-        tickfont=dict(size=10, color=TEXT_COLOR),
-        side="left",
-        row=2,
-        col=1,
-    )
-
 
 def add_profile_depth_sp(fig, float_map_inst, std_fig_width=1000):
     x2_nprof = []
@@ -1196,18 +1308,23 @@ def add_profile_depth_sp(fig, float_map_inst, std_fig_width=1000):
 
     for n_prof in float_map_inst["NPROF_list"]:
         x2_nprof.append(str(n_prof + 1))
-        df_levels = float_map_inst["NPROF_NLEVEL_df"]
-        p_slice = df_levels[df_levels["N_PROF"] == n_prof]["PRES_ADJUSTED"]
-        max_d = np.nanmax(p_slice) if len(p_slice) > 0 and not np.all(np.isnan(p_slice)) else 0.0
+        nprof_nlevel_df = float_map_inst["NPROF_NLEVEL_df"]
+        depth_profile = nprof_nlevel_df[nprof_nlevel_df["N_PROF"] == n_prof]["PRES_ADJUSTED"]
+        max_d = np.nanmax(depth_profile) if len(depth_profile) > 0 and not np.all(np.isnan(depth_profile)) else 0.0
         y2_depth.append(max_d)
 
     max_prof_depth = np.max(y2_depth) if y2_depth and not np.all(np.isnan(y2_depth)) else 2000.0
+
     fig.add_trace(
         go.Bar(
             x=x2_nprof,
             y=y2_depth,
             orientation="v",
-            marker=dict(color=color_depth, line=dict(color=color_depth), cornerradius="0%"),
+            marker=dict(
+                color=color_depth,
+                line=dict(color=color_depth),
+                cornerradius="0%",
+            ),
             showlegend=False,
         ),
         row=3,
@@ -1216,85 +1333,96 @@ def add_profile_depth_sp(fig, float_map_inst, std_fig_width=1000):
 
     fig.update_yaxes(
         range=[max_prof_depth, 0],
-        title=dict(text="<b>Profile Depth</b>", font=dict(size=10, color=TEXT_COLOR)),
-        side="left",
+        visible=False,
         row=3,
         col=1,
     )
+
     return np.rint(max_prof_depth)
 
 
 def add_param_QC_sp(fig, float_map_inst, PARAM, subplotNum, std_fig_width=1000):
     x3_nprof = []
-    y3_p1 = []  # QC Flag track (lower)
-    y3_p2 = []  # Data Mode track (upper)
-    color3_qc = []
-    color3_pdm = []
-    hover_texts_qc = []
-    hover_texts_pdm = []
-    n_profs = len(float_map_inst["NPROF_list"])
+    y3_placehodler1 = []
+    y3_placehodler2 = []
+    color3_profile_flag_QC = []
+    color3_param_data_mode = []
 
     for n_prof in float_map_inst["NPROF_list"]:
-        cyc_str = str(n_prof + 1)
-        x3_nprof.append(cyc_str)
-        y3_p1.append("QC")
-        y3_p2.append("Mode")
+        x3_nprof.append(str(n_prof + 1))
+        y3_placehodler1.append(" ")
+        y3_placehodler2.append("  ")
 
-        flag = float_map_inst["NPROF_df"].get(f"PROFILE_{PARAM}_QC", {}).get(n_prof, " ")
-        color3_qc.append(param_qc_color_map.get(flag, "#FFFFFF"))
-        hover_texts_qc.append(f"Cycle {cyc_str}<br>Param: {PARAM}<br>QC Grade: {flag}")
+        # Resolve variable aliasing across both standard and shortened names
+        possible_qc_keys = [f"PROFILE_{PARAM}_QC"]
+        if PARAM == "CHLA_FLUORESCENCE":
+            possible_qc_keys.append("PROFILE_FLUORESCENCE_CHLA_QC")
+        elif PARAM == "FLUORESCENCE_CHLA":
+            possible_qc_keys.append("PROFILE_CHLA_FLUORESCENCE_QC")
+        elif PARAM == "PH_IN_SITU_TOTAL":
+            possible_qc_keys.append("PROFILE_PH_QC")
+        elif PARAM == "PH":
+            possible_qc_keys.append("PROFILE_PH_IN_SITU_TOTAL_QC")
 
-        pdm = float_map_inst["PDM_MAP"].get(PARAM, {}).get(n_prof, "R")
-        color3_pdm.append(data_type_color_map.get(pdm, "#FFFFFF"))
-        hover_texts_pdm.append(f"Cycle {cyc_str}<br>Param: {PARAM}<br>Data Mode: {pdm}")
+        profile_flag_QC = " "
+        for key in possible_qc_keys:
+            if key in float_map_inst["NPROF_df"] and n_prof in float_map_inst["NPROF_df"][key]:
+                val = float_map_inst["NPROF_df"][key][n_prof]
+                if val and str(val).strip() != "":
+                    profile_flag_QC = str(val).strip()
+                    break
 
-    marker_line_w = max(0.9 * (std_fig_width - 240) / max(n_profs, 1), 1.0)
+        profile_flag_QC_color = param_qc_color_map.get(profile_flag_QC, "#FFFFFF")
+        color3_profile_flag_QC.append(profile_flag_QC_color)
+
+        possible_pdm_keys = [PARAM]
+        if PARAM in ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"]:
+            possible_pdm_keys.extend(["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"])
+        elif PARAM in ["PH", "PH_IN_SITU_TOTAL"]:
+            possible_pdm_keys.extend(["PH_IN_SITU_TOTAL", "PH"])
+
+        param_data_mode = "R"
+        for key in possible_pdm_keys:
+            if key in float_map_inst["PDM_MAP"] and n_prof in float_map_inst["PDM_MAP"][key]:
+                m = float_map_inst["PDM_MAP"][key][n_prof]
+                if m and str(m).strip() != "":
+                    param_data_mode = str(m).strip()
+                    break
+
+        param_data_mode_color = data_type_color_map.get(param_data_mode, "#FFFFFF")
+        color3_param_data_mode.append(param_data_mode_color)
+
+    marker_line_w = max(0.9 * (std_fig_width - 170) / max(len(float_map_inst["NPROF_list"]), 1), 1.0)
 
     fig.add_trace(
         go.Scatter(
             x=x3_nprof,
-            y=y3_p1,
+            y=y3_placehodler1,
             mode="markers",
             marker_symbol="line-ns",
-            marker_color=color3_qc,
-            marker_line_color=color3_qc,
+            marker_color=color3_profile_flag_QC,
+            marker_line_color=color3_profile_flag_QC,
             marker_line_width=marker_line_w,
-            marker_size=16,
-            hoverinfo="text",
-            hovertext=hover_texts_qc,
+            marker_size=15,
             orientation="h",
             showlegend=False,
         ),
         row=subplotNum,
         col=1,
     )
-
     fig.add_trace(
         go.Scatter(
             x=x3_nprof,
-            y=y3_p2,
+            y=y3_placehodler2,
             mode="markers",
             marker_symbol="line-ns",
-            marker_color=color3_pdm,
-            marker_line_color=color3_pdm,
+            marker_color=color3_param_data_mode,
+            marker_line_color=color3_param_data_mode,
             marker_line_width=marker_line_w,
-            marker_size=16,
-            hoverinfo="text",
-            hovertext=hover_texts_pdm,
+            marker_size=15,
             orientation="h",
             showlegend=False,
         ),
-        row=subplotNum,
-        col=1,
-    )
-
-    clean_param = "PH" if PARAM == "PH_IN_SITU_TOTAL" else ("FLUOR" if PARAM in ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"] else PARAM)
-    fig.update_yaxes(
-        tickmode="array",
-        tickvals=["QC", "Mode"],
-        ticktext=[f"<b>{clean_param} QC</b>", f"<b>{clean_param} Mode</b>"],
-        tickfont=dict(size=9, color=TEXT_COLOR),
-        side="left",
         row=subplotNum,
         col=1,
     )
@@ -1302,129 +1430,228 @@ def add_param_QC_sp(fig, float_map_inst, PARAM, subplotNum, std_fig_width=1000):
 
 def update_layout_DMQC_STATUS(fig, float_map_inst, max_prof_depth, subplotList, num_rows, std_fig_width=1000):
     n_profs = len(float_map_inst["NPROF_list"])
-    fig.update_xaxes(range=[-0.05 * n_profs, n_profs * 1.05], dtick=max(1, int(n_profs * 0.33)))
+    fig.update_xaxes(
+        range=[-0.05 * n_profs, n_profs * 1.05],
+        dtick=max(1, int(n_profs * 0.33)),
+    )
+
+    calc_height = max(800, int(60 * num_rows + 150))
 
     fig.update_layout(
         autosize=False,
-        height=max(900, 52 * num_rows + 220),
+        height=calc_height,
         width=std_fig_width,
         bargap=0,
         bargroupgap=0,
         font=dict(color=TEXT_COLOR),
         title=dict(
-            text=f"WMOID {float_map_inst['wmoID_str']} - BD File Verification & DMQC Status",
-            font=dict(color=TEXT_COLOR, size=22),
+            text=f"WMOID {float_map_inst['wmoID_str']}",
+            font=dict(color=TEXT_COLOR, size=24),
             x=0.5,
             xanchor="center",
             yanchor="top",
         ),
+        annotations=[
+            dict(
+                text="Data Type (R/A/D)",
+                xref="paper", yref="paper",
+                x=0,
+                xanchor="right",
+                y=sum(fig.layout["yaxis1"].domain) / 2,
+                yanchor="middle",
+                showarrow=False,
+                textangle=0,
+                font=dict(size=12),
+            ),
+            dict(
+                text="Positioning System",
+                xref="paper", yref="paper",
+                x=0,
+                xanchor="right",
+                y=sum(fig.layout["yaxis2"].domain) / 2,
+                yanchor="bottom",
+                showarrow=False,
+                textangle=0,
+                font=dict(size=12),
+            ),
+            dict(
+                text="Position QC",
+                xref="paper", yref="paper",
+                x=0,
+                xanchor="right",
+                y=sum(fig.layout["yaxis2"].domain) / 2,
+                yanchor="top",
+                showarrow=False,
+                textangle=0,
+                font=dict(size=12),
+            ),
+            dict(
+                text="Profile Depth",
+                xref="paper", yref="paper",
+                x=0,
+                xanchor="right",
+                y=sum(fig.layout["yaxis3"].domain) / 2,
+                yanchor="bottom",
+                showarrow=False,
+                textangle=0,
+                font=dict(size=12),
+            ),
+            dict(
+                text=f"Max: ~{max_prof_depth:.0f} dbar",
+                xref="paper", yref="paper",
+                x=0,
+                xanchor="right",
+                y=sum(fig.layout["yaxis3"].domain) / 2,
+                yanchor="top",
+                showarrow=False,
+                textangle=0,
+                font=dict(size=12, color="#41AACE"),
+            ),
+        ],
         plot_bgcolor=BG_COLOR,
         paper_bgcolor=BG_COLOR,
-        margin=dict(l=140, r=30, t=110, b=80),
+        margin=dict(l=170, r=20, t=100, b=80),
     )
 
-    for mode_name, hex_color in label_data_type_color_map.items():
+    for data_mode, hex_color in label_data_type_color_map.items():
         fig.add_trace(
             go.Scatter(
                 x=[None], y=[None],
                 mode="markers",
                 marker=dict(size=10, color=hex_color),
-                name=f"{mode_name}",
+                name=f"{data_mode}",
                 legendgroup="DataMode",
                 showlegend=True,
             )
         )
-    fig.update_traces(legendgrouptitle_text="<b>Data Mode</b>", selector=dict(legendgroup="DataMode"))
+    fig.update_traces(legendgrouptitle_text="Data Mode: ", selector=dict(legendgroup="DataMode"))
 
-    for grade_name, hex_color in label_param_qc_color_map.items():
+    for qc_code, hex_color in label_qc_color_map.items():
         fig.add_trace(
             go.Scatter(
                 x=[None], y=[None],
                 mode="markers",
                 marker=dict(size=10, color=hex_color),
-                name=f"{grade_name}",
-                legendgroup="ProfileQualityFlag",
-                showlegend=True,
-            )
-        )
-    fig.update_traces(legendgrouptitle_text="<b>QC Profile Grade</b>", selector=dict(legendgroup="ProfileQualityFlag"))
-
-    for qc_name, hex_color in label_qc_color_map.items():
-        fig.add_trace(
-            go.Scatter(
-                x=[None], y=[None],
-                mode="markers",
-                marker=dict(size=10, color=hex_color),
-                name=f"{qc_name}",
+                name=f"{qc_code}",
                 legendgroup="PositioningSystemQC",
                 showlegend=True,
             )
         )
-    fig.update_traces(legendgrouptitle_text="<b>Position QC</b>", selector=dict(legendgroup="PositioningSystemQC"))
+    fig.update_traces(legendgrouptitle_text="Positioning System QC: ", selector=dict(legendgroup="PositioningSystemQC"))
 
-    total_slots = 0
-    d_mode_count = 0
-    for p in float_map_inst["param_list"]:
-        for m in float_map_inst["PDM_MAP"].get(p, {}).values():
-            total_slots += 1
-            if m == "D":
-                d_mode_count += 1
-    pct_d = (d_mode_count / total_slots * 100) if total_slots > 0 else 0.0
+    for qc_code, hex_color in label_param_qc_color_map.items():
+        fig.add_trace(
+            go.Scatter(
+                x=[None], y=[None],
+                mode="markers",
+                marker=dict(size=10, color=hex_color),
+                name=f"{qc_code}",
+                legendgroup="ProfileQualityFlag",
+                showlegend=True,
+            )
+        )
+    fig.update_traces(legendgrouptitle_text="Profile PARAM Grade: ", selector=dict(legendgroup="ProfileQualityFlag"))
+
+    new_annotations = []
+    for PARAM, subplotidx in zip(float_map_inst["param_list"], subplotList):
+        tempPARAM = "PH" if PARAM in ["PH_IN_SITU_TOTAL", "PH"] else ("FLUOR" if PARAM in ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"] else PARAM)
+        domain_center = sum(fig.layout[f"yaxis{subplotidx}"].domain) / 2
+
+        new_annotations.extend([
+            dict(
+                text=f"{tempPARAM} Data Mode",
+                xref="paper", yref="paper",
+                x=0,
+                xanchor="right",
+                y=domain_center,
+                yanchor="bottom",
+                showarrow=False,
+                textangle=0,
+                font=dict(size=11),
+            ),
+            dict(
+                text=f"Profile {tempPARAM} QC",
+                xref="paper", yref="paper",
+                x=0,
+                xanchor="right",
+                y=domain_center,
+                yanchor="top",
+                showarrow=False,
+                textangle=0,
+                font=dict(size=11),
+            ),
+        ])
+    fig.layout.annotations = list(fig.layout.annotations) + new_annotations
 
     float_status = float_map_inst.get("activity_status", "Active")
-    status_annotation = (
-        f'<span style="font-size: 16px; font-weight: bold; color: #16a085;">BD Filler: {pct_d:.0f}% D-Mode</span><br>'
-        f'<span style="font-size: 14px; color: #27ae60;">Status: {float_status}</span>'
-    )
+    if float_status == "Active":
+        status_color = "#147628"
+        annotation_text = f"Status: {float_status}"
+    elif float_status == "Inactive":
+        status_color = "#FA0226"
+        annotation_text = f"Status: {float_status}"
+    else:
+        parts = float_status.split(" ", 1)
+        base_status = parts[0]
+        overdue_detail = parts[1] if len(parts) > 1 else ""
+        status_color = "#f5c133"
+        annotation_text = (
+            f'<span style="font-size: 20px;">Status: {base_status}</span>'
+            f'<span style="font-size: 14px; text-align: right;"><br>{overdue_detail}</span>'
+        )
 
     fig.add_annotation(
-        text=status_annotation,
+        text=annotation_text,
         xref="paper", yref="paper",
         x=1, y=1,
         xanchor="right", yanchor="top",
         showarrow=False,
-        yshift=75, xshift=140,
+        font=dict(size=20, color=status_color),
+        yshift=60,
+        xshift=140,
     )
 
-    curr_date_str = dt.now().strftime("%Y-%m-%d")
+    current_date = dt.now().strftime("%Y-%m-%d")
     fig.add_annotation(
-        text=f"Figure Created: {curr_date_str}",
+        text=f"Figure Created: {current_date}",
         xref="paper", yref="paper",
         x=0, y=0,
         xanchor="left", yanchor="top",
         showarrow=False,
-        font=dict(size=11),
-        xshift=-120, yshift=-60,
+        font=dict(size=12),
+        xshift=-150, yshift=-60,
     )
 
-    prof_dates = float_map_inst.get("JULD_list", [])
-    if prof_dates:
-        first_prof = float_map_inst["NPROF_list"][0]
-        last_prof = float_map_inst["NPROF_list"][-1]
-        first_d = prof_dates[0].strftime("%Y-%m-%d") if isinstance(prof_dates[0], dt) else str(prof_dates[0])
-        last_d = prof_dates[-1].strftime("%Y-%m-%d") if isinstance(prof_dates[-1], dt) else str(prof_dates[-1])
+    prof_date_map = dict(zip(float_map_inst["NPROF_list"], float_map_inst["JULD_list"]))
+    if prof_date_map:
+        first_prof = next(iter(prof_date_map))
+        first_date = prof_date_map[first_prof].strftime("%Y-%m-%d") if isinstance(prof_date_map[first_prof], dt) else str(prof_date_map[first_prof])
+        last_prof = next(reversed(prof_date_map))
+        last_date = prof_date_map[last_prof].strftime("%Y-%m-%d") if isinstance(prof_date_map[last_prof], dt) else str(prof_date_map[last_prof])
 
         fig.add_annotation(
-            text=f"Cycle {first_prof + 1}:  {first_d}",
+            text=f"Cycle {first_prof + 1}:  {first_date}",
             xref="paper", yref="paper",
             x=0, y=0,
             xanchor="left", yanchor="bottom",
-            showarrow=False, font=dict(size=11),
+            showarrow=False,
+            font=dict(size=12),
             xshift=0, yshift=-50,
         )
         fig.add_annotation(
-            text=f"Cycle {last_prof + 1}:  {last_d}",
+            text=f"Cycle {last_prof + 1}:  {last_date}",
             xref="paper", yref="paper",
             x=1, y=0,
             xanchor="right", yanchor="bottom",
-            showarrow=False, font=dict(size=11),
+            showarrow=False,
+            font=dict(size=12),
             xshift=0, yshift=-50,
         )
 
 
-def make_DMQC_STATUS_fig(float_map_inst, output_filepath, show_grid=True):
+def make_DMQC_STATUS_fig(float_map_inst, output_filepath=None, show_grid=True):
     num_rows = 3 + len(float_map_inst["param_list"])
-    row_heights = [1.0 / num_rows] * num_rows
+    row_heights_list = [1 / num_rows] * num_rows
 
     fig = make_subplots(
         rows=num_rows,
@@ -1432,8 +1659,8 @@ def make_DMQC_STATUS_fig(float_map_inst, output_filepath, show_grid=True):
         shared_xaxes=True,
         x_title="Cycle Number",
         shared_yaxes=False,
-        vertical_spacing=0.012,
-        row_heights=row_heights,
+        vertical_spacing=0.02,
+        row_heights=row_heights_list,
         print_grid=show_grid,
     )
 
@@ -1442,7 +1669,8 @@ def make_DMQC_STATUS_fig(float_map_inst, output_filepath, show_grid=True):
     max_prof_depth = add_profile_depth_sp(fig, float_map_inst)
 
     subplotNumList = []
-    for i, PARAM in enumerate(float_map_inst["param_list"]):
+    for i in range(len(float_map_inst["param_list"])):
+        PARAM = float_map_inst["param_list"][i]
         subplotNum = i + 4
         try:
             subplotNumList.append(subplotNum)
@@ -1471,11 +1699,22 @@ def make_DMQC_STATUS_fig(float_map_inst, output_filepath, show_grid=True):
         except Exception:
             pass
 
-    fig.write_image(output_filepath, format="png", width=1100, height=max(900, 52 * num_rows + 220), scale=2)
+    out_file = output_filepath if output_filepath else f"/a2/ARGO_OPERATIONS/float_vis/drive/pictures/{float_map_inst['wmoID_str']}_DMQC_status.png"
+    fig.write_image(
+        out_file,
+        format="png",
+        width=1000,
+        height=max(800, int(60 * num_rows + 150)),
+        scale=2,
+    )
     return fig
 
 
 def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
+    """
+    Directly harvests output BD NetCDF files to generate the verified DMQC Status Plot.
+    Properly extracts all sub-profiles so PH, NITRATE, DOXY, CHLA, and FLUOR grades populate.
+    """
     if not processed_bd_files:
         return
 
@@ -1483,7 +1722,6 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
     os.makedirs(plot_out_dir, exist_ok=True)
     out_png = os.path.join(plot_out_dir, f"{WMOfloatid}_DMQC_status.png")
 
-    # PRES is placed first to guarantee its Profile QC appears directly under Profile Depth
     candidate_params = ["PRES", "TEMP", "PSAL", "DOXY", "BBP700", "CHLA", "PH_IN_SITU_TOTAL", "NITRATE", "CHLA_FLUORESCENCE"]
     present_params = set()
 
@@ -1522,9 +1760,9 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
             nprof_df_data["POSITION_QC"][prof_idx] = pos_qc
 
             p_pres_idx = detect_parameter_profile(ds, "PRES")
-            pres_vals = get_pres_array_for_profile(ds, p_pres_idx)
+            pres_vals, _ = get_pres_and_qc_for_profile(ds, p_pres_idx)
             for p_v in pres_vals:
-                if not np.isnan(p_v) and p_v != 99999.0:
+                if not is_missing_value(p_v):
                     nprof_nlevel_records.append({"N_PROF": prof_idx, "PRES_ADJUSTED": p_v})
 
             for p in candidate_params:
@@ -1535,6 +1773,8 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
                 )
                 if not var_exists and p == "CHLA_FLUORESCENCE":
                     var_exists = "FLUORESCENCE_CHLA" in ds.variables or "PROFILE_FLUORESCENCE_CHLA_QC" in ds.variables
+                elif not var_exists and p == "PH_IN_SITU_TOTAL":
+                    var_exists = "PH" in ds.variables or "PROFILE_PH_QC" in ds.variables
 
                 if var_exists:
                     present_params.add(p)
@@ -1551,21 +1791,33 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
                 has_data = has_valid_measurements(ds, p, p_prof)
 
                 grade = " "
-                if target_qc in ds.variables:
+                qc_var_names = [f"PROFILE_{p}_QC"]
+                if p == "CHLA_FLUORESCENCE":
+                    qc_var_names.append("PROFILE_FLUORESCENCE_CHLA_QC")
+                elif p == "PH_IN_SITU_TOTAL":
+                    qc_var_names.append("PROFILE_PH_QC")
+
+                # Harvest profile QC grade directly across sub-profiles
+                for qvn in qc_var_names:
+                    if qvn in ds.variables:
+                        g_var = ds.variables[qvn]
+                        raw_g_slice = g_var[:]
+                        for candidate_idx in [p_prof, 0]:
+                            if candidate_idx < len(raw_g_slice):
+                                cand = raw_g_slice[candidate_idx]
+                                if isinstance(cand, np.ndarray) and cand.ndim > 0:
+                                    cand = cand[0]
+                                c_str = cand.decode("utf-8", errors="ignore") if isinstance(cand, (bytes, np.bytes_)) else str(cand)
+                                if c_str.strip() != "":
+                                    grade = c_str.strip()
+                                    break
+                    if grade != " ":
+                        break
+
+                # If missing or blank, compute grade dynamically using Table 2a
+                if grade == " " and target_qc in ds.variables:
                     qc_slice = ds.variables[target_qc][p_prof, :] if ds.variables[target_qc].ndim > 1 else ds.variables[target_qc][:]
                     grade = get_profile_qc_grade(qc_slice, parameter_present=has_data)
-                else:
-                    qc_var_names = [f"PROFILE_{p}_QC"]
-                    if p == "CHLA_FLUORESCENCE":
-                        qc_var_names.append("PROFILE_FLUORESCENCE_CHLA_QC")
-                    for qvn in qc_var_names:
-                        if qvn in ds.variables:
-                            g = ds.variables[qvn][p_prof] if ds.variables[qvn].ndim > 0 else ds.variables[qvn][:]
-                            if isinstance(g, np.ndarray) and g.ndim > 0:
-                                g = g[0]
-                            grade = g.decode("utf-8", errors="ignore") if isinstance(g, bytes) else str(g)
-                            if grade.strip() != "":
-                                break
 
                 if p == "PRES":
                     if "PRES_QC" in ds.variables:
@@ -1576,6 +1828,16 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
                 if qc_col_key not in nprof_df_data:
                     nprof_df_data[qc_col_key] = {}
                 nprof_df_data[qc_col_key][prof_idx] = grade
+
+                # Mirror aliases
+                if p == "CHLA_FLUORESCENCE":
+                    if "PROFILE_FLUORESCENCE_CHLA_QC" not in nprof_df_data:
+                        nprof_df_data["PROFILE_FLUORESCENCE_CHLA_QC"] = {}
+                    nprof_df_data["PROFILE_FLUORESCENCE_CHLA_QC"][prof_idx] = grade
+                elif p == "PH_IN_SITU_TOTAL":
+                    if "PROFILE_PH_QC" not in nprof_df_data:
+                        nprof_df_data["PROFILE_PH_QC"] = {}
+                    nprof_df_data["PROFILE_PH_QC"][prof_idx] = grade
 
             ds.close()
         except Exception:
@@ -1623,7 +1885,7 @@ QC_COLOR_MAP = {
 
 def create_interpolated_grid(df, val_col, grid_nx=100, grid_ny=100):
     clean_df = df.dropna(subset=[val_col, "CYCLE_NUMBER", "PRES"]).copy()
-    clean_df = clean_df[clean_df[val_col] != 99999.0]
+    clean_df = clean_df[~clean_df[val_col].isin([MISSING_VAL, 99999.0])]
 
     if clean_df.empty:
         return None
@@ -1657,32 +1919,48 @@ def generate_section_qc_plot(
     df_base, var_name, qc_var_name, title_prefix, file_suffix,
     output_dir, WMOfloatid, col_palette="viridis", unit_str="", is_chla=False
 ):
+    """
+    Renders exactly 2 panels:
+      Top: Scientific section profile (valid data only) with missing data overlaid as faint 'x' markers.
+      Bottom: Discrete QC flags section map (all active flags including Flag 9).
+    """
     if var_name not in df_base.columns:
         return
 
-    clean_var = df_base[var_name].replace(99999.0, np.nan)
-    if clean_var.dropna().empty:
-        return
-
-    df_qc = df_base.copy()
-    df_qc["VAR_VAL"] = clean_var
-    df_qc = df_qc.dropna(subset=["VAR_VAL", "PRES", "CYCLE_NUMBER"]).copy()
-
-    if df_qc.empty:
-        return
-
-    if qc_var_name in df_qc.columns:
-        df_qc["QC_VAL"] = (
-            df_qc[qc_var_name]
+    df_plot = df_base.copy()
+    if qc_var_name in df_plot.columns:
+        df_plot["QC_VAL"] = (
+            df_plot[qc_var_name]
             .astype(str)
             .str.extract(r"([0-9])")[0]
-            .fillna("1")
+            .fillna("9")
         )
     else:
-        df_qc["QC_VAL"] = "1"
+        df_plot["QC_VAL"] = "9"
 
-    interp_res = create_interpolated_grid(df_qc, "VAR_VAL")
-    max_pres = np.nanmax(df_base["PRES"].replace(99999.0, np.nan))
+    is_missing_mask = (
+        df_plot[var_name].isna()
+        | (df_plot[var_name] == MISSING_VAL)
+        | (df_plot[var_name] == 99999.0)
+        | (df_plot["QC_VAL"] == "9")
+    )
+
+    df_valid = df_plot[~is_missing_mask].copy()
+    df_missing = df_plot[is_missing_mask].copy()
+
+    df_valid = df_valid.dropna(subset=[var_name, "PRES", "CYCLE_NUMBER"]).copy()
+    df_valid = df_valid[(df_valid["PRES"] != MISSING_VAL) & (df_valid["PRES"] != 99999.0)]
+
+    df_missing = df_missing.dropna(subset=["PRES", "CYCLE_NUMBER"]).copy()
+    df_missing = df_missing[(df_missing["PRES"] != MISSING_VAL) & (df_missing["PRES"] != 99999.0)]
+
+    if df_valid.empty and df_missing.empty:
+        return
+
+    interp_res = create_interpolated_grid(df_valid, var_name) if not df_valid.empty else None
+    
+    pres_all = df_plot["PRES"].replace([MISSING_VAL, 99999.0], np.nan)
+    max_pres = np.nanmax(pres_all) if not pres_all.dropna().empty else 2000.0
     if np.isnan(max_pres) or max_pres <= 0:
         max_pres = 2000.0
 
@@ -1699,6 +1977,7 @@ def generate_section_qc_plot(
     cax_qc = divider_qc.append_axes("right", size="3%", pad=0.15)
     cax_qc.axis("off")
 
+    # --- TOP PANEL: Scientific Contour or Scatter Plot ---
     if interp_res is not None:
         xi_grid, yi_grid, zi_grid = interp_res
 
@@ -1716,19 +1995,38 @@ def generate_section_qc_plot(
             cbar.set_label(unit_str, fontsize=10)
 
         ax_data.set_title(f"Float {WMOfloatid} - {title_prefix} Section Profile", fontsize=12, fontweight="bold")
-    else:
-        sc = ax_data.scatter(df_qc["CYCLE_NUMBER"], df_qc["PRES"], c=df_qc["VAR_VAL"], cmap=col_palette, s=15, alpha=0.8)
+    elif not df_valid.empty:
+        sc = ax_data.scatter(df_valid["CYCLE_NUMBER"], df_valid["PRES"], c=df_valid[var_name], cmap=col_palette, s=15, alpha=0.8)
         cbar = fig.colorbar(sc, cax=cax_data)
         cbar.set_label(unit_str, fontsize=10)
         ax_data.set_title(f"Float {WMOfloatid} - {title_prefix} Section Profile", fontsize=12, fontweight="bold")
+    else:
+        cax_data.axis("off")
+        ax_data.set_title(f"Float {WMOfloatid} - {title_prefix} Section Profile (No Valid Data)", fontsize=12, fontweight="bold")
+
+    # OVERLAY MISSING DATA (Faint 'x' directly over section plot)
+    if not df_missing.empty:
+        ax_data.scatter(
+            df_missing["CYCLE_NUMBER"],
+            df_missing["PRES"],
+            marker="x",
+            c="#7f7f7f",
+            s=12,
+            alpha=0.35,
+            linewidths=0.7,
+            label="Missing Data (-99999)",
+        )
+        ax_data.legend(loc="upper right", fontsize=8, frameon=True, facecolor="white", edgecolor="none")
 
     ax_data.set_ylim(max_pres, 0)
     ax_data.set_ylabel("Pressure (dbar)", fontsize=11)
     ax_data.grid(True, linestyle="--", alpha=0.4)
 
-    unique_qcs = sorted(df_qc["QC_VAL"].unique(), key=lambda q: int(q) if q.isdigit() else 99)
+    # --- BOTTOM PANEL: Discrete QC Flag Map ---
+    unique_qcs = sorted(df_plot["QC_VAL"].unique(), key=lambda q: int(q) if q.isdigit() else 99)
     for q_flag in unique_qcs:
-        sub = df_qc[df_qc["QC_VAL"] == q_flag]
+        sub = df_plot[df_plot["QC_VAL"] == q_flag]
+        sub = sub[(sub["PRES"] != MISSING_VAL) & (sub["PRES"] != 99999.0)]
         ax_qc.scatter(
             sub["CYCLE_NUMBER"], sub["PRES"],
             c=QC_COLOR_MAP.get(q_flag, "#000000"),
@@ -1781,15 +2079,19 @@ def extract_bd_parameter_dataframe(processed_bd_files, param_name, adj_param_nam
             raw_v_name = param_name
             if raw_v_name not in ds.variables and param_name == "CHLA_FLUORESCENCE":
                 raw_v_name = "FLUORESCENCE_CHLA"
+            elif raw_v_name not in ds.variables and param_name == "PH_IN_SITU_TOTAL":
+                raw_v_name = "PH"
 
             adj_v_name = adj_param_name if adj_param_name else f"{param_name}_ADJUSTED"
             if adj_v_name not in ds.variables and "FLUORESCENCE_CHLA" in raw_v_name:
                 adj_v_name = "FLUORESCENCE_CHLA_ADJUSTED"
+            elif adj_v_name not in ds.variables and raw_v_name == "PH":
+                adj_v_name = "PH_ADJUSTED"
 
             raw_qc_name = f"{raw_v_name}_QC"
             adj_qc_name = f"{adj_v_name}_QC"
 
-            pres_arr = get_pres_array_for_profile(ds, iprof)
+            pres_arr, _ = get_pres_and_qc_for_profile(ds, iprof)
             n_levels = len(pres_arr)
 
             def get_arr(v_name):
@@ -1798,7 +2100,7 @@ def extract_bd_parameter_dataframe(processed_bd_files, param_name, adj_param_nam
                 v = ds.variables[v_name]
                 arr = v[iprof, :] if v.ndim > 1 else v[:]
                 if hasattr(arr, "filled"):
-                    arr = arr.filled(99999.0 if arr.dtype.kind in ['f', 'i'] else b" ")
+                    arr = arr.filled(MISSING_VAL if arr.dtype.kind in ['f', 'i'] else b" ")
                 return np.array(arr)
 
             raw_arr = get_arr(raw_v_name)
@@ -1808,7 +2110,7 @@ def extract_bd_parameter_dataframe(processed_bd_files, param_name, adj_param_nam
 
             for k in range(n_levels):
                 p_val = float(pres_arr[k])
-                if np.isnan(p_val) or p_val == 99999.0:
+                if is_missing_value(p_val):
                     continue
 
                 def parse_val(arr):
@@ -1817,7 +2119,7 @@ def extract_bd_parameter_dataframe(processed_bd_files, param_name, adj_param_nam
                     val = arr[k]
                     try:
                         f = float(val)
-                        return np.nan if f == 99999.0 else f
+                        return np.nan if is_missing_value(f) else f
                     except (ValueError, TypeError):
                         return np.nan
 
@@ -1952,20 +2254,23 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             iprof_bbp = detect_parameter_profile(ds, "BBP700")
             iprof_doxy = detect_parameter_profile(ds, "DOXY")
 
-            # 1. Update PARAMETER_DATA_MODE and DATA_MODE
+            # 1. Update PARAMETER_DATA_MODE and DATA_MODE (pH and Nitrate explicitly skipped)
             write_parameter_data_modes(ds)
 
-            # 2. Process calibrations and CSV adjustments
+            # 2. Standardize missing data in raw variables to -99999.0 and QC 9 (only change to raw data)
+            standardize_raw_missing_data(ds)
+
+            # 3. Process calibrations and CSV adjustments
             write_scientific_calib_chla(ds, WMOfloatid, idx_profile, df_bio)
             write_chla_BBP_adjusted(ds, WMOfloatid, idx_profile, df_bio, iprof_chla)
             write_BBP700_adjusted(ds, WMOfloatid, idx_profile, df_bio, iprof_bbp)
             write_DOXY_slope_drift(ds, 0, df_bio, idx_profile, WMOfloatid=WMOfloatid)
             write_DOXY_from_csv(ds, df_bio, idx_profile, WMOfloatid=WMOfloatid)
 
-            # 3. Clean adjusted QC variables and update PROFILE_<PARAM>_QC (leaves raw QC intact)
+            # 4. Clean adjusted QC variables and update PROFILE_<PARAM>_QC (pH and Nitrate skipped)
             clean_and_fill_qc_variables(ds, WMOfloatid=WMOfloatid)
 
-            # 4. Metadata and attributes
+            # 5. Metadata and attributes
             write_history_metadata(ds, iprof_chla, iprof_doxy, WMOfloatid=WMOfloatid)
             add_missing_valid_range_attributes(ds)
             remove_forbidden_attributes(ds)
@@ -1984,6 +2289,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             if "ds" in locals() and ds.isopen():
                 ds.close()
 
+    # Step 6: Finalize output files
     final_processed_files = []
     for w_file in new_bd_files:
         path, name = os.path.split(w_file)
@@ -1998,8 +2304,6 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
         processed_output_paths.append(new_path)
         final_processed_files.append(new_path)
 
-    # 5. Generate DMQC Status Plot reading directly from output BD files
+    # Step 7: Verification Plotting (reading directly from output BD files)
     generate_dmqc_status_plot(WMOfloatid, final_processed_files, script_dir)
-
-    # 6. Generate Section Contour & QC Summary Plots directly from output BD files (R_mode & D_mode)
     generate_all_qc_summary_plots(final_processed_files, WMOfloatid, script_dir)
