@@ -2,7 +2,7 @@
 # coding: utf-8
 
 # ==============================================================================
-# SECTION 1: Library Imports & Helper Functions
+# SECTION 1: Library Imports & Global Constants
 # ==============================================================================
 import datetime
 import gc
@@ -40,7 +40,7 @@ FLOAT_TYPES = {
     4903622: "aoml_apex",
     2904010: "aoml_apex",
     2904011: "aoml_apex",
-    4903624: "aoml_apex",
+    # 4903624 excluded from analysis
     4903625: "aoml_apex",
     4903904: "aoml_navis",
     6999992: "aoml_navis",
@@ -127,12 +127,23 @@ def is_missing_value(val):
 # SECTION 2: Architecture & NetCDF Helper Functions
 # ==============================================================================
 
+def safe_rename(from_file, to_file):
+    gc.collect()
+    try:
+        os.replace(from_file, to_file)
+    except OSError:
+        try:
+            shutil.copyfile(from_file, to_file)
+            os.remove(from_file)
+        except Exception:
+            pass
+
+
 def is_broken_sensor_float(WMOfloatid, cycle_num):
     float_str = str(WMOfloatid)
     cycle_num = int(cycle_num)
     return (
-        (float_str == "4903624")
-        | ((float_str == "2904010") & (cycle_num >= 49))
+        ((float_str == "2904010") & (cycle_num >= 49))
         | ((float_str == "2904011") & (cycle_num >= 24))
     )
 
@@ -255,9 +266,10 @@ def get_param_data_mode(bgc_file, iprof, param_base):
     return "R"
 
 
-def write_parameter_data_modes(bgc_file):
+def write_parameter_data_modes(bgc_file, WMOfloatid=None):
     n_param = bgc_file.dimensions["N_PARAM"].size
     n_prof = bgc_file.dimensions["N_PROF"].size
+    skip_doxy = WMOfloatid in DOXY_EXCLUDE_FLOAT_IDS if WMOfloatid is not None else False
 
     pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
     data_mode = bgc_file.variables["DATA_MODE"][:]
@@ -275,6 +287,9 @@ def write_parameter_data_modes(bgc_file):
             ]).strip()
 
             if not p_str or "PH" in p_str or "NITRATE" in p_str:
+                continue
+
+            if skip_doxy and p_str == "DOXY":
                 continue
 
             if p_str == "PRES" or p_str.startswith("DOWN_IRRADIANCE") or p_str.startswith("UP_RADIANCE"):
@@ -503,7 +518,6 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx
         CHLA_AdjustedQC_Array = get_existing_array("CHLA_ADJUSTED_QC", is_char=True)
         CHLA_Adjusted_ERROR_Array = get_existing_array("CHLA_ADJUSTED_ERROR")
 
-        # Fixed multi-element array boolean check bug by passing candidate list
         FLUORESCENCE_CHLA_Adjusted_Array = get_existing_array(["CHLA_FLUORESCENCE_ADJUSTED", "FLUORESCENCE_CHLA_ADJUSTED"])
         FLUORESCENCE_CHLA_AdjustedQC_Array = get_existing_array(["CHLA_FLUORESCENCE_ADJUSTED_QC", "FLUORESCENCE_CHLA_ADJUSTED_QC"], is_char=True)
         FLUORESCENCE_CHLA_Adjusted_ERROR_Array = get_existing_array(["CHLA_FLUORESCENCE_ADJUSTED_ERROR", "FLUORESCENCE_CHLA_ADJUSTED_ERROR"])
@@ -517,7 +531,6 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx
             if matched_row is None:
                 continue
 
-            # Update CHLA only if valid in CSV
             if "CHLA_FINAL" in matched_row and pd.notna(matched_row.get("CHLA_FINAL")):
                 chla_final_val = matched_row.get("CHLA_FINAL")
                 if not is_missing_value(chla_final_val):
@@ -529,7 +542,6 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx
                     if CHLA_Adjusted_ERROR_Array is not None:
                         CHLA_Adjusted_ERROR_Array[i] = np.float32(CHLA_Adjusted_ERROR_est)
 
-            # Update Fluorescence only if valid in CSV
             if fluo_csv_col is not None and pd.notna(matched_row.get(fluo_csv_col)):
                 fluo_csv_val = matched_row.get(fluo_csv_col)
                 if not is_missing_value(fluo_csv_val):
@@ -725,8 +737,9 @@ def write_DOXY_from_csv(ds, float_df, target_cycle, WMOfloatid=None):
             ds.variables["DOXY_ADJUSTED_ERROR"][iprof, :] = DOXY_Adjusted_Error_Array
 
 
-def update_profile_qc_grades(bgc_file):
+def update_profile_qc_grades(bgc_file, WMOfloatid=None):
     n_prof = bgc_file.dimensions["N_PROF"].size
+    skip_doxy = WMOfloatid in DOXY_EXCLUDE_FLOAT_IDS if WMOfloatid is not None else False
 
     for var_name in list(bgc_file.variables.keys()):
         if not var_name.startswith("PROFILE_") or not var_name.endswith("_QC"):
@@ -735,6 +748,9 @@ def update_profile_qc_grades(bgc_file):
             continue
 
         param_base = var_name[8:-3]
+        if skip_doxy and param_base == "DOXY":
+            continue
+
         target_prof = detect_parameter_profile(bgc_file, param_base)
         mode = get_param_data_mode(bgc_file, target_prof, param_base)
 
@@ -875,18 +891,6 @@ def write_history_metadata(bgc_file, iprof_chla, iprof_doxy, WMOfloatid=None):
 
     if "DATE_UPDATE" in bgc_file.variables:
         bgc_file.variables["DATE_UPDATE"][:] = nc.stringtochar(np.array(UTCcurrent, dtype="S14"))
-
-
-def safe_rename(from_file, to_file):
-    gc.collect()
-    try:
-        os.replace(from_file, to_file)
-    except OSError:
-        try:
-            shutil.copyfile(from_file, to_file)
-            os.remove(from_file)
-        except Exception:
-            pass
 
 
 # ==============================================================================
@@ -1964,8 +1968,8 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             iprof_bbp = detect_parameter_profile(ds, "BBP700")
             iprof_doxy = detect_parameter_profile(ds, "DOXY")
 
-            # 1. Update PARAMETER_DATA_MODE and DATA_MODE
-            write_parameter_data_modes(ds)
+            # 1. Update PARAMETER_DATA_MODE and DATA_MODE (DOXY skipped for excluded floats)
+            write_parameter_data_modes(ds, WMOfloatid=WMOfloatid)
 
             # 2. Process calibrations and CSV adjustments (only writing valid entries from CSV)
             write_scientific_calib_chla(ds, WMOfloatid, idx_profile, df_bio)
@@ -1974,16 +1978,20 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             write_DOXY_slope_drift(ds, 0, df_bio, idx_profile, WMOfloatid=WMOfloatid)
             write_DOXY_from_csv(ds, df_bio, idx_profile, WMOfloatid=WMOfloatid)
 
-            # 3. Update PROFILE_<PARAM>_QC based on evaluated levels
-            update_profile_qc_grades(ds)
+            # 3. Update PROFILE_<PARAM>_QC based on evaluated levels (DOXY skipped for excluded floats)
+            update_profile_qc_grades(ds, WMOfloatid=WMOfloatid)
 
             # 4. Metadata and attributes
             write_history_metadata(ds, iprof_chla, iprof_doxy, WMOfloatid=WMOfloatid)
             add_missing_valid_range_attributes(ds)
             remove_forbidden_attributes(ds)
 
+            active_iprofs = [iprof_chla, iprof_bbp]
+            if WMOfloatid not in DOXY_EXCLUDE_FLOAT_IDS:
+                active_iprofs.append(iprof_doxy)
+
             for i in range(ds.dimensions["N_PROF"].size):
-                if i in [iprof_chla, iprof_bbp, iprof_doxy]:
+                if i in active_iprofs:
                     ds.variables["DATA_STATE_INDICATOR"][i, :] = nc.stringtochar(
                         np.array("2C  ", dtype="S4")
                     )
