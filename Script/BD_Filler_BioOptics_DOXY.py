@@ -812,11 +812,11 @@ def remove_forbidden_attributes(bgc_file):
 
 def standardize_missing_data_and_qc(ds):
     """
-    Standardizes missing data across all variables in the final BD NetCDF dataset.
-    1. For any variable ending in '_QC': sets missing, blank (' ', ''), 
-       or fill values to '9' (b'9').
-    2. For numeric data variables (excluding navigation/time/dimensions): 
-       sets NaN, inf, or arbitrary fill indicators to standard -99999.0 (-99999 for int).
+    Standardizes missing data across variables in the final BD NetCDF dataset.
+    1. For level QC variables ending in '_QC' (skipping PROFILE-level letter grades):
+       sets missing, blank (' ', ''), or invalid values to '9'.
+    2. For numeric variables (excluding navigation/time/dimensions):
+       sets NaN, inf, or arbitrary fill indicators to -99999.0 (-99999 for int).
     """
     excluded_vars = {
         "LATITUDE", "LONGITUDE", "JULD", "JULD_LOCATION", 
@@ -827,7 +827,11 @@ def standardize_missing_data_and_qc(ds):
     for v_name in ds.variables.keys():
         var = ds.variables[v_name]
         
-        # Condition 1: QC variables (ending in _QC)
+        # Preserve PROFILE summary grades ('A'-'F') unchanged
+        if v_name.startswith("PROFILE_"):
+            continue
+
+        # Condition 1: Level QC variables (ending in _QC)
         if v_name.endswith("_QC"):
             try:
                 arr = var[:]
@@ -835,17 +839,17 @@ def standardize_missing_data_and_qc(ds):
                     arr = arr.filled(b"9")
                 
                 if arr.dtype.kind in ["S", "U", "O"]:
-                    str_arr = np.array([
-                        x.decode("utf-8", errors="ignore").strip() if isinstance(x, (bytes, np.bytes_)) 
-                        else str(x).strip() for x in arr.flat
-                    ])
-                    # Replace blanks, empty strings, spaces, or non-valid characters with '9'
-                    mask_missing_qc = (str_arr == "") | (str_arr == " ") | (~np.isin(str_arr, list(VALID_QC_CHARS)))
-                    str_arr[mask_missing_qc] = "9"
+                    flat_items = []
+                    for x in arr.flat:
+                        if isinstance(x, (bytes, np.bytes_)):
+                            c = x.decode("utf-8", errors="ignore").strip()
+                        else:
+                            c = str(x).strip()
+                        flat_items.append(c if c in VALID_QC_CHARS else "9")
                     
+                    str_arr = np.array(flat_items)
                     if arr.dtype.kind == "S":
-                        normalized_bytes = np.array([s.encode("utf-8") for s in str_arr]).reshape(arr.shape)
-                        var[:] = normalized_bytes.astype(var.dtype)
+                        var[:] = np.array([s.encode("utf-8") for s in str_arr]).reshape(arr.shape).astype(var.dtype)
                     else:
                         var[:] = str_arr.reshape(arr.shape).astype(var.dtype)
             except Exception:
@@ -862,7 +866,6 @@ def standardize_missing_data_and_qc(ds):
                 if isinstance(arr, np.ma.MaskedArray):
                     arr = arr.filled(MISSING_VAL)
 
-                # Identify NaN, Inf, or legacy positive fill values (99999.0)
                 mask_missing = (
                     np.isnan(arr) 
                     | np.isinf(arr) 
@@ -1135,9 +1138,11 @@ label_qc_color_map = {
     "9 - Missing": "#808080",
 }
 
+# Added '9' and light-grey fallbacks so profile QC marks remain visible
 param_qc_color_map = {
     "A": "#1b7837", "B": "#a6dba0", "C": "#ffffbf",
-    "D": "#fdae61", "E": "#f46d43", "F": "#d73027", " ": "#ffffff"
+    "D": "#fdae61", "E": "#f46d43", "F": "#d73027", 
+    "9": "#808080", " ": "#e0e0e0"
 }
 label_param_qc_color_map = {
     "Grade A (100% Good)": "#1b7837",
@@ -1318,7 +1323,7 @@ def add_param_QC_sp(fig, float_map_inst, PARAM, subplotNum, std_fig_width=1000):
                     profile_flag_QC = str(val).strip()
                     break
 
-        profile_flag_QC_color = param_qc_color_map.get(profile_flag_QC, "#FFFFFF")
+        profile_flag_QC_color = param_qc_color_map.get(profile_flag_QC, "#808080")
         color3_profile_flag_QC.append(profile_flag_QC_color)
 
         possible_pdm_keys = [PARAM]
@@ -1727,6 +1732,7 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
                 has_data = has_valid_measurements(ds, p, p_prof)
                 grade = " "
 
+                # 1. Read existing PROFILE_<PARAM>_QC letter grade
                 qc_var_names = [f"PROFILE_{p}_QC"]
                 if p == "CHLA_FLUORESCENCE":
                     qc_var_names.append("PROFILE_FLUORESCENCE_CHLA_QC")
@@ -1735,20 +1741,24 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
 
                 for qvn in qc_var_names:
                     if qvn in ds.variables:
-                        g_var = ds.variables[qvn]
-                        raw_g_slice = g_var[:]
-                        for candidate_idx in [p_prof, 0]:
-                            if candidate_idx < len(raw_g_slice):
-                                cand = raw_g_slice[candidate_idx]
-                                if isinstance(cand, np.ndarray) and cand.ndim > 0:
-                                    cand = cand[0]
-                                c_str = cand.decode("utf-8", errors="ignore") if isinstance(cand, (bytes, np.bytes_)) else str(cand)
-                                if c_str.strip() != "":
-                                    grade = c_str.strip()
+                        raw_val = ds.variables[qvn][:]
+                        if hasattr(raw_val, "filled"):
+                            raw_val = raw_val.filled(b" ")
+                        
+                        target_indices = [p_prof, 0] if p_prof < len(raw_val) else [0]
+                        for idx_cand in target_indices:
+                            if idx_cand < len(raw_val):
+                                item = raw_val[idx_cand]
+                                while isinstance(item, (np.ndarray, list)) and len(item) > 0:
+                                    item = item[0]
+                                item_str = item.decode("utf-8", errors="ignore").strip() if isinstance(item, (bytes, np.bytes_)) else str(item).strip()
+                                if item_str in ["A", "B", "C", "D", "E", "F"]:
+                                    grade = item_str
                                     break
-                        if grade != " ":
-                            break
+                    if grade != " ":
+                        break
 
+                # 2. If not found or blank, dynamically compute from profile array
                 if grade == " ":
                     adj_qc_name = f"{p}_ADJUSTED_QC"
                     raw_qc_name = "PRES_QC" if p == "PRES" else f"{p}_QC"
