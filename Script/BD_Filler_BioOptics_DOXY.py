@@ -119,6 +119,7 @@ ARGO_VALID_RANGES = {
 }
 
 VALID_QC_CHARS = {"0", "1", "2", "3", "4", "5", "8", "9"}
+VALID_DATA_MODES = {"R", "A", "D"}
 MISSING_VAL = -99999.0
 
 
@@ -243,8 +244,9 @@ def get_param_data_mode(bgc_file, iprof, param_base):
         dm_var = bgc_file.variables.get("DATA_MODE")
         if dm_var is not None:
             m = dm_var[iprof] if dm_var.ndim > 0 else dm_var[:]
-            return m.decode("utf-8").strip() if isinstance(m, (bytes, np.bytes_)) else str(m).strip()
-        return "R"
+            mode_str = m.decode("utf-8").strip() if isinstance(m, (bytes, np.bytes_)) else str(m).strip()
+            return mode_str if mode_str in VALID_DATA_MODES else "-99999"
+        return "-99999"
 
     station_params = bgc_file.variables["STATION_PARAMETERS"][iprof]
     pdm_array = bgc_file.variables["PARAMETER_DATA_MODE"][iprof]
@@ -266,13 +268,15 @@ def get_param_data_mode(bgc_file, iprof, param_base):
 
         if p_str in target_names or any(p_str.startswith(tn) for tn in target_names):
             m_val = pdm_array[j]
-            return m_val.decode("utf-8").strip() if isinstance(m_val, (bytes, np.bytes_)) else str(m_val).strip()
+            mode_str = m_val.decode("utf-8").strip() if isinstance(m_val, (bytes, np.bytes_)) else str(m_val).strip()
+            return mode_str if mode_str in VALID_DATA_MODES else "-99999"
 
     dm_var = bgc_file.variables.get("DATA_MODE")
     if dm_var is not None:
         m = dm_var[iprof] if dm_var.ndim > 0 else dm_var[:]
-        return m.decode("utf-8").strip() if isinstance(m, (bytes, np.bytes_)) else str(m).strip()
-    return "R"
+        mode_str = m.decode("utf-8").strip() if isinstance(m, (bytes, np.bytes_)) else str(m).strip()
+        return mode_str if mode_str in VALID_DATA_MODES else "-99999"
+    return "-99999"
 
 
 def write_parameter_data_modes(bgc_file, WMOfloatid=None):
@@ -813,10 +817,9 @@ def remove_forbidden_attributes(bgc_file):
 def standardize_missing_data_and_qc(ds):
     """
     Standardizes missing data across variables in the final BD NetCDF dataset.
-    1. For level QC variables ending in '_QC' (skipping PROFILE-level letter grades):
-       sets missing, blank (' ', ''), or invalid values to '9'.
-    2. For numeric variables (excluding navigation/time/dimensions):
-       sets NaN, inf, or arbitrary fill indicators to -99999.0 (-99999 for int).
+    1. Skips PROFILE summary grades ('A'-'F') and DATA_MODE variables so they are preserved.
+    2. For level QC variables ending in '_QC': sets missing, blank (' ', ''), or invalid values to '9'.
+    3. For numeric variables: sets NaN, inf, or positive fill indicators (99999.0) to -99999.0 (-99999 for int).
     """
     excluded_vars = {
         "LATITUDE", "LONGITUDE", "JULD", "JULD_LOCATION", 
@@ -829,6 +832,10 @@ def standardize_missing_data_and_qc(ds):
         
         # Preserve PROFILE summary grades ('A'-'F') unchanged
         if v_name.startswith("PROFILE_"):
+            continue
+
+        # Preserve DATA_MODE character indicators ('R', 'A', 'D') unchanged
+        if v_name in ["DATA_MODE", "PARAMETER_DATA_MODE"]:
             continue
 
         # Condition 1: Level QC variables (ending in _QC)
@@ -1115,13 +1122,21 @@ def check_bd_missing_data_mismatches(processed_bd_files, WMOfloatid):
 # SECTION 3: Plotly DMQC Status Plot Generation
 # ==============================================================================
 
-data_type_color_map = {"D": "#647ed5", "A": "#c07ab8", "R": "#ff4d6d"}
+# Added -99999 as grey to represent missing Data Mode in the summary plot
+data_type_color_map = {
+    "D": "#647ed5", 
+    "A": "#c07ab8", 
+    "R": "#ff4d6d", 
+    "-99999": "#808080",
+    " ": "#808080"
+}
 label_data_type_color_map = {
     "Delayed Mode (D)": "#647ed5",
     "Adjusted Mode (A)": "#c07ab8",
     "Real Time Mode (R)": "#ff4d6d",
+    "Missing Mode (-99999)": "#808080",
 }
-data_mode_rank_map = {"R": 1, "A": 2, "D": 3}
+data_mode_rank_map = {"-99999": 0, "R": 1, "A": 2, "D": 3}
 
 position_system_color_map = {"GPS": "#af43f0", "ARGOS": "#00bcd4"}
 position_qc_color_map = {
@@ -1138,7 +1153,7 @@ label_qc_color_map = {
     "9 - Missing": "#808080",
 }
 
-# Added '9' and light-grey fallbacks so profile QC marks remain visible
+# Retained grade letter maps while ensuring missing profile entries show as grey
 param_qc_color_map = {
     "A": "#1b7837", "B": "#a6dba0", "C": "#ffffbf",
     "D": "#fdae61", "E": "#f46d43", "F": "#d73027", 
@@ -1169,8 +1184,11 @@ def add_Data_mode_sp(fig, float_map_inst, std_fig_width=1000):
         y_dataType.append(" ")
         df_sub = float_map_inst["NPROF_NPARAM_df"]
         modes = df_sub[df_sub["N_PROF"] == n_prof]["PARAMETER_DATA_MODE"].tolist()
-        best_mode = min(modes, key=lambda x: data_mode_rank_map.get(x, 99)) if modes else "R"
-        color_dataType.append(data_type_color_map.get(best_mode, "#FFFFFF"))
+        
+        # Rank by best available mode; if none or all missing/unassigned, show -99999 (grey)
+        valid_modes = [m for m in modes if m in ["R", "A", "D"]]
+        best_mode = max(valid_modes, key=lambda x: data_mode_rank_map.get(x, 0)) if valid_modes else "-99999"
+        color_dataType.append(data_type_color_map.get(best_mode, "#808080"))
 
     x_ticks = get_subsample_prof_idx(x_nprof, min(7, len(x_nprof)))
     fig.update_xaxes(
@@ -1332,15 +1350,16 @@ def add_param_QC_sp(fig, float_map_inst, PARAM, subplotNum, std_fig_width=1000):
         elif PARAM in ["PH", "PH_IN_SITU_TOTAL"]:
             possible_pdm_keys.extend(["PH_IN_SITU_TOTAL", "PH"])
 
-        param_data_mode = "R"
+        # Default to -99999 if mode is missing
+        param_data_mode = "-99999"
         for key in possible_pdm_keys:
             if key in float_map_inst["PDM_MAP"] and n_prof in float_map_inst["PDM_MAP"][key]:
                 m = float_map_inst["PDM_MAP"][key][n_prof]
-                if m and str(m).strip() != "":
+                if m and str(m).strip() in VALID_DATA_MODES:
                     param_data_mode = str(m).strip()
                     break
 
-        param_data_mode_color = data_type_color_map.get(param_data_mode, "#FFFFFF")
+        param_data_mode_color = data_type_color_map.get(param_data_mode, "#808080")
         color3_param_data_mode.append(param_data_mode_color)
 
     marker_line_w = max(0.9 * (std_fig_width - 170) / max(len(float_map_inst["NPROF_list"]), 1), 1.0)
@@ -1725,6 +1744,7 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
                 if var_exists:
                     present_params.add(p)
 
+                # Fetch parameter data mode and record -99999 if unassigned/missing
                 mode_val = get_param_data_mode(ds, p_prof, p)
                 pdm_map[p][prof_idx] = mode_val
                 nprof_nparam_records.append({"N_PROF": prof_idx, "PARAMETER_DATA_MODE": mode_val})
@@ -1758,7 +1778,7 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
                     if grade != " ":
                         break
 
-                # 2. If not found or blank, dynamically compute from profile array
+                # 2. If not found or blank, dynamically compute from profile array without changing data mode
                 if grade == " ":
                     adj_qc_name = f"{p}_ADJUSTED_QC"
                     raw_qc_name = "PRES_QC" if p == "PRES" else f"{p}_QC"
