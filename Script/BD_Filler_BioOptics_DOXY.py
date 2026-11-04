@@ -53,6 +53,15 @@ FLOAT_TYPES = {
 WMO_FLOAT_IDS = list(FLOAT_TYPES.keys())
 DOXY_EXCLUDE_FLOAT_IDS = {4903910, 4903911, 7902327, 3902693, 1902800}
 
+# Central storage location for input B-files
+INPUT_STORAGE_DIR = "/data/a1/ARGO_DELAY/DMQC_BGC/lists/a1/ARGO_DELAY/DMQC_BGC/storage/"
+
+# Output destination base directory & dynamic date-stamped folder (MMDDYYYY)
+BASE_OUTPUT_DIR = "/data/a1/ARGO_DELAY/DMQC_BGC/BDfiller/"
+TODAY_FOLDER_STR = dt.now().strftime("%m%d%Y")
+OUTPUT_PLOTS_CSV_DIR = os.path.join(BASE_OUTPUT_DIR, f"BD_Output_Plots_{TODAY_FOLDER_STR}")
+os.makedirs(OUTPUT_PLOTS_CSV_DIR, exist_ok=True)
+
 comment_dmqc_operator_chla = (
     "PRIMARY | https://orcid.org/0000-0003-1297-6599 | Jennifer McWhorter, NOAA/AOML"
 )
@@ -894,6 +903,144 @@ def write_history_metadata(bgc_file, iprof_chla, iprof_doxy, WMOfloatid=None):
 
 
 # ==============================================================================
+# SECTION 2.5: Missing Data & QC Alignment Auditor
+# ==============================================================================
+
+def check_bd_missing_data_mismatches(processed_bd_files, WMOfloatid):
+    """
+    Audits final BD NetCDF files by PRES level per float and cycle.
+    Detects and reports mismatches between:
+      - CHLA and CHLA_ADJUSTED, CHLA_QC and CHLA_ADJUSTED_QC
+      - BBP700 and BBP700_ADJUSTED, BBP700_QC and BBP700_ADJUSTED_QC
+      - DOXY and DOXY_ADJUSTED, DOXY_QC and DOXY_ADJUSTED_QC
+    """
+    pairs_to_check = [
+        ("CHLA", "CHLA_ADJUSTED", "CHLA_QC", "CHLA_ADJUSTED_QC"),
+        ("BBP700", "BBP700_ADJUSTED", "BBP700_QC", "BBP700_ADJUSTED_QC"),
+        ("DOXY", "DOXY_ADJUSTED", "DOXY_QC", "DOXY_ADJUSTED_QC"),
+    ]
+
+    mismatches = []
+
+    def is_qc_missing(qc_char):
+        if qc_char is None or pd.isna(qc_char):
+            return True
+        c = qc_char.decode("utf-8", errors="ignore").strip() if isinstance(qc_char, (bytes, np.bytes_)) else str(qc_char).strip()
+        return c in ["", " ", "9"]
+
+    def decode_qc(qc_val):
+        if isinstance(qc_val, (bytes, np.bytes_)):
+            return qc_val.decode("utf-8", errors="ignore").strip()
+        return str(qc_val).strip()
+
+    for fpath in processed_bd_files:
+        try:
+            ds = nc.Dataset(fpath, "r")
+            cycle_num = int(fpath[-6:-3])
+
+            for raw_var, adj_var, raw_qc_var, adj_qc_var in pairs_to_check:
+                iprof = detect_parameter_profile(ds, raw_var)
+                pres_vals, _ = get_pres_and_qc_for_profile(ds, iprof)
+
+                def get_slice(v_name):
+                    if v_name not in ds.variables:
+                        return None
+                    v = ds.variables[v_name]
+                    arr = v[iprof, :] if v.ndim > 1 else v[:]
+                    if hasattr(arr, "filled"):
+                        arr = arr.filled(MISSING_VAL if arr.dtype.kind in ["f", "i"] else b" ")
+                    return np.array(arr)
+
+                raw_data = get_slice(raw_var)
+                adj_data = get_slice(adj_var)
+                raw_qc_data = get_slice(raw_qc_var)
+                adj_qc_data = get_slice(adj_qc_var)
+
+                if raw_data is None and adj_data is None:
+                    continue
+
+                n_levels = len(pres_vals)
+                for k in range(n_levels):
+                    pres = pres_vals[k]
+                    if is_missing_value(pres):
+                        continue
+
+                    r_val = raw_data[k] if raw_data is not None and k < len(raw_data) else MISSING_VAL
+                    a_val = adj_data[k] if adj_data is not None and k < len(adj_data) else MISSING_VAL
+                    r_qc = raw_qc_data[k] if raw_qc_data is not None and k < len(raw_qc_data) else b" "
+                    a_qc = adj_qc_data[k] if adj_qc_data is not None and k < len(adj_qc_data) else b" "
+
+                    r_val_miss = is_missing_value(r_val)
+                    a_val_miss = is_missing_value(a_val)
+                    r_qc_miss = is_qc_missing(r_qc)
+                    a_qc_miss = is_qc_missing(a_qc)
+
+                    # Check value missingness mismatch
+                    if r_val_miss != a_val_miss:
+                        mismatches.append({
+                            "WMO": WMOfloatid,
+                            "CYCLE": cycle_num,
+                            "PRES": float(pres),
+                            "LEVEL_IDX": k,
+                            "COMPARISON_TYPE": "VALUE",
+                            "PAIR": f"{raw_var} vs {adj_var}",
+                            "RAW_VAL": r_val,
+                            "ADJ_VAL": a_val,
+                            "RAW_IS_MISSING": r_val_miss,
+                            "ADJ_IS_MISSING": a_val_miss,
+                        })
+
+                    # Check QC flag missingness mismatch
+                    if r_qc_miss != a_qc_miss:
+                        mismatches.append({
+                            "WMO": WMOfloatid,
+                            "CYCLE": cycle_num,
+                            "PRES": float(pres),
+                            "LEVEL_IDX": k,
+                            "COMPARISON_TYPE": "QC_FLAG",
+                            "PAIR": f"{raw_qc_var} vs {adj_qc_var}",
+                            "RAW_VAL": decode_qc(r_qc),
+                            "ADJ_VAL": decode_qc(a_qc),
+                            "RAW_IS_MISSING": r_qc_miss,
+                            "ADJ_IS_MISSING": a_qc_miss,
+                        })
+
+            ds.close()
+        except Exception:
+            traceback.print_exc()
+
+    df_mismatches = pd.DataFrame(mismatches)
+
+    print("\n" + "=" * 90)
+    print(f"MISSING DATA / QC AUDIT SUMMARY: FLOAT {WMOfloatid}")
+    print("=" * 90)
+
+    if df_mismatches.empty:
+        print(f"[{WMOfloatid}] All missing value masks and QC flags align consistently across all cycles.")
+    else:
+        print(f"[{WMOfloatid}] Found {len(df_mismatches)} level-by-level mismatches.\n")
+
+        for _, row in df_mismatches.iterrows():
+            print(
+                f"  Float {row['WMO']} | Cycle {row['CYCLE']:03d} | PRES: {row['PRES']:7.1f} dbar (lvl {row['LEVEL_IDX']:03d}) | "
+                f"Type: {row['COMPARISON_TYPE']:<8} | Pair: {row['PAIR']:<28} | "
+                f"Raw: {str(row['RAW_VAL']):<10} (Miss: {row['RAW_IS_MISSING']}) vs "
+                f"Adj: {str(row['ADJ_VAL']):<10} (Miss: {row['ADJ_IS_MISSING']})"
+            )
+
+        print("\n--- Summary Count Table by Cycle and Parameter Pair ---")
+        summary_table = (
+            df_mismatches.groupby(["WMO", "CYCLE", "COMPARISON_TYPE", "PAIR"])
+            .size()
+            .reset_index(name="MISMATCH_COUNT")
+        )
+        print(summary_table.to_string(index=False))
+
+    print("=" * 90 + "\n")
+    return df_mismatches
+
+
+# ==============================================================================
 # SECTION 3: Plotly DMQC Status Plot Generation
 # ==============================================================================
 
@@ -1018,11 +1165,11 @@ def add_positioning_system_sp(fig, float_map_inst, std_fig_width=1000):
     fig.add_trace(
         go.Scatter(
             x=x1_nprof,
-            y=y1_positioning_system,
+            y=y1_position_qc,
             mode="markers",
             marker_symbol="line-ns",
             marker_color=color1_positioning_system,
-            marker_line_color=color1_positioning_system,
+            marker_line_color=color1_position_qc,
             marker_line_width=marker_line_w,
             marker_size=15,
             orientation="h",
@@ -1445,9 +1592,8 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
     if not processed_bd_files:
         return
 
-    plot_out_dir = os.path.join(output_dir, "DMQC_status_plot")
-    os.makedirs(plot_out_dir, exist_ok=True)
-    out_png = os.path.join(plot_out_dir, f"{WMOfloatid}_DMQC_status.png")
+    os.makedirs(output_dir, exist_ok=True)
+    out_png = os.path.join(output_dir, f"{WMOfloatid}_DMQC_status.png")
 
     candidate_params = ["PRES", "TEMP", "PSAL", "DOXY", "BBP700", "CHLA", "PH_IN_SITU_TOTAL", "NITRATE", "CHLA_FLUORESCENCE"]
     present_params = set()
@@ -1532,8 +1678,8 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
                                 if c_str.strip() != "":
                                     grade = c_str.strip()
                                     break
-                    if grade != " ":
-                        break
+                        if grade != " ":
+                            break
 
                 if grade == " ":
                     adj_qc_name = f"{p}_ADJUSTED_QC"
@@ -1870,8 +2016,7 @@ def generate_all_qc_summary_plots(processed_bd_files, WMOfloatid, output_root):
     if not processed_bd_files:
         return
 
-    qc_summary_dir = os.path.join(output_root, "QC_SUMMARIES")
-    os.makedirs(qc_summary_dir, exist_ok=True)
+    os.makedirs(output_root, exist_ok=True)
 
     tasks = [
         ("DOXY", "plasma", r"Oxygen ($\mu$mol/kg)", False),
@@ -1892,7 +2037,7 @@ def generate_all_qc_summary_plots(processed_bd_files, WMOfloatid, output_root):
                 f"{param_base}_QC",
                 f"{param_base} R_mode",
                 f"{param_base}_R_mode",
-                qc_summary_dir,
+                output_root,
                 WMOfloatid,
                 col_palette=palette,
                 unit_str=unit,
@@ -1905,7 +2050,7 @@ def generate_all_qc_summary_plots(processed_bd_files, WMOfloatid, output_root):
                 f"{param_base}_ADJUSTED_QC",
                 f"{param_base} D_mode",
                 f"{param_base}_D_mode",
-                qc_summary_dir,
+                output_root,
                 WMOfloatid,
                 col_palette=palette,
                 unit_str=unit,
@@ -1920,7 +2065,7 @@ def generate_all_qc_summary_plots(processed_bd_files, WMOfloatid, output_root):
 # ==============================================================================
 
 processed_output_paths = []
-script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
+print(f"Master plot and CSV output directory created at: {OUTPUT_PLOTS_CSV_DIR}")
 
 for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
     main_float_dir = f"/data/a1/ARGO_DELAY/DMQC_BGC/data/{WMOfloatid}/"
@@ -1932,24 +2077,33 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
     today_str = dt.now().strftime("%Y-%m-%d")
     final_out_dir = os.path.join(output_lut_dir, today_str)
 
-    if not os.path.exists(bio_dmqc_csv_path) or not os.path.exists(main_float_dir):
+    if not os.path.exists(bio_dmqc_csv_path):
+        print(f"[{WMOfloatid}] CSV calibration file not found: {bio_dmqc_csv_path}. Skipping.")
         continue
 
+    os.makedirs(main_float_dir, exist_ok=True)
     os.makedirs(output_lut_dir, exist_ok=True)
     os.makedirs(final_out_dir, exist_ok=True)
 
     df_bio = pd.read_csv(bio_dmqc_csv_path, low_memory=False)
 
+    # --------------------------------------------------------------------------
+    # Search for input B-files directly in the central storage location
+    # --------------------------------------------------------------------------
     all_bd_files = sorted(
-        glob.glob(os.path.join(main_float_dir, f"BD*{WMOfloatid}_*.nc"))
+        glob.glob(os.path.join(INPUT_STORAGE_DIR, f"BD*{WMOfloatid}_*.nc"))
     )
     all_br_files = sorted(
-        glob.glob(os.path.join(main_float_dir, f"AOML_BR*{WMOfloatid}_*.nc"))
+        glob.glob(os.path.join(INPUT_STORAGE_DIR, f"AOML_BR*{WMOfloatid}_*.nc"))
     )
     if not all_br_files:
         all_br_files = sorted(
-            glob.glob(os.path.join(main_float_dir, f"BR*{WMOfloatid}_*.nc"))
+            glob.glob(os.path.join(INPUT_STORAGE_DIR, f"BR*{WMOfloatid}_*.nc"))
         )
+
+    if not all_bd_files and not all_br_files:
+        print(f"[{WMOfloatid}] No input BD or BR files found in central storage {INPUT_STORAGE_DIR}. Skipping.")
+        continue
 
     sorted_b_files = organize_b_files(all_bd_files, all_br_files)
     new_bd_files = []
@@ -1957,6 +2111,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
     for bgc_filename in sorted_b_files:
         idx_profile = int(bgc_filename[-6:-3])
 
+        # Stage working BD file in the float's directory for processing
         w_bgc_filename = create_working_bd_file(
             bgc_filename, dest_dir=main_float_dir
         )
@@ -2004,7 +2159,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             if "ds" in locals() and ds.isopen():
                 ds.close()
 
-    # Step 5: Finalize output files
+    # Step 5: Finalize output NetCDF files into the float's LUT/<date>/ directory
     final_processed_files = []
     for w_file in new_bd_files:
         path, name = os.path.split(w_file)
@@ -2019,6 +2174,18 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
         processed_output_paths.append(new_path)
         final_processed_files.append(new_path)
 
-    # Step 6: Verification Plotting (reading directly from output BD files)
-    generate_dmqc_status_plot(WMOfloatid, final_processed_files, script_dir)
-    generate_all_qc_summary_plots(final_processed_files, WMOfloatid, script_dir)
+    # --------------------------------------------------------------------------
+    # Step 5.5: Audit Missing Value / QC Alignment & Save CSV to BDfiller folder
+    # --------------------------------------------------------------------------
+    df_missing_mismatches = check_bd_missing_data_mismatches(final_processed_files, WMOfloatid)
+
+    if not df_missing_mismatches.empty:
+        audit_csv = os.path.join(OUTPUT_PLOTS_CSV_DIR, f"{WMOfloatid}_missing_data_mismatches.csv")
+        df_missing_mismatches.to_csv(audit_csv, index=False)
+        print(f"[{WMOfloatid}] Saved missing mismatch audit table to: {audit_csv}")
+
+    # --------------------------------------------------------------------------
+    # Step 6: Verification Plotting (Directing all plots to BDfiller folder)
+    # --------------------------------------------------------------------------
+    generate_dmqc_status_plot(WMOfloatid, final_processed_files, OUTPUT_PLOTS_CSV_DIR)
+    generate_all_qc_summary_plots(final_processed_files, WMOfloatid, OUTPUT_PLOTS_CSV_DIR)
