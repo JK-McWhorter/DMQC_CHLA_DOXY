@@ -810,6 +810,74 @@ def remove_forbidden_attributes(bgc_file):
                     var.delncattr(attr)
 
 
+def standardize_missing_data_and_qc(ds):
+    """
+    Standardizes missing data across all variables in the final BD NetCDF dataset.
+    1. For any variable ending in '_QC': sets missing, blank (' ', ''), 
+       or fill values to '9' (b'9').
+    2. For numeric data variables (excluding navigation/time/dimensions): 
+       sets NaN, inf, or arbitrary fill indicators to standard -99999.0 (-99999 for int).
+    """
+    excluded_vars = {
+        "LATITUDE", "LONGITUDE", "JULD", "JULD_LOCATION", 
+        "PRES", "PRES_ADJUSTED", "CYCLE_NUMBER", "CONFIG_MISSION_NUMBER",
+        "STATION_PARAMETERS", "DATA_MODE", "PARAMETER_DATA_MODE"
+    }
+
+    for v_name in ds.variables.keys():
+        var = ds.variables[v_name]
+        
+        # Condition 1: QC variables (ending in _QC)
+        if v_name.endswith("_QC"):
+            try:
+                arr = var[:]
+                if isinstance(arr, np.ma.MaskedArray):
+                    arr = arr.filled(b"9")
+                
+                if arr.dtype.kind in ["S", "U", "O"]:
+                    str_arr = np.array([
+                        x.decode("utf-8", errors="ignore").strip() if isinstance(x, (bytes, np.bytes_)) 
+                        else str(x).strip() for x in arr.flat
+                    ])
+                    # Replace blanks, empty strings, spaces, or non-valid characters with '9'
+                    mask_missing_qc = (str_arr == "") | (str_arr == " ") | (~np.isin(str_arr, list(VALID_QC_CHARS)))
+                    str_arr[mask_missing_qc] = "9"
+                    
+                    if arr.dtype.kind == "S":
+                        normalized_bytes = np.array([s.encode("utf-8") for s in str_arr]).reshape(arr.shape)
+                        var[:] = normalized_bytes.astype(var.dtype)
+                    else:
+                        var[:] = str_arr.reshape(arr.shape).astype(var.dtype)
+            except Exception:
+                pass
+            continue
+
+        # Condition 2: Numeric variables not in excluded list
+        if v_name in excluded_vars:
+            continue
+
+        if var.dtype.kind in ["f", "i", "u"]:
+            try:
+                arr = var[:]
+                if isinstance(arr, np.ma.MaskedArray):
+                    arr = arr.filled(MISSING_VAL)
+
+                # Identify NaN, Inf, or legacy positive fill values (99999.0)
+                mask_missing = (
+                    np.isnan(arr) 
+                    | np.isinf(arr) 
+                    | (arr == 99999.0) 
+                    | (arr == -99999.0)
+                )
+
+                if np.any(mask_missing):
+                    fill_to_apply = np.float32(-99999.0) if var.dtype.kind == "f" else int(-99999)
+                    arr[mask_missing] = fill_to_apply
+                    var[:] = arr
+            except Exception:
+                pass
+
+
 def create_working_bd_file(filename, dest_dir=None):
     path, name = os.path.split(filename)
     bd_name = re.sub(r"^(AOML_)?BR", "BD", name)
@@ -2150,6 +2218,11 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                     ds.variables["DATA_STATE_INDICATOR"][i, :] = nc.stringtochar(
                         np.array("2C  ", dtype="S4")
                     )
+
+            # ------------------------------------------------------------------
+            # 4.5. Standardize all missing data to -99999 and QC flags to '9'
+            # ------------------------------------------------------------------
+            standardize_missing_data_and_qc(ds)
 
             ds.close()
             new_bd_files.append(w_bgc_filename)
