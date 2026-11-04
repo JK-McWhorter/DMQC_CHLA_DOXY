@@ -657,11 +657,14 @@ for (woko in float_ids) {
   # reading between 900–1000m across 5 separate cycles, and taking the median as the true dark offset.
   
   # Filter raw fluorescence to realistic limits (-0.2 to 100)
+  # Filter raw fluorescence to realistic limits (-0.2 to 100)
   float_data$FLUO_CHLA_RANGE <- ifelse(
     !is.na(float_data$FLUO_CHLA) & 
-      !(float_data$FLUO_CHLA %in% c(-99999, 99999, -99999.0, 99999.0)) & 
-      float_data$FLUO_CHLA >= -0.2 & 
-      float_data$FLUO_CHLA <= 100,
+      !(float_data$FLUO_CHLA %in% c(-99999, 99999, -99999.0, 99999.0)) &
+      float_data$FLUO_CHLA >= 0 & 
+      float_data$FLUO_CHLA <= 4095,
+    #float_data$FLUO_CHLA >= -0.2 & 
+    #float_data$FLUO_CHLA <= 100,
     float_data$FLUO_CHLA,
     NA_real_
   )
