@@ -1,7 +1,7 @@
 ### =========================================================================
 ### BGC-Argo CHLA, BBP700 & DOXY Corrections DMQC Pipeline
 ### Integrated DMQC processing with strict missing data (-99999 / QC 9) rules
-### Replicating Python BD Plotting, Interpolation, & Mismatch Auditing
+### Replicating Python Matplotlib/Griddata QC Summary Layout, Grids & Audits
 ### =========================================================================
 
 # =========================================================================
@@ -48,7 +48,7 @@ standardize_missing_qc <- function(qc) {
   return(qc_chr)
 }
 
-# Replicating Python's check_bd_missing_data_mismatches()
+# Mirrors Python's check_bd_missing_data_mismatches()
 audit_missing_mismatches <- function(df_export, float_wmo, output_dir) {
   pairs_to_check <- list(
     list(raw = "CHLA", adj = "CHLA_FINAL", raw_qc = "CHLA_QC", adj_qc = "CHLA_FINAL_QC"),
@@ -80,7 +80,6 @@ audit_missing_mismatches <- function(df_export, float_wmo, output_dir) {
       r_qc_miss  <- sapply(raw_qcs, is_qc_missing)
       a_qc_miss  <- sapply(adj_qcs, is_qc_missing)
       
-      # 1. Numerical missingness mismatch
       val_diff_idx <- which(r_val_miss != a_val_miss)
       if (length(val_diff_idx) > 0) {
         for (idx in val_diff_idx) {
@@ -88,6 +87,7 @@ audit_missing_mismatches <- function(df_export, float_wmo, output_dir) {
             WMO             = as.character(float_wmo),
             CYCLE           = df_export$CYCLE_NUMBER[idx],
             PRES            = df_export$PRES[idx],
+            LEVEL_IDX       = idx,
             COMPARISON_TYPE = "VALUE",
             PAIR            = paste(pair$raw, "vs", pair$adj),
             RAW_VAL         = as.character(raw_vals[idx]),
@@ -99,7 +99,6 @@ audit_missing_mismatches <- function(df_export, float_wmo, output_dir) {
         }
       }
       
-      # 2. QC flag missingness mismatch
       qc_diff_idx <- which(r_qc_miss != a_qc_miss)
       if (length(qc_diff_idx) > 0) {
         for (idx in qc_diff_idx) {
@@ -107,6 +106,7 @@ audit_missing_mismatches <- function(df_export, float_wmo, output_dir) {
             WMO             = as.character(float_wmo),
             CYCLE           = df_export$CYCLE_NUMBER[idx],
             PRES            = df_export$PRES[idx],
+            LEVEL_IDX       = idx,
             COMPARISON_TYPE = "QC_FLAG",
             PAIR            = paste(pair$raw_qc, "vs", pair$adj_qc),
             RAW_VAL         = as.character(raw_qcs[idx]),
@@ -129,8 +129,7 @@ audit_missing_mismatches <- function(df_export, float_wmo, output_dir) {
   if (nrow(df_mismatches) == 0) {
     cat(sprintf("[%s] All missing value masks and QC flags align consistently across all cycles.\n", float_wmo))
   } else {
-    cat(sprintf("[%s] Found %d level-by-level mismatches between raw and adjusted/final data.\n\n", 
-                float_wmo, nrow(df_mismatches)))
+    cat(sprintf("[%s] Found %d level-by-level mismatches.\n\n", float_wmo, nrow(df_mismatches)))
     
     summary_table <- df_mismatches %>%
       group_by(WMO, CYCLE, COMPARISON_TYPE, PAIR) %>%
@@ -228,7 +227,7 @@ write_DOXY_adjusted_error <- function(nc, profile_idx, err_mbar, psal, temp, pre
   return(DOXY_adj_error_umol_kg)
 }
 
-# Matching Python's QC_COLOR_MAP
+# Python-identical QC_COLOR_MAP: Flag 9 is black (#000000)
 qc_color_scale <- c(
   "0" = "#b3b3b3",
   "1" = "#33A02C",
@@ -919,9 +918,13 @@ for (woko in float_ids) {
     }
   }
   
+  # Suppress coercion warnings when non-numeric edge elements are standardized
   df_combo_export <- df_combo_export %>%
     mutate(
-      across(all_of(val_cols), ~ ifelse(is_argo_missing_val(.), -99999.0, as.numeric(.)))
+      across(all_of(val_cols), ~ {
+        num_val <- suppressWarnings(as.numeric(as.character(.)))
+        ifelse(is_argo_missing_val(num_val), -99999.0, num_val)
+      })
     )
   
   write.csv(df_combo_export, combo_output_path, row.names = FALSE)
@@ -933,7 +936,7 @@ for (woko in float_ids) {
   audit_missing_mismatches(df_combo_export, active_wmo, dir_qc_summary)
   
   # ==============================================================================
-  # STEP 7: SECTION CONTOUR & QC SUMMARY PLOTS (MATCHING PYTHON IMPLEMENTATION)
+  # STEP 7: SECTION CONTOUR & QC SUMMARY PLOTS (MATCHING PYTHON SCIPY/MATPLOTLIB)
   # ==============================================================================
   df_summary_base <- df_combo_export %>%
     mutate(
@@ -941,6 +944,7 @@ for (woko in float_ids) {
       PRES         = as.numeric(PRES)
     )
   
+  # Matrix-safe interpolation replicating Python scipy.interpolate.griddata(linear + nearest fill)
   create_interpolated_grid_r <- function(clean_df, val_col, grid_nx = 100, grid_ny = 100) {
     if (is.null(clean_df) || nrow(clean_df) < 5) return(NULL)
     if (!val_col %in% names(clean_df)) return(NULL)
@@ -952,23 +956,31 @@ for (woko in float_ids) {
         !is_argo_missing_val(.data[[val_col]])
       )
     
-    if (nrow(sub_df) < 5 ||
-        length(unique(sub_df$CYCLE_NUMBER)) < 3 ||
-        length(unique(sub_df$PRES)) < 3) {
+    grouped <- sub_df %>%
+      group_by(CYCLE_NUMBER, PRES) %>%
+      summarise(z_val = mean(.data[[val_col]], na.rm = TRUE), .groups = "drop")
+    
+    if (nrow(grouped) < 5 ||
+        n_distinct(grouped$CYCLE_NUMBER) < 2 ||
+        n_distinct(grouped$PRES) < 2) {
       return(NULL)
     }
     
-    val_range <- range(sub_df[[val_col]], na.rm = TRUE)
+    val_range <- range(grouped$z_val, na.rm = TRUE)
     if (!all(is.finite(val_range)) || diff(val_range) == 0) return(NULL)
     
-    interp_res <- tryCatch({
+    xo_seq <- seq(min(grouped$CYCLE_NUMBER), max(grouped$CYCLE_NUMBER), length.out = grid_nx)
+    yo_seq <- seq(min(grouped$PRES), max(grouped$PRES), length.out = grid_ny)
+    
+    # 1. Linear interpolation via interp::interp
+    interp_lin <- tryCatch({
       suppressWarnings(
         interp::interp(
-          x = sub_df$CYCLE_NUMBER,
-          y = sub_df$PRES,
-          z = sub_df[[val_col]],
-          xo = seq(min(sub_df$CYCLE_NUMBER), max(sub_df$CYCLE_NUMBER), length.out = grid_nx),
-          yo = seq(min(sub_df$PRES), max(sub_df$PRES), length.out = grid_ny),
+          x = grouped$CYCLE_NUMBER,
+          y = grouped$PRES,
+          z = grouped$z_val,
+          xo = xo_seq,
+          yo = yo_seq,
           linear = TRUE,
           extrap = FALSE,
           duplicate = "mean"
@@ -976,24 +988,46 @@ for (woko in float_ids) {
       )
     }, error = function(e) NULL)
     
-    if (is.null(interp_res) || is.null(interp_res$z) || !is.matrix(interp_res$z)) {
+    if (is.null(interp_lin) || is.null(interp_lin$z) || !is.matrix(interp_lin$z)) {
       return(NULL)
     }
     
-    z_vector <- as.vector(interp_res$z)
-    grid_df  <- expand.grid(x = interp_res$x, y = interp_res$y)
+    z_mat <- interp_lin$z
     
-    if (length(z_vector) != nrow(grid_df)) {
-      return(NULL)
+    # 2. Nearest-neighbor fallback for NA cells (matching SciPy griddata 'nearest')
+    if (any(is.na(z_mat))) {
+      na_coords <- which(is.na(z_mat), arr.ind = TRUE)
+      
+      c_scale <- diff(range(xo_seq))
+      p_scale <- diff(range(yo_seq))
+      if (c_scale == 0) c_scale <- 1
+      if (p_scale == 0) p_scale <- 1
+      
+      norm_obs_x <- grouped$CYCLE_NUMBER / c_scale
+      norm_obs_y <- grouped$PRES / p_scale
+      
+      for (idx in seq_len(nrow(na_coords))) {
+        r <- na_coords[idx, 1]
+        c <- na_coords[idx, 2]
+        
+        pt_x <- xo_seq[r] / c_scale
+        pt_y <- yo_seq[c] / p_scale
+        
+        dist_sq <- (norm_obs_x - pt_x)^2 + (norm_obs_y - pt_y)^2
+        nearest_idx <- which.min(dist_sq)
+        z_mat[r, c] <- grouped$z_val[nearest_idx]
+      }
     }
     
-    grid_df$z <- z_vector
-    grid_df <- grid_df %>% filter(!is.na(z) & is.finite(z) & !is_argo_missing_val(z))
+    grid_df <- expand.grid(x = xo_seq, y = yo_seq)
+    grid_df$z <- as.vector(z_mat)
+    grid_df <- grid_df %>% filter(!is.na(z) & is.finite(z))
+    
     if (nrow(grid_df) == 0) return(NULL)
-    
     return(grid_df)
   }
   
+  # Generates upper/lower section plot matching Python matplotlib styling exactly
   generate_section_qc_plot <- function(df_base, var_name, qc_var_name, title_prefix, file_suffix, 
                                        col_palette = "viridis", unit_expr = "", is_chla = FALSE) {
     if (!var_name %in% names(df_base)) return(NULL)
@@ -1022,13 +1056,13 @@ for (woko in float_ids) {
     
     pres_all <- df_plot$PRES[!is_argo_missing_val(df_plot$PRES)]
     max_pres <- if (length(pres_all) > 0) max(pres_all, na.rm = TRUE) else 2000.0
-    min_pres <- if (length(pres_all) > 0) min(pres_all, na.rm = TRUE) else 0.0
     if (is.na(max_pres) || max_pres <= 0) max_pres <- 2000.0
-    if (is.na(min_pres) || min_pres < 0) min_pres <- 0.0
     
     grid_df <- if (nrow(df_valid) > 0) create_interpolated_grid_r(df_valid, var_name) else NULL
     
-    # --- Upper Plot (Data Section) ---
+    # --------------------------------------------------------------------------
+    # Upper Plot: Interpolated Contour + Faded Grey 'x' Missing Overlay
+    # --------------------------------------------------------------------------
     p_data <- ggplot()
     
     if (!is.null(grid_df)) {
@@ -1045,22 +1079,20 @@ for (woko in float_ids) {
     } else if (nrow(df_valid) > 0) {
       p_data <- p_data + 
         geom_point(data = df_valid, aes(x = CYCLE_NUMBER, y = PRES, color = !!sym(var_name)), 
-                   size = 0.8, alpha = 0.85) +
+                   size = 1.2, alpha = 0.8) +
         scale_color_viridis_c(option = col_palette, name = unit_expr)
     }
     
-    # Missing points highlighted with dual-layer cross
+    # Python-exact missing data overlay: marker='x', c='#7f7f7f', s=12, alpha=0.35, linewidths=0.7
     if (nrow(df_missing) > 0) {
       p_data <- p_data + 
-        geom_point(data = df_missing, aes(x = CYCLE_NUMBER, y = PRES), 
-                   shape = 4, color = "#ff4d4d", size = 1.3, stroke = 0.3, alpha = 0.4) +
         geom_point(data = df_missing, aes(x = CYCLE_NUMBER, y = PRES, shape = "Missing Data (-99999)"), 
-                   color = "#111111", size = 1.0, stroke = 0.6, alpha = 0.85) +
+                   color = "#7f7f7f", size = 1.2, stroke = 0.6, alpha = 0.35) +
         scale_shape_manual(name = "", values = c("Missing Data (-99999)" = 4))
     }
     
     p_data <- p_data + 
-      scale_y_reverse(limits = c(max_pres, min_pres)) +
+      scale_y_reverse(limits = c(max_pres, 0), expand = c(0, 0)) +
       labs(
         title = paste0("Float ", float_id, " - ", title_prefix, " Section Profile"),
         x = NULL,
@@ -1069,39 +1101,32 @@ for (woko in float_ids) {
       theme_bw(base_size = 11) +
       theme(
         plot.title = element_text(face = "bold", size = 12),
-        panel.grid.major = element_line(linetype = "dashed", color = "grey80"),
+        panel.grid.major = element_line(linetype = "dashed", color = "grey80", linewidth = 0.4),
         panel.grid.minor = element_blank(),
         legend.position = "right"
       )
     
-    # --- Lower Plot (QC Flag Map with Controlled Z-Ordering) ---
+    # --------------------------------------------------------------------------
+    # Lower Plot: QC Flags Scatter Map (Flag 9 shown as Black Dots #000000)
+    # --------------------------------------------------------------------------
     df_qc_plot <- df_plot %>% 
-      filter(!is_argo_missing_val(PRES) & !is_argo_missing_val(CYCLE_NUMBER)) %>%
-      # Sort Flag 9 to bottom so valid flags (1, 2, 3, 4, 5, 8) render on top
-      arrange(desc(QC_VAL == "9"))
+      filter(!is_argo_missing_val(PRES) & !is_argo_missing_val(CYCLE_NUMBER))
     
-    active_qcs <- sort(unique(df_qc_plot$QC_VAL))
-    
-    df_qc_9     <- df_qc_plot %>% filter(QC_VAL == "9")
-    df_qc_non_9 <- df_qc_plot %>% filter(QC_VAL != "9")
+    u_qcs <- unique(df_qc_plot$QC_VAL)
+    unique_qcs <- u_qcs[order(ifelse(grepl("^[0-9]+$", u_qcs), as.numeric(u_qcs), 99))]
     
     p_qc <- ggplot()
     
-    if (nrow(df_qc_9) > 0) {
+    for (q_flag in unique_qcs) {
+      sub_df <- df_qc_plot %>% filter(QC_VAL == q_flag)
       p_qc <- p_qc + 
-        geom_point(data = df_qc_9, aes(x = CYCLE_NUMBER, y = PRES, color = "9"),
-                   shape = 21, fill = "#ffffff", color = "#444444", size = 0.8, stroke = 0.4, alpha = 0.6)
-    }
-    
-    if (nrow(df_qc_non_9) > 0) {
-      p_qc <- p_qc + 
-        geom_point(data = df_qc_non_9, aes(x = CYCLE_NUMBER, y = PRES, color = QC_VAL),
-                   shape = 16, size = 1.1, alpha = 0.9)
+        geom_point(data = sub_df, aes(x = CYCLE_NUMBER, y = PRES, color = QC_VAL), 
+                   size = 1.2, alpha = 0.7, shape = 16)
     }
     
     p_qc <- p_qc + 
-      scale_y_reverse(limits = c(max_pres, min_pres)) +
-      scale_color_manual(values = qc_color_scale, limits = active_qcs, name = "QC Flag") +
+      scale_y_reverse(limits = c(max_pres, 0), expand = c(0, 0)) +
+      scale_color_manual(values = qc_color_scale, limits = unique_qcs, name = "QC Flag") +
       labs(
         title = paste0(title_prefix, " QC Flags Section Map"),
         x = "Cycle Number",
@@ -1110,23 +1135,17 @@ for (woko in float_ids) {
       theme_bw(base_size = 11) +
       theme(
         plot.title = element_text(face = "bold", size = 12),
-        panel.grid.major = element_line(linetype = "dashed", color = "grey80"),
+        panel.grid.major = element_line(linetype = "dashed", color = "grey80", linewidth = 0.4),
         panel.grid.minor = element_blank(),
         legend.position = "right"
       ) +
       guides(
         color = guide_legend(
-          override.aes = list(
-            shape = ifelse(active_qcs == "9", 21, 16),
-            fill  = ifelse(active_qcs == "9", "#ffffff", qc_color_scale[active_qcs]),
-            color = ifelse(active_qcs == "9", "#444444", qc_color_scale[active_qcs]),
-            size  = 3.5,
-            stroke = 0.8,
-            alpha = 1
-          )
+          override.aes = list(size = 3.5, alpha = 1)
         )
       )
     
+    # Combined 2-panel vertical plot with shared X axis (heights 1:1)
     p_combined <- (p_data / p_qc) + 
       plot_layout(heights = c(1, 1), guides = "keep") +
       plot_annotation(
@@ -1140,18 +1159,26 @@ for (woko in float_ids) {
     message(sprintf("[%s] Saved QC Section Summary Plot -> %s", active_wmo, out_file))
   }
   
-  # Section Summary Plots
-  generate_section_qc_plot(df_summary_base, "DOXY", "DOXY_QC", "DOXY R_mode", "DOXY_R_mode", col_palette = "plasma", unit_expr = expression(Oxygen ~ (mu * "mol/kg")))
-  generate_section_qc_plot(df_summary_base, "DOXY_FINAL", "DOXY_FINAL_QC", "DOXY D_mode", "DOXY_D_mode", col_palette = "plasma", unit_expr = expression(Oxygen ~ (mu * "mol/kg")))
+  # Section Summary Plots Matching Python
+  generate_section_qc_plot(df_summary_base, "DOXY", "DOXY_QC", "DOXY R_mode", "DOXY_R_mode", 
+                           col_palette = "plasma", unit_expr = expression(Oxygen ~ (mu * "mol/kg")))
+  generate_section_qc_plot(df_summary_base, "DOXY_FINAL", "DOXY_FINAL_QC", "DOXY D_mode", "DOXY_D_mode", 
+                           col_palette = "plasma", unit_expr = expression(Oxygen ~ (mu * "mol/kg")))
   
-  generate_section_qc_plot(df_summary_base, "BBP700", "BBP700_QC", "BBP700 R_mode", "BBP700_R_mode", col_palette = "turbo", unit_expr = expression(b[bp](700) ~ (m^{-1})))
-  generate_section_qc_plot(df_summary_base, "BBP700_FINAL", "BBP700_FINAL_QC", "BBP700 D_mode", "BBP700_D_mode", col_palette = "turbo", unit_expr = expression(b[bp](700) ~ (m^{-1})))
+  generate_section_qc_plot(df_summary_base, "BBP700", "BBP700_QC", "BBP700 R_mode", "BBP700_R_mode", 
+                           col_palette = "turbo", unit_expr = expression(b[bp](700) ~ (m^{-1})))
+  generate_section_qc_plot(df_summary_base, "BBP700_FINAL", "BBP700_FINAL_QC", "BBP700 D_mode", "BBP700_D_mode", 
+                           col_palette = "turbo", unit_expr = expression(b[bp](700) ~ (m^{-1})))
   
-  generate_section_qc_plot(df_summary_base, "CHLA", "CHLA_QC", "CHLA R_mode", "CHLA_R_mode", col_palette = "turbo", unit_expr = expression(Chlorophyll ~ a ~ (mg/m^3)), is_chla = TRUE)
-  generate_section_qc_plot(df_summary_base, "CHLA_FINAL", "CHLA_FINAL_QC", "CHLA D_mode", "CHLA_D_mode", col_palette = "turbo", unit_expr = expression(Chlorophyll ~ a ~ (mg/m^3)), is_chla = TRUE)
+  generate_section_qc_plot(df_summary_base, "CHLA", "CHLA_QC", "CHLA R_mode", "CHLA_R_mode", 
+                           col_palette = "turbo", unit_expr = expression(Chlorophyll ~ a ~ (mg/m^3)), is_chla = TRUE)
+  generate_section_qc_plot(df_summary_base, "CHLA_FINAL", "CHLA_FINAL_QC", "CHLA D_mode", "CHLA_D_mode", 
+                           col_palette = "turbo", unit_expr = expression(Chlorophyll ~ a ~ (mg/m^3)), is_chla = TRUE)
   
-  generate_section_qc_plot(df_summary_base, "CHLA_FLUORESCENCE", "CHLA_FLUORESCENCE_QC", "CHLA_FLUORESCENCE R_mode", "CHLA_FLUORESCENCE_R_mode", col_palette = "mako", unit_expr = "Fluorescence (RU)")
-  generate_section_qc_plot(df_summary_base, "CHLA_FLUORESCENCE_ADJUSTED", "CHLA_FLUORESCENCE_ADJUSTED_QC", "CHLA_FLUORESCENCE D_mode", "CHLA_FLUORESCENCE_D_mode", col_palette = "mako", unit_expr = "Fluorescence (RU)")
+  generate_section_qc_plot(df_summary_base, "CHLA_FLUORESCENCE", "CHLA_FLUORESCENCE_QC", "CHLA_FLUORESCENCE R_mode", "CHLA_FLUORESCENCE_R_mode", 
+                           col_palette = "mako", unit_expr = "Fluorescence (RU)")
+  generate_section_qc_plot(df_summary_base, "CHLA_FLUORESCENCE_ADJUSTED", "CHLA_FLUORESCENCE_ADJUSTED_QC", "CHLA_FLUORESCENCE D_mode", "CHLA_FLUORESCENCE_D_mode", 
+                           col_palette = "mako", unit_expr = "Fluorescence (RU)")
   
   message("\n=== COMPLETE DMQC PROCESSING FOR FLOAT: ", float_id, " ===")
 }
