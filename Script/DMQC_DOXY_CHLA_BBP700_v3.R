@@ -1,11 +1,12 @@
 ### =========================================================================
 ### BGC-Argo CHLA, BBP700 & DOXY Corrections DMQC Pipeline
-### Integrated DMQC processing with strict missing data (-99999 / QC 9) rules
-### Replicating Python Matplotlib/Griddata QC Summary Layout, Grids & Audits
+### Integrated Multi-Mode Processing: R-mode, A-mode & D-mode Preservation
+### QC Summary Layout & Missing Data Visualization Exactly Matching Python
+### Filtering Depth Levels Consistently Missing Across All BGC Parameters
 ### =========================================================================
 
 # =========================================================================
-# 1. ENVIRONMENT CLEANUP & PACKAGE INITIALIZATION
+# 1. ENVIRONMENT CLEANUP, PACKAGE INITIALIZATION & BUG HOTPATCH
 # =========================================================================
 
 cat("\014")
@@ -14,7 +15,7 @@ rm(list = ls())
 required_pkgs <- c("dplyr", "ggplot2", "lubridate", "gridExtra", "tidyverse", 
                    "ggeffects", "mapdata", "suncalc", "ncdf4", "oce", "terra", 
                    "sf", "stars", "gstat", "rnaturalearth", "rnaturalearthdata", 
-                   "viridis", "knitr", "patchwork", "stringr", "interp")
+                   "viridis", "knitr", "patchwork", "stringr", "interp", "scales")
 
 for (pkg in required_pkgs) {
   if (!require(pkg, character.only = TRUE)) {
@@ -23,8 +24,22 @@ for (pkg in required_pkgs) {
   }
 }
 
+# -------------------------------------------------------------------------
+# HOTPATCH: Fixes ggplot2 3.5.0 bug with scales >= 1.3.0 in stat_contour_filled
+# -------------------------------------------------------------------------
+safe_zero_range <- function(x, tol = 1000 * .Machine$double.eps) {
+  if (is.null(x) || length(x) == 0) return(TRUE)
+  if (length(x) > 2) x <- range(x, na.rm = TRUE)
+  if (length(x) == 1) return(TRUE)
+  if (anyNA(x)) return(NA)
+  abs(x[1] - x[2]) < tol
+}
+
+try(assignInNamespace("zero_range", safe_zero_range, ns = "scales"), silent = TRUE)
+try(assignInNamespace("zero_range", safe_zero_range, ns = "ggplot2"), silent = TRUE)
+
 # =========================================================================
-# 2. HELPER FUNCTIONS FOR MISSING VALUE & QC CONSISTENCY
+# 2. HELPER FUNCTIONS FOR MISSING VALUES, QC & CONSISTENCY AUDITING
 # =========================================================================
 
 is_argo_missing_val <- function(x) {
@@ -48,18 +63,17 @@ standardize_missing_qc <- function(qc) {
   return(qc_chr)
 }
 
-# Mirrors Python's check_bd_missing_data_mismatches()
+safe_max <- function(x) {
+  x_clean <- x[!is.na(x) & is.finite(x) & !is_argo_missing_val(x)]
+  if (length(x_clean) > 0) max(x_clean) else NA_real_
+}
+
+safe_min <- function(x) {
+  x_clean <- x[!is.na(x) & is.finite(x) & !is_argo_missing_val(x)]
+  if (length(x_clean) > 0) min(x_clean) else NA_real_
+}
+
 audit_missing_mismatches <- function(df_export, float_wmo, output_dir) {
-  pairs_to_check <- list(
-    list(raw = "CHLA", adj = "CHLA_FINAL", raw_qc = "CHLA_QC", adj_qc = "CHLA_FINAL_QC"),
-    list(raw = "BBP700", adj = "BBP700_FINAL", raw_qc = "BBP700_QC", adj_qc = "BBP700_FINAL_QC"),
-    list(raw = "DOXY", adj = "DOXY_FINAL", raw_qc = "DOXY_QC", adj_qc = "DOXY_FINAL_QC"),
-    list(raw = "CHLA_FLUORESCENCE", adj = "CHLA_FLUORESCENCE_ADJUSTED", 
-         raw_qc = "CHLA_FLUORESCENCE_QC", adj_qc = "CHLA_FLUORESCENCE_ADJUSTED_QC")
-  )
-  
-  mismatches <- list()
-  
   is_qc_missing <- function(qc_val) {
     if (is.na(qc_val) || qc_val == "" || qc_val == " ") return(TRUE)
     qc_str <- as.character(qc_val)
@@ -68,19 +82,70 @@ audit_missing_mismatches <- function(df_export, float_wmo, output_dir) {
     return(match_res == "9")
   }
   
-  for (pair in pairs_to_check) {
-    if (all(c(pair$raw, pair$adj, pair$raw_qc, pair$adj_qc) %in% names(df_export))) {
-      raw_vals <- df_export[[pair$raw]]
-      adj_vals <- df_export[[pair$adj]]
-      raw_qcs  <- df_export[[pair$raw_qc]]
-      adj_qcs  <- df_export[[pair$adj_qc]]
+  mismatches <- list()
+  
+  var_stems <- c("DOXY", "DOXY_ADJUSTED", "DOXY_FINAL",
+                 "CHLA", "CHLA_ADJUSTED", "CHLA_FINAL",
+                 "BBP700", "BBP700_ADJUSTED", "BBP700_FINAL",
+                 "CHLA_FLUORESCENCE", "CHLA_FLUORESCENCE_FINAL")
+  
+  for (stem in var_stems) {
+    qc_name <- paste0(stem, "_QC")
+    if (all(c(stem, qc_name) %in% names(df_export))) {
+      vals <- df_export[[stem]]
+      qcs  <- df_export[[qc_name]]
+      val_is_miss <- is_argo_missing_val(vals)
+      qc_is_miss  <- sapply(qcs, is_qc_missing)
       
-      r_val_miss <- is_argo_missing_val(raw_vals)
-      a_val_miss <- is_argo_missing_val(adj_vals)
-      r_qc_miss  <- sapply(raw_qcs, is_qc_missing)
-      a_qc_miss  <- sapply(adj_qcs, is_qc_missing)
+      bad_idx <- which(val_is_miss != qc_is_miss)
+      if (length(bad_idx) > 0) {
+        for (idx in bad_idx) {
+          mismatches[[length(mismatches) + 1]] <- data.frame(
+            WMO             = as.character(float_wmo),
+            CYCLE           = df_export$CYCLE_NUMBER[idx],
+            PRES            = df_export$PRES[idx],
+            LEVEL_IDX       = idx,
+            AUDIT_CATEGORY  = "INTERNAL_VALUE_VS_QC",
+            PAIR_OR_VAR     = paste(stem, "vs", qc_name),
+            DESCRIPTION     = if (val_is_miss[idx]) "Value is Missing (-99999/NA) but QC is NOT 9" else "QC is 9 but Value is NOT Missing",
+            VAL_1           = as.character(vals[idx]),
+            VAL_2           = as.character(qcs[idx]),
+            IS_MISSING_1    = val_is_miss[idx],
+            IS_MISSING_2    = qc_is_miss[idx],
+            stringsAsFactors = FALSE
+          )
+        }
+      }
+    }
+  }
+  
+  cross_pairs <- list(
+    list(v1 = "DOXY", v2 = "DOXY_ADJUSTED", q1 = "DOXY_QC", q2 = "DOXY_ADJUSTED_QC", label = "DOXY: R vs A"),
+    list(v1 = "DOXY", v2 = "DOXY_FINAL",    q1 = "DOXY_QC", q2 = "DOXY_FINAL_QC",    label = "DOXY: R vs D"),
+    list(v1 = "DOXY_ADJUSTED", v2 = "DOXY_FINAL", q1 = "DOXY_ADJUSTED_QC", q2 = "DOXY_FINAL_QC", label = "DOXY: A vs D"),
+    list(v1 = "CHLA", v2 = "CHLA_ADJUSTED", q1 = "CHLA_QC", q2 = "CHLA_ADJUSTED_QC", label = "CHLA: R vs A"),
+    list(v1 = "CHLA", v2 = "CHLA_FINAL",    q1 = "CHLA_QC", q2 = "CHLA_FINAL_QC",    label = "CHLA: R vs D"),
+    list(v1 = "CHLA_ADJUSTED", v2 = "CHLA_FINAL", q1 = "CHLA_ADJUSTED_QC", q2 = "CHLA_FINAL_QC", label = "CHLA: A vs D"),
+    list(v1 = "BBP700", v2 = "BBP700_ADJUSTED", q1 = "BBP700_QC", q2 = "BBP700_ADJUSTED_QC", label = "BBP700: R vs A"),
+    list(v1 = "BBP700", v2 = "BBP700_FINAL",    q1 = "BBP700_QC", q2 = "BBP700_FINAL_QC",    label = "BBP700: R vs D"),
+    list(v1 = "BBP700_ADJUSTED", v2 = "BBP700_FINAL", q1 = "BBP700_ADJUSTED_QC", q2 = "BBP700_FINAL_QC", label = "BBP700: A vs D"),
+    list(v1 = "CHLA_FLUORESCENCE", v2 = "CHLA_FLUORESCENCE_FINAL", 
+         q1 = "CHLA_FLUORESCENCE_QC", q2 = "CHLA_FLUORESCENCE_FINAL_QC", label = "CHLA_FLUO: R vs D")
+  )
+  
+  for (pair in cross_pairs) {
+    if (all(c(pair$v1, pair$v2, pair$q1, pair$q2) %in% names(df_export))) {
+      v1_vals <- df_export[[pair$v1]]
+      v2_vals <- df_export[[pair$v2]]
+      q1_vals <- df_export[[pair$q1]]
+      q2_vals <- df_export[[pair$q2]]
       
-      val_diff_idx <- which(r_val_miss != a_val_miss)
+      v1_miss <- is_argo_missing_val(v1_vals)
+      v2_miss <- is_argo_missing_val(v2_vals)
+      q1_miss <- sapply(q1_vals, is_qc_missing)
+      q2_miss <- sapply(q2_vals, is_qc_missing)
+      
+      val_diff_idx <- which(v1_miss != v2_miss)
       if (length(val_diff_idx) > 0) {
         for (idx in val_diff_idx) {
           mismatches[[length(mismatches) + 1]] <- data.frame(
@@ -88,18 +153,21 @@ audit_missing_mismatches <- function(df_export, float_wmo, output_dir) {
             CYCLE           = df_export$CYCLE_NUMBER[idx],
             PRES            = df_export$PRES[idx],
             LEVEL_IDX       = idx,
-            COMPARISON_TYPE = "VALUE",
-            PAIR            = paste(pair$raw, "vs", pair$adj),
-            RAW_VAL         = as.character(raw_vals[idx]),
-            ADJ_VAL         = as.character(adj_vals[idx]),
-            RAW_IS_MISSING  = r_val_miss[idx],
-            ADJ_IS_MISSING  = a_val_miss[idx],
+            AUDIT_CATEGORY  = "CROSS_MODE_VALUE_DIVERGENCE",
+            PAIR_OR_VAR     = pair$label,
+            DESCRIPTION     = sprintf("Value missing in %s but present in %s", 
+                                      ifelse(v1_miss[idx], pair$v1, pair$v2),
+                                      ifelse(v1_miss[idx], pair$v2, pair$v1)),
+            VAL_1           = as.character(v1_vals[idx]),
+            VAL_2           = as.character(v2_vals[idx]),
+            IS_MISSING_1    = v1_miss[idx],
+            IS_MISSING_2    = v2_miss[idx],
             stringsAsFactors = FALSE
           )
         }
       }
       
-      qc_diff_idx <- which(r_qc_miss != a_qc_miss)
+      qc_diff_idx <- which(q1_miss != q2_miss)
       if (length(qc_diff_idx) > 0) {
         for (idx in qc_diff_idx) {
           mismatches[[length(mismatches) + 1]] <- data.frame(
@@ -107,12 +175,15 @@ audit_missing_mismatches <- function(df_export, float_wmo, output_dir) {
             CYCLE           = df_export$CYCLE_NUMBER[idx],
             PRES            = df_export$PRES[idx],
             LEVEL_IDX       = idx,
-            COMPARISON_TYPE = "QC_FLAG",
-            PAIR            = paste(pair$raw_qc, "vs", pair$adj_qc),
-            RAW_VAL         = as.character(raw_qcs[idx]),
-            ADJ_VAL         = as.character(adj_qcs[idx]),
-            RAW_IS_MISSING  = r_qc_miss[idx],
-            ADJ_IS_MISSING  = a_qc_miss[idx],
+            AUDIT_CATEGORY  = "CROSS_MODE_QC_DIVERGENCE",
+            PAIR_OR_VAR     = paste(pair$q1, "vs", pair$q2),
+            DESCRIPTION     = sprintf("QC 9 in %s but valid in %s",
+                                      ifelse(q1_miss[idx], pair$q1, pair$q2),
+                                      ifelse(q1_miss[idx], pair$q2, pair$q1)),
+            VAL_1           = as.character(q1_vals[idx]),
+            VAL_2           = as.character(q2_vals[idx]),
+            IS_MISSING_1    = q1_miss[idx],
+            IS_MISSING_2    = q2_miss[idx],
             stringsAsFactors = FALSE
           )
         }
@@ -122,27 +193,25 @@ audit_missing_mismatches <- function(df_export, float_wmo, output_dir) {
   
   df_mismatches <- if (length(mismatches) > 0) bind_rows(mismatches) else data.frame()
   
-  cat("\n", rep("=", 90), "\n", sep = "")
-  cat(sprintf("MISSING DATA / QC AUDIT SUMMARY: FLOAT %s\n", float_wmo))
-  cat(rep("=", 90), "\n", sep = "")
+  cat("\n", rep("=", 95), "\n", sep = "")
+  cat(sprintf("MISSING DATA & INCONSISTENCY AUDIT SUMMARY: FLOAT %s\n", float_wmo))
+  cat(rep("=", 95), "\n", sep = "")
   
   if (nrow(df_mismatches) == 0) {
-    cat(sprintf("[%s] All missing value masks and QC flags align consistently across all cycles.\n", float_wmo))
+    cat(sprintf("[%s] PASSED: All missing value masks and QC flags align consistently internally & across all modes.\n", float_wmo))
   } else {
-    cat(sprintf("[%s] Found %d level-by-level mismatches.\n\n", float_wmo, nrow(df_mismatches)))
-    
+    cat(sprintf("[%s] Found %d total level-by-level inconsistencies.\n\n", float_wmo, nrow(df_mismatches)))
     summary_table <- df_mismatches %>%
-      group_by(WMO, CYCLE, COMPARISON_TYPE, PAIR) %>%
-      summarise(MISMATCH_COUNT = n(), .groups = "drop")
-    
+      group_by(AUDIT_CATEGORY, PAIR_OR_VAR) %>%
+      summarise(MISMATCH_COUNT = n(), AFFECTED_CYCLES = n_distinct(CYCLE), .groups = "drop") %>%
+      arrange(desc(MISMATCH_COUNT))
     print(as.data.frame(summary_table))
     
     audit_csv_path <- file.path(output_dir, sprintf("%s_missing_data_mismatches.csv", float_wmo))
     write.csv(df_mismatches, audit_csv_path, row.names = FALSE)
-    cat(sprintf("\n>>> SAVED MISMATCH AUDIT REPORT -> %s\n", audit_csv_path))
+    cat(sprintf("\n>>> SAVED DETAILED AUDIT REPORT -> %s\n", audit_csv_path))
   }
-  cat(rep("=", 90), "\n\n", sep = "")
-  
+  cat(rep("=", 95), "\n\n", sep = "")
   return(df_mismatches)
 }
 
@@ -227,7 +296,7 @@ write_DOXY_adjusted_error <- function(nc, profile_idx, err_mbar, psal, temp, pre
   return(DOXY_adj_error_umol_kg)
 }
 
-# Python-identical QC_COLOR_MAP: Flag 9 is black (#000000)
+# Exact Python QC_COLOR_MAP
 qc_color_scale <- c(
   "0" = "#b3b3b3",
   "1" = "#33A02C",
@@ -242,7 +311,7 @@ qc_color_scale <- c(
 mode_levels      <- c("R-mode", "A-mode", "D-mode", "Bottle")
 color_mapping    <- c("R-mode" = "#E31A1C", "A-mode" = "#8C510A", "D-mode" = "#33A02C", "Bottle" = "#000000")
 linetype_mapping <- c("R-mode" = "dotted",  "A-mode" = "dashed",  "D-mode" = "solid",   "Bottle" = "blank")
-linewidth_map    <- c("R-mode" = 0.7,       "A-mode" = 0.9,       "D-mode" = 1.1,       "Bottle" = 0)
+linewidth_map    <- c("R-mode" = 0.8,       "A-mode" = 1.0,       "D-mode" = 1.2,       "Bottle" = 0.0)
 shape_mapping    <- c("R-mode" = NA,        "A-mode" = NA,        "D-mode" = NA,        "Bottle" = 16)
 
 calib_csv_path <- file.path(dir_tables, "Jul2026_inair_output_binflags5.csv")
@@ -263,26 +332,18 @@ calib_df <- read.csv(calib_csv_path) %>%
 
 float_ids     <- calib_df$float_ids 
 target_floats <- c(6999992, 4903904, 1902800, 5907206, 4903624)
-today_str     <- format(Sys.Date(), "%Y-%m-%d")
-
-reg_countries <- c('Mexico', 'USA', 'Cuba', 'Belize', "Guatemala", "Cayman Islands", "Jamaica")
-lons          <- c(-98, -59)
-lats          <- c(8, 29)
+today_str     <- format(Sys.Date(), format = "%Y-%m-%d")
 
 path_lut_nc     <- file.path(dir_data_root, "LUT/127630.nc")
 path_bottle_val <- file.path(dir_data_root, "Bottle_samples/Master_Vali_24_July_2025.csv")
 
 # =========================================================================
-# 4. GLOBAL DATA INGESTION & PREPARATION (LOCAL INPUTS)
+# 4. GLOBAL DATA INGESTION & PREPARATION
 # =========================================================================
 
 LUT <- rast(path_lut_nc)
 df_LUT <- as.data.frame(LUT, xy = TRUE, na.rm = TRUE)
 lut_sf <- st_as_sf(df_LUT, coords = c("x", "y"), crs = 4326)
-
-reg <- map_data("world2Hires")
-reg <- subset(reg, region %in% reg_countries)
-reg$long <- (360 - reg$long) * -1
 
 if (file.exists(path_bottle_val)) {
   Bottle_Vali <- read.csv(path_bottle_val)
@@ -292,7 +353,131 @@ if (file.exists(path_bottle_val)) {
 }
 
 # =========================================================================
-# 5. BATCH EXECUTION LOOP (INDIVIDUAL FLOAT PROCESSING)
+# 5. INDIVIDUAL PER-CYCLE PROFILE PLOTTING ROUTINE
+# =========================================================================
+
+generate_cycle_profile_plot <- function(df_cyc, var_cols, var_modes, var_title, unit_expr, 
+                                        out_file, float_id, cyc_num, bottle_df = NULL) {
+  plot_rows <- list()
+  for (i in seq_along(var_cols)) {
+    col_name <- var_cols[i]
+    mode_name <- var_modes[i]
+    if (col_name %in% names(df_cyc)) {
+      vals <- standardize_to_na(as.numeric(df_cyc[[col_name]]))
+      pres <- standardize_to_na(as.numeric(df_cyc$PRES))
+      valid <- !is.na(vals) & !is_argo_missing_val(vals) & !is.na(pres) & !is_argo_missing_val(pres)
+      if (any(valid)) {
+        plot_rows[[length(plot_rows) + 1]] <- data.frame(
+          PRES  = pres[valid],
+          Value = vals[valid],
+          Mode  = mode_name,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+  
+  if (length(plot_rows) == 0 && (is.null(bottle_df) || nrow(bottle_df) == 0)) {
+    return(invisible(NULL))
+  }
+  
+  df_plot_lines <- if (length(plot_rows) > 0) bind_rows(plot_rows) else data.frame()
+  if (nrow(df_plot_lines) > 0) {
+    df_plot_lines$Mode <- factor(df_plot_lines$Mode, levels = mode_levels)
+    df_plot_lines <- df_plot_lines %>% arrange(Mode, PRES)
+  }
+  
+  df_paths   <- df_plot_lines %>% group_by(Mode) %>% filter(n() >= 2) %>% ungroup()
+  df_singles <- df_plot_lines %>% group_by(Mode) %>% filter(n() == 1) %>% ungroup()
+  
+  p <- ggplot()
+  
+  if (nrow(df_paths) > 0) {
+    p <- p + 
+      geom_path(
+        data = df_paths,
+        aes(x = Value, y = PRES, color = Mode, linetype = Mode, linewidth = Mode, group = Mode),
+        na.rm = TRUE
+      )
+  }
+  
+  if (nrow(df_singles) > 0) {
+    p <- p + 
+      geom_point(
+        data = df_singles,
+        aes(x = Value, y = PRES, color = Mode),
+        size = 2.4, shape = 18, na.rm = TRUE
+      )
+  }
+  
+  if (!is.null(bottle_df) && nrow(bottle_df) > 0) {
+    bottle_df$Mode <- factor("Bottle", levels = mode_levels)
+    p <- p + 
+      geom_point(
+        data = bottle_df,
+        aes(x = Value, y = PRES, color = Mode, shape = Mode),
+        size = 2.4, na.rm = TRUE
+      )
+  }
+  
+  cyc_time <- ""
+  if ("DATE_TIME" %in% names(df_cyc) && !is.na(df_cyc$DATE_TIME[1]) && df_cyc$DATE_TIME[1] != "-99999") {
+    dt_val <- df_cyc$DATE_TIME[1]
+    if (inherits(dt_val, "POSIXt")) {
+      cyc_time <- format(dt_val, format = "%Y-%m-%d %H:%M")
+    } else {
+      parsed_dt <- suppressWarnings(lubridate::as_datetime(as.character(dt_val)))
+      if (!is.na(parsed_dt)) {
+        cyc_time <- format(parsed_dt, format = "%Y-%m-%d %H:%M")
+      } else {
+        cyc_time <- as.character(dt_val)
+      }
+    }
+  }
+  
+  cyc_lat <- if ("LATITUDE" %in% names(df_cyc)) round(df_cyc$LATITUDE[1], 3) else NA
+  cyc_lon <- if ("LONGITUDE" %in% names(df_cyc)) round(df_cyc$LONGITUDE[1], 3) else NA
+  
+  sub_text <- paste0(
+    if (!is.na(cyc_time) && cyc_time != "") paste0("Date: ", cyc_time, " UTC | ") else "",
+    if (!is.na(cyc_lat) && !is.na(cyc_lon)) sprintf("Lat: %.3f, Lon: %.3f", cyc_lat, cyc_lon) else ""
+  )
+  
+  p <- p + 
+    scale_y_reverse(expand = expansion(mult = c(0.02, 0.05))) +
+    scale_color_manual(name = "Data Mode", values = color_mapping, breaks = mode_levels, drop = FALSE) +
+    scale_linetype_manual(name = "Data Mode", values = linetype_mapping, breaks = mode_levels, drop = FALSE) +
+    scale_linewidth_manual(name = "Data Mode", values = linewidth_map, breaks = mode_levels, drop = FALSE) +
+    scale_shape_manual(name = "Data Mode", values = shape_mapping, breaks = mode_levels, drop = FALSE, na.translate = FALSE) +
+    labs(
+      title = sprintf("Float %s - Cycle %03d: %s Profile", float_id, cyc_num, var_title),
+      subtitle = sub_text,
+      x = unit_expr,
+      y = "Pressure (dbar)"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 9, color = "grey30"),
+      panel.grid.major = element_line(linetype = "dashed", color = "grey85", linewidth = 0.4),
+      panel.grid.minor = element_blank(),
+      legend.position = "right",
+      legend.background = element_rect(fill = alpha("white", 0.8), color = "grey80")
+    ) +
+    guides(
+      color = guide_legend(override.aes = list(
+        linetype = linetype_mapping,
+        linewidth = c(0.8, 1.0, 1.2, 0.0),
+        shape = c(NA, NA, NA, 16)
+      ))
+    )
+  
+  ggsave(out_file, plot = p, width = 7, height = 8, dpi = 130)
+  return(invisible(TRUE))
+}
+
+# =========================================================================
+# 6. BATCH EXECUTION LOOP (PROCESSING, EXPORT, AUDIT & DUAL PLOTTING)
 # =========================================================================
 
 for (woko in float_ids) {
@@ -393,7 +578,7 @@ for (woko in float_ids) {
     }
     
     MLD <- NA_real_
-    if (length(which(!is.na(pres))) > 15 && max(pres, na.rm = TRUE) > 250) {
+    if (length(which(!is.na(pres))) > 15 && safe_max(pres) > 250) {
       sigma_all <- swSigmaTheta(sal, temp, pres)
       valid_mld <- !is.na(pres) & !is.na(sigma_all)
       if (sum(valid_mld) > 5) {
@@ -403,7 +588,7 @@ for (woko in float_ids) {
     }
     
     chl <- rep(NA_real_, length(pres)); chl_qc <- rep(9, length(pres))
-    chl_adj <- rep(NA_real_, length(pres)) 
+    chl_adj <- rep(NA_real_, length(pres)); chl_adj_qc <- rep(9, length(pres))
     bbp <- rep(NA_real_, length(pres)); bbp_qc <- rep(9, length(pres))
     fluo <- rep(NA_real_, length(pres)); fluo_qc <- rep(9, length(pres))
     doxy <- rep(NA_real_, length(pres)); doxy_qc <- rep(9, length(pres))
@@ -419,6 +604,11 @@ for (woko in float_ids) {
     
     if ("CHLA_ADJUSTED" %in% names(profile_bio$var)) {
       chl_adj <- standardize_to_na(as.vector(ncvar_get(profile_bio, "CHLA_ADJUSTED")))
+      if ("CHLA_ADJUSTED_QC" %in% names(profile_bio$var)) {
+        chl_adj_qc_v <- paste(ncvar_get(profile_bio, "CHLA_ADJUSTED_QC"), collapse = "")
+        chl_adj_qc <- unlist(strsplit(chl_adj_qc_v, ""))[1:length(pres)]
+        chl_adj_qc[is.na(chl_adj) | is.na(chl_adj_qc)] <- 9
+      }
     }
     
     if ("FLUORESCENCE_CHLA" %in% names(profile_bio$var)) {
@@ -477,7 +667,8 @@ for (woko in float_ids) {
     data_sub <- data.frame(
       PRES = as.numeric(pres), PRES_QC = as.numeric(pres_qc),
       TEMP = as.numeric(temp), PSAL = as.numeric(sal),
-      CHLA = chl, CHLA_QC = as.numeric(chl_qc), CHLA_ADJUSTED = chl_adj,
+      CHLA = chl, CHLA_QC = as.numeric(chl_qc), 
+      CHLA_ADJUSTED = chl_adj, CHLA_ADJUSTED_QC = as.numeric(chl_adj_qc),
       FLUO_CHLA = fluo, FLUO_CHLA_QC = as.numeric(fluo_qc),
       BBP700 = bbp, BBP700_QC = as.numeric(bbp_qc),
       DOXY = doxy, DOXY_QC = as.numeric(doxy_qc),
@@ -509,7 +700,7 @@ for (woko in float_ids) {
   }
   
   # =========================================================================
-  # STEP 1.5: BBP700 MANUAL QUALITY CONTROL TESTS (PRESERVING NA)
+  # STEP 1.5: BBP700 MANUAL QUALITY CONTROL TESTS
   # =========================================================================
   message("\nProcessing BBP700 Manual Quality Control Tests...")
   float_data$BBP700_QC_MANUAL <- ifelse(is.na(float_data$BBP700), 9, 1)
@@ -517,7 +708,6 @@ for (woko in float_ids) {
   for (i in unique(float_data$CYCLE_NUMBER)) {
     data_sub <- float_data[which(float_data$CYCLE_NUMBER == i), ]
     bbp <- data_sub$BBP700
-    dep_bbp <- data_sub$PRES
     if (all(is.na(bbp))) next
     
     try({
@@ -541,11 +731,12 @@ for (woko in float_ids) {
   
   float_data <- float_data %>%
     mutate(
-      BBP700_QC_NUM   = suppressWarnings(as.numeric(as.character(BBP700_QC))),
-      BBP700_FINAL_QC = pmax(coalesce(BBP700_QC_NUM, 9), coalesce(BBP700_QC_MANUAL, 9), na.rm = TRUE),
-      BBP700_FINAL_QC = ifelse(is.na(BBP700) | PRES_QC %in% c("9", 9), 9, BBP700_FINAL_QC),
-      BBP700_ADJUSTED = ifelse(BBP700_FINAL_QC == 9, NA_real_, BBP700),
-      BBP700_FINAL    = ifelse(is.na(BBP700) | BBP700_FINAL_QC %in% c(4, 9), NA_real_, BBP700)
+      BBP700_QC_NUM      = suppressWarnings(as.numeric(as.character(BBP700_QC))),
+      BBP700_FINAL_QC    = pmax(coalesce(BBP700_QC_NUM, 9), coalesce(BBP700_QC_MANUAL, 9), na.rm = TRUE),
+      BBP700_FINAL_QC    = ifelse(is.na(BBP700) | PRES_QC %in% c("9", 9), 9, BBP700_FINAL_QC),
+      BBP700_ADJUSTED_QC = BBP700_FINAL_QC,
+      BBP700_ADJUSTED    = ifelse(BBP700_FINAL_QC == 9, NA_real_, BBP700),
+      BBP700_FINAL       = ifelse(is.na(BBP700) | BBP700_FINAL_QC %in% c(4, 9), NA_real_, BBP700)
     ) %>%
     select(-BBP700_QC_NUM)
   
@@ -571,8 +762,8 @@ for (woko in float_ids) {
     data_sub <- float_data %>% filter(CYCLE_NUMBER == cyc_i)
     if (nrow(data_sub) == 0) next
     
-    max_p <- max(data_sub$PRES, na.rm = TRUE)
-    if (is.infinite(max_p) || max_p < 900) next 
+    max_p <- safe_max(data_sub$PRES)
+    if (is.na(max_p) || max_p < 900) next 
     
     deep_layer <- data_sub %>% 
       filter(!is.na(PRES) & 
@@ -583,7 +774,7 @@ for (woko in float_ids) {
     
     if (nrow(deep_layer) < 3) next
     
-    min_val <- min(deep_layer$FLUO_CHLA_RANGE, na.rm = TRUE)
+    min_val <- safe_min(deep_layer$FLUO_CHLA_RANGE)
     if (!is.na(min_val) && is.finite(min_val)) {
       cycle_deep_mins   <- c(cycle_deep_mins, min_val)
       qualifying_cycles <- c(qualifying_cycles, cyc_i)
@@ -597,11 +788,11 @@ for (woko in float_ids) {
   
   scale_factor <- coalesce(float_data$SCALE_FLUO[1], 1)
   
-  float_data$CHLA_DARK                 <- (float_data$FLUO_CHLA_RANGE - MED) * scale_factor
-  float_data$CHLA_NoLUT                <- float_data$CHLA_DARK
-  float_data$CHLA_ADJUSTED             <- coalesce(float_data$CHLA_ADJUSTED, float_data$CHLA_DARK)
-  float_data$CHLA_FLUORESCENCE          <- (float_data$FLUO_CHLA - coalesce(float_data$DARK_FLUO, 0)) * scale_factor
-  float_data$CHLA_FLUORESCENCE_ADJUSTED <- (float_data$FLUO_CHLA - MED) * scale_factor
+  float_data$CHLA_DARK              <- (float_data$FLUO_CHLA_RANGE - MED) * scale_factor
+  float_data$CHLA_NoLUT             <- float_data$CHLA_DARK
+  float_data$CHLA_ADJUSTED          <- coalesce(float_data$CHLA_ADJUSTED, float_data$CHLA_DARK)
+  float_data$CHLA_FLUORESCENCE       <- (float_data$FLUO_CHLA - coalesce(float_data$DARK_FLUO, 0)) * scale_factor
+  float_data$CHLA_FLUORESCENCE_FINAL <- (float_data$FLUO_CHLA - MED) * scale_factor
   
   # =========================================================================
   # STEP 4: PRE-NPQ AUTOMATED QC & DESPIKING
@@ -671,9 +862,9 @@ for (woko in float_ids) {
         max_chla_idx <- mld_sub[which.max(float_data$CHLA_NoLUT[mld_sub])]
         max_chla_val <- float_data$CHLA_NoLUT[max_chla_idx]
         pres_at_max  <- float_data$PRES[max_chla_idx]
-        shallowest_p <- min(float_data$PRES[mld_sub], na.rm = TRUE)
+        shallowest_p <- safe_min(float_data$PRES[mld_sub])
         
-        if (pres_at_max > shallowest_p && is.finite(max_chla_val)) {
+        if (!is.na(shallowest_p) && pres_at_max > shallowest_p && is.finite(max_chla_val)) {
           upward_idx <- idx[which(float_data$PRES[idx] < pres_at_max & float_data$CHLA_QC_AUTO[idx] < 4)]
           if (length(upward_idx) > 0) {
             float_data$CHLA_NoLUT[upward_idx] <- max_chla_val
@@ -724,26 +915,28 @@ for (woko in float_ids) {
       pres_qc_9_mask <- df_cyc$PRES_QC %in% c("9", 9)
       qc_flags_chla[pres_qc_9_mask] <- 9
       
+      df_cyc$CHLA_ADJUSTED_QC <- ifelse(is.na(df_cyc$CHLA_ADJUSTED) | pres_qc_9_mask, 9, qc_flags_chla)
+      
       qc_flags_fluo <- rep(1, n_obs)
       range_fail_fluo <- !is.na(fluo_v) & (fluo_v < -0.2 | fluo_v > 100)
       qc_flags_fluo[range_fail_fluo] <- 4
       qc_flags_fluo[is_argo_missing_val(fluo_v)] <- 9
       qc_flags_fluo[pres_qc_9_mask]              <- 9
       
-      qc_flags_fluo_adj <- ifelse(length(cycle_deep_mins) >= 5, 1, 2)
-      qc_flags_fluo_adj <- rep(qc_flags_fluo_adj, n_obs)
-      qc_flags_fluo_adj[qc_flags_fluo >= 4] <- qc_flags_fluo[qc_flags_fluo >= 4]
-      qc_flags_fluo_adj[is_argo_missing_val(df_cyc$CHLA_FLUORESCENCE_ADJUSTED)] <- 9
-      qc_flags_fluo_adj[pres_qc_9_mask] <- 9
+      qc_flags_fluo_final <- ifelse(length(cycle_deep_mins) >= 5, 1, 2)
+      qc_flags_fluo_final <- rep(qc_flags_fluo_final, n_obs)
+      qc_flags_fluo_final[qc_flags_fluo >= 4] <- qc_flags_fluo[qc_flags_fluo >= 4]
+      qc_flags_fluo_final[is_argo_missing_val(df_cyc$CHLA_FLUORESCENCE_FINAL)] <- 9
+      qc_flags_fluo_final[pres_qc_9_mask] <- 9
       
       chla_v[qc_flags_chla == 9] <- NA_real_
       fluo_v[qc_flags_fluo == 9] <- NA_real_
-      df_cyc$CHLA_FLUORESCENCE_ADJUSTED[qc_flags_fluo_adj == 9] <- NA_real_
+      df_cyc$CHLA_FLUORESCENCE_FINAL[qc_flags_fluo_final == 9] <- NA_real_
       
-      df_cyc$CHLA_FINAL                    <- chla_v
-      df_cyc$CHLA_FINAL_QC                 <- qc_flags_chla
-      df_cyc$CHLA_FLUORESCENCE_QC          <- qc_flags_fluo
-      df_cyc$CHLA_FLUORESCENCE_ADJUSTED_QC <- qc_flags_fluo_adj
+      df_cyc$CHLA_FINAL                 <- chla_v
+      df_cyc$CHLA_FINAL_QC              <- qc_flags_chla
+      df_cyc$CHLA_FLUORESCENCE_QC       <- qc_flags_fluo
+      df_cyc$CHLA_FLUORESCENCE_FINAL_QC <- qc_flags_fluo_final
       return(df_cyc)
     }) %>%
     ungroup() %>%
@@ -782,6 +975,9 @@ for (woko in float_ids) {
   gain       <- coalesce(df_all$doxy_slope, 1) * (1 + (coalesce(df_all$doxy_drift, 0) / 100) * (delta_days / 365.25))
   df_all$DOXY_CALCULATED_ADJ <- df_all$DOXY * gain
   
+  df_all$DOXY_ADJUSTED    <- coalesce(df_all$DOXY_ADJUSTED, df_all$DOXY_CALCULATED_ADJ)
+  df_all$DOXY_ADJUSTED_QC <- ifelse(is.na(df_all$DOXY_ADJUSTED) | df_all$PRES_QC %in% c("9", 9), 9, df_all$DOXY_QC)
+  
   df_all <- df_all %>%
     mutate(
       DENSITY = oce::swRho(salinity = PSAL, temperature = TEMP, pressure = PRES_ADJUSTED),
@@ -792,16 +988,18 @@ for (woko in float_ids) {
       )
     )
   
+  # Vector-safe hook detection
   df_all <- df_all %>%
     group_by(CYCLE_NUMBER) %>%
     mutate(
       is_valid_pres = !is.na(PRES_ADJUSTED) & !is.na(DOXY_CALCULATED_ADJ) & !is_argo_missing_val(DOXY_CALCULATED_ADJ),
-      max_pres_val  = ifelse(any(is_valid_pres), max(PRES_ADJUSTED[is_valid_pres]), NA_real_),
-      sec_pres_val  = ifelse(sum(is_valid_pres) >= 2, max(PRES_ADJUSTED[is_valid_pres & PRES_ADJUSTED < max_pres_val]), NA_real_),
+      max_pres_val  = if (any(is_valid_pres)) max(PRES_ADJUSTED[is_valid_pres], na.rm = TRUE) else NA_real_,
+      sec_pres_val  = if (sum(is_valid_pres) >= 2) safe_max(PRES_ADJUSTED[is_valid_pres & PRES_ADJUSTED < max_pres_val]) else NA_real_,
       doxy_deepest  = ifelse(!is.na(max_pres_val) & PRES_ADJUSTED == max_pres_val, DOXY_CALCULATED_ADJ, NA_real_),
       doxy_second   = ifelse(!is.na(sec_pres_val) & PRES_ADJUSTED == sec_pres_val, DOXY_CALCULATED_ADJ, NA_real_),
-      deepest_diff  = abs(max(doxy_deepest, na.rm = TRUE) - max(doxy_second, na.rm = TRUE)),
-      HOOK_FLAG_4   = !is.na(PRES_ADJUSTED) & !is.na(max_pres_val) & (PRES_ADJUSTED == max_pres_val) & (!is.na(deepest_diff) & deepest_diff > 2)
+      deepest_diff  = abs(safe_max(doxy_deepest) - safe_max(doxy_second)),
+      HOOK_FLAG_4   = !is.na(PRES_ADJUSTED) & !is.na(max_pres_val) & (PRES_ADJUSTED == max_pres_val) & 
+        (!is.na(deepest_diff) & deepest_diff > 2)
     ) %>%
     ungroup()
   
@@ -847,14 +1045,16 @@ for (woko in float_ids) {
     select(-any_of(c("HOOK_FLAG_4", "is_valid_pres", "max_pres_val", "sec_pres_val", "doxy_deepest", "doxy_second", "deepest_diff")))
   
   # ==============================================================================
-  # STEP 6: EXPORT COMBINED CSV (PRESERVING COMPLETE PRES AXIS & DOXY R-MODE)
+  # STEP 6: EXPORT COMBINED CSV RETAINING ALL R, A & D MODES
   # ==============================================================================
   combo_output_path <- file.path(combo_output_dir, sprintf("CHLA_BBP_DOXY_%d.csv", float_id))
   
   df_export_prep <- df_all %>%
     mutate(
       float_num = coalesce(as.character(WMOID), as.character(float_num)),
-      across(where(is.logical), as.numeric)
+      across(where(is.logical), as.numeric),
+      DOXY_ADJUSTED = coalesce(DOXY_ADJUSTED, DOXY_CALCULATED_ADJ),
+      DATE_TIME     = format(DATE_TIME, format = "%Y-%m-%d %H:%M:%S")
     )
   
   df_export_prep <- df_export_prep %>%
@@ -864,19 +1064,26 @@ for (woko in float_ids) {
           (float_num == "2904010" & CYCLE_NUMBER >= 49) | 
           (float_num == "2904011" & CYCLE_NUMBER >= 24)
       ),
-      CHLA_FINAL                    = ifelse(override_condition, -99999.0, CHLA_FINAL),
-      BBP700_FINAL                  = ifelse(override_condition, -99999.0, BBP700_FINAL),
-      CHLA_FINAL_QC                 = ifelse(override_condition, "9", as.character(CHLA_FINAL_QC)),
-      BBP700_FINAL_QC               = ifelse(override_condition, "9", as.character(BBP700_FINAL_QC)),
       CHLA                          = ifelse(override_condition, -99999.0, CHLA),
+      CHLA_QC                       = ifelse(override_condition, "9", as.character(CHLA_QC)),
       CHLA_ADJUSTED                 = ifelse(override_condition, -99999.0, CHLA_ADJUSTED),
-      CHLA_FLUORESCENCE             = ifelse(override_condition, -99999.0, CHLA_FLUORESCENCE),
-      CHLA_FLUORESCENCE_QC          = ifelse(override_condition, "9", as.character(CHLA_FLUORESCENCE_QC)),
-      CHLA_FLUORESCENCE_ADJUSTED    = ifelse(override_condition, -99999.0, CHLA_FLUORESCENCE_ADJUSTED),
-      CHLA_FLUORESCENCE_ADJUSTED_QC = ifelse(override_condition, "9", as.character(CHLA_FLUORESCENCE_ADJUSTED_QC)),
-      CHLA_NoLUT                    = ifelse(override_condition, -99999.0, CHLA_NoLUT),
+      CHLA_ADJUSTED_QC              = ifelse(override_condition, "9", as.character(CHLA_ADJUSTED_QC)),
+      CHLA_FINAL                    = ifelse(override_condition, -99999.0, CHLA_FINAL),
+      CHLA_FINAL_QC                 = ifelse(override_condition, "9", as.character(CHLA_FINAL_QC)),
+      
       BBP700                        = ifelse(override_condition, -99999.0, BBP700),
       BBP700_QC                     = ifelse(override_condition, "9", as.character(BBP700_QC)),
+      BBP700_ADJUSTED               = ifelse(override_condition, -99999.0, BBP700_ADJUSTED),
+      BBP700_ADJUSTED_QC            = ifelse(override_condition, "9", as.character(BBP700_ADJUSTED_QC)),
+      BBP700_FINAL                  = ifelse(override_condition, -99999.0, BBP700_FINAL),
+      BBP700_FINAL_QC               = ifelse(override_condition, "9", as.character(BBP700_FINAL_QC)),
+      
+      CHLA_FLUORESCENCE             = ifelse(override_condition, -99999.0, CHLA_FLUORESCENCE),
+      CHLA_FLUORESCENCE_QC          = ifelse(override_condition, "9", as.character(CHLA_FLUORESCENCE_QC)),
+      CHLA_FLUORESCENCE_FINAL       = ifelse(override_condition, -99999.0, CHLA_FLUORESCENCE_FINAL),
+      CHLA_FLUORESCENCE_FINAL_QC    = ifelse(override_condition, "9", as.character(CHLA_FLUORESCENCE_FINAL_QC)),
+      
+      CHLA_NoLUT                    = ifelse(override_condition, -99999.0, CHLA_NoLUT),
       SCALE_CHLA                    = ifelse(override_condition, -99999.0, SCALE_CHLA),
       DARK_CHLA                     = ifelse(override_condition, -99999.0, DARK_CHLA)
     ) %>%
@@ -884,25 +1091,31 @@ for (woko in float_ids) {
   
   df_combo_export <- df_export_prep %>%
     select(-any_of(c(
-      "WMOID", "ID", "DOXY_ADJUSTED_QC", "BBP700_QC_MANUAL",
-      "DOXY_ADJUSTED", "DOXY_CALCULATED_ADJ", "float_ids", "TIME",
+      "WMOID", "ID", "BBP700_QC_MANUAL",
+      "DOXY_CALCULATED_ADJ", "float_ids", "TIME",
       "launch_date", "lauch_date", "LAUNCH_DATE", "sun_test", "SOLAR_ANGLE", 
       "FLUO_CHLA_RANGE", "CHLA_QC_AUTO"
     ))) %>%
     rename_with(toupper) %>%
     relocate(
-      FLOAT_NUM, CYCLE_NUMBER, PRES, PRES_QC,
-      DOXY, DOXY_QC,
+      FLOAT_NUM, CYCLE_NUMBER, DATE_TIME, LATITUDE, LONGITUDE, PRES, PRES_QC,
+      DOXY, DOXY_QC, 
+      DOXY_ADJUSTED, DOXY_ADJUSTED_QC, 
       DOXY_FINAL, DOXY_FINAL_QC, DOXY_ADJUSTED_ERROR,
-      CHLA, CHLA_QC, CHLA_FINAL, CHLA_FINAL_QC,
+      CHLA, CHLA_QC, 
+      CHLA_ADJUSTED, CHLA_ADJUSTED_QC, 
+      CHLA_FINAL, CHLA_FINAL_QC,
+      BBP700, BBP700_QC, 
+      BBP700_ADJUSTED, BBP700_ADJUSTED_QC, 
+      BBP700_FINAL, BBP700_FINAL_QC,
       CHLA_FLUORESCENCE, CHLA_FLUORESCENCE_QC,
-      CHLA_FLUORESCENCE_ADJUSTED, CHLA_FLUORESCENCE_ADJUSTED_QC,
-      BBP700, BBP700_QC, BBP700_FINAL, BBP700_FINAL_QC
+      CHLA_FLUORESCENCE_FINAL, CHLA_FLUORESCENCE_FINAL_QC
     ) %>%
     filter(!is.na(PRES) & !is_argo_missing_val(PRES))
   
   qc_cols <- grep("_QC$", names(df_combo_export), value = TRUE)
-  val_cols <- setdiff(names(df_combo_export), c(qc_cols, "FLOAT_NUM", "CYCLE_NUMBER", "PRES", "PRES_ADJUSTED"))
+  meta_cols <- c(qc_cols, "FLOAT_NUM", "CYCLE_NUMBER", "DATE_TIME", "LATITUDE", "LONGITUDE", "PRES", "PRES_ADJUSTED")
+  val_cols <- setdiff(names(df_combo_export), meta_cols)
   
   df_combo_export <- df_combo_export %>%
     mutate(
@@ -918,7 +1131,6 @@ for (woko in float_ids) {
     }
   }
   
-  # Suppress coercion warnings when non-numeric edge elements are standardized
   df_combo_export <- df_combo_export %>%
     mutate(
       across(all_of(val_cols), ~ {
@@ -927,16 +1139,132 @@ for (woko in float_ids) {
       })
     )
   
+  # --------------------------------------------------------------------------
+  # FILTER OUT LEVELS CONSISTENTLY MISSING ACROSS ALL BGC PARAMETERS & MODES
+  # --------------------------------------------------------------------------
+  bgc_pairs <- list(
+    list(val = "DOXY",                    qc = "DOXY_QC"),
+    list(val = "DOXY_ADJUSTED",           qc = "DOXY_ADJUSTED_QC"),
+    list(val = "DOXY_FINAL",              qc = "DOXY_FINAL_QC"),
+    list(val = "CHLA",                    qc = "CHLA_QC"),
+    list(val = "CHLA_ADJUSTED",           qc = "CHLA_ADJUSTED_QC"),
+    list(val = "CHLA_FINAL",              qc = "CHLA_FINAL_QC"),
+    list(val = "BBP700",                  qc = "BBP700_QC"),
+    list(val = "BBP700_ADJUSTED",         qc = "BBP700_ADJUSTED_QC"),
+    list(val = "BBP700_FINAL",            qc = "BBP700_FINAL_QC"),
+    list(val = "CHLA_FLUORESCENCE",       qc = "CHLA_FLUORESCENCE_QC"),
+    list(val = "CHLA_FLUORESCENCE_FINAL", qc = "CHLA_FLUORESCENCE_FINAL_QC")
+  )
+  
+  existing_pairs <- Filter(function(p) p$val %in% names(df_combo_export), bgc_pairs)
+  
+  is_missing_pair <- function(p) {
+    v_miss <- is_argo_missing_val(df_combo_export[[p$val]])
+    if (p$qc %in% names(df_combo_export)) {
+      q_miss <- is.na(df_combo_export[[p$qc]]) | as.character(df_combo_export[[p$qc]]) %in% c("9", "-99999", "99999", "", "NA")
+      return(v_miss | q_miss)
+    }
+    return(v_miss)
+  }
+  
+  all_missing_matrix <- sapply(existing_pairs, is_missing_pair)
+  row_all_bgc_missing <- apply(all_missing_matrix, 1, all)
+  
+  n_rows_before <- nrow(df_combo_export)
+  df_combo_export <- df_combo_export %>% filter(!row_all_bgc_missing)
+  n_rows_removed <- n_rows_before - nrow(df_combo_export)
+  
+  message(sprintf("[%s] Removed %d depth levels consistently missing across all BGC parameters and modes (%d levels retained).", 
+                  active_wmo, n_rows_removed, nrow(df_combo_export)))
+  
   write.csv(df_combo_export, combo_output_path, row.names = FALSE)
-  message(sprintf("\n>>> SUCCESSFULLY EXPORTED SINGLE COMBINED CSV -> %s", combo_output_path))
+  message(sprintf("\n>>> SUCCESSFULLY EXPORTED ALL MODES COMBINED CSV -> %s", combo_output_path))
   
   # ==============================================================================
-  # STEP 6.5: AUDIT MISSING DATA & QC MISMATCHES (RAW vs FINAL)
+  # STEP 6.5: AUDIT AND REPORT INCONSISTENCIES WITHIN AND ACROSS VARIABLES
   # ==============================================================================
   audit_missing_mismatches(df_combo_export, active_wmo, dir_qc_summary)
   
   # ==============================================================================
-  # STEP 7: SECTION CONTOUR & QC SUMMARY PLOTS (MATCHING PYTHON SCIPY/MATPLOTLIB)
+  # STEP 7: INDIVIDUAL PER-FLOAT PER-CYCLE PROFILE PLOTS (R, A, D MODES)
+  # ==============================================================================
+  message(sprintf("Generating per-cycle profile plots for Float %s...", active_wmo))
+  
+  cycles_to_plot <- sort(unique(df_combo_export$CYCLE_NUMBER[!is.na(df_combo_export$CYCLE_NUMBER)]))
+  
+  for (cyc in cycles_to_plot) {
+    df_cyc <- df_combo_export %>% filter(CYCLE_NUMBER == cyc)
+    if (nrow(df_cyc) == 0) next
+    
+    bottle_cyc_df <- NULL
+    if (exists("Bottle_Vali") && nrow(Bottle_Vali) > 0) {
+      b_float_col <- intersect(c("Float_num", "FLOAT_NUM", "float_ids", "WMO"), names(Bottle_Vali))
+      if (length(b_float_col) > 0) {
+        b_match <- Bottle_Vali[as.character(Bottle_Vali[[b_float_col[1]]]) == as.character(active_wmo), ]
+        b_cyc_col <- intersect(c("CYCLE_NUMBER", "Cycle", "CYCLE", "cycle"), names(b_match))
+        if (length(b_cyc_col) > 0) {
+          b_match <- b_match[b_match[[b_cyc_col[1]]] == cyc, ]
+        }
+        if (nrow(b_match) > 0 && "DOXY_bottle" %in% names(b_match) && "PRES" %in% names(b_match)) {
+          bottle_cyc_df <- b_match %>%
+            filter(!is_argo_missing_val(DOXY_bottle) & !is_argo_missing_val(PRES)) %>%
+            transmute(PRES = as.numeric(PRES), Value = as.numeric(DOXY_bottle))
+        }
+      }
+    }
+    
+    doxy_plot_file <- file.path(dir_doxy_plots, sprintf("Float_%s_Cycle_%03d_DOXY_Profile.png", active_wmo, cyc))
+    generate_cycle_profile_plot(
+      df_cyc = df_cyc,
+      var_cols = c("DOXY", "DOXY_ADJUSTED", "DOXY_FINAL"),
+      var_modes = c("R-mode", "A-mode", "D-mode"),
+      var_title = "DOXY",
+      unit_expr = expression(Oxygen ~ (mu * "mol/kg")),
+      out_file = doxy_plot_file,
+      float_id = active_wmo,
+      cyc_num = cyc,
+      bottle_df = bottle_cyc_df
+    )
+    
+    chla_plot_file <- file.path(dir_chla_plots, sprintf("Float_%s_Cycle_%03d_CHLA_Profile.png", active_wmo, cyc))
+    generate_cycle_profile_plot(
+      df_cyc = df_cyc,
+      var_cols = c("CHLA", "CHLA_ADJUSTED", "CHLA_FINAL"),
+      var_modes = c("R-mode", "A-mode", "D-mode"),
+      var_title = "CHLA",
+      unit_expr = expression(Chlorophyll ~ a ~ (mg/m^3)),
+      out_file = chla_plot_file,
+      float_id = active_wmo,
+      cyc_num = cyc
+    )
+    
+    bbp_plot_file <- file.path(dir_bbp_plots, sprintf("Float_%s_Cycle_%03d_BBP700_Profile.png", active_wmo, cyc))
+    generate_cycle_profile_plot(
+      df_cyc = df_cyc,
+      var_cols = c("BBP700", "BBP700_ADJUSTED", "BBP700_FINAL"),
+      var_modes = c("R-mode", "A-mode", "D-mode"),
+      var_title = "BBP700",
+      unit_expr = expression(b[bp](700) ~ (m^{-1})),
+      out_file = bbp_plot_file,
+      float_id = active_wmo,
+      cyc_num = cyc
+    )
+    
+    fluo_plot_file <- file.path(dir_fluo_plots, sprintf("Float_%s_Cycle_%03d_CHLA_FLUO_Profile.png", active_wmo, cyc))
+    generate_cycle_profile_plot(
+      df_cyc = df_cyc,
+      var_cols = c("CHLA_FLUORESCENCE", "CHLA_FLUORESCENCE_FINAL"),
+      var_modes = c("R-mode", "D-mode"),
+      var_title = "CHLA FLUORESCENCE",
+      unit_expr = "Fluorescence (RU)",
+      out_file = fluo_plot_file,
+      float_id = active_wmo,
+      cyc_num = cyc
+    )
+  }
+  
+  # ==============================================================================
+  # STEP 8: SECTION CONTOUR & QC SUMMARY PLOTS (MATCHING PYTHON SCIPY/MATPLOTLIB)
   # ==============================================================================
   df_summary_base <- df_combo_export %>%
     mutate(
@@ -944,7 +1272,6 @@ for (woko in float_ids) {
       PRES         = as.numeric(PRES)
     )
   
-  # Matrix-safe interpolation replicating Python scipy.interpolate.griddata(linear + nearest fill)
   create_interpolated_grid_r <- function(clean_df, val_col, grid_nx = 100, grid_ny = 100) {
     if (is.null(clean_df) || nrow(clean_df) < 5) return(NULL)
     if (!val_col %in% names(clean_df)) return(NULL)
@@ -972,7 +1299,6 @@ for (woko in float_ids) {
     xo_seq <- seq(min(grouped$CYCLE_NUMBER), max(grouped$CYCLE_NUMBER), length.out = grid_nx)
     yo_seq <- seq(min(grouped$PRES), max(grouped$PRES), length.out = grid_ny)
     
-    # 1. Linear interpolation via interp::interp
     interp_lin <- tryCatch({
       suppressWarnings(
         interp::interp(
@@ -994,7 +1320,6 @@ for (woko in float_ids) {
     
     z_mat <- interp_lin$z
     
-    # 2. Nearest-neighbor fallback for NA cells (matching SciPy griddata 'nearest')
     if (any(is.na(z_mat))) {
       na_coords <- which(is.na(z_mat), arr.ind = TRUE)
       
@@ -1021,13 +1346,13 @@ for (woko in float_ids) {
     
     grid_df <- expand.grid(x = xo_seq, y = yo_seq)
     grid_df$z <- as.vector(z_mat)
-    grid_df <- grid_df %>% filter(!is.na(z) & is.finite(z))
     
-    if (nrow(grid_df) == 0) return(NULL)
+    if (all(is.na(grid_df$z)) || diff(range(grid_df$z, na.rm = TRUE)) == 0) {
+      return(NULL)
+    }
     return(grid_df)
   }
   
-  # Generates upper/lower section plot matching Python matplotlib styling exactly
   generate_section_qc_plot <- function(df_base, var_name, qc_var_name, title_prefix, file_suffix, 
                                        col_palette = "viridis", unit_expr = "", is_chla = FALSE) {
     if (!var_name %in% names(df_base)) return(NULL)
@@ -1055,19 +1380,23 @@ for (woko in float_ids) {
     if (nrow(df_valid) == 0 && nrow(df_missing) == 0) return(NULL)
     
     pres_all <- df_plot$PRES[!is_argo_missing_val(df_plot$PRES)]
-    max_pres <- if (length(pres_all) > 0) max(pres_all, na.rm = TRUE) else 2000.0
+    max_pres <- safe_max(pres_all)
     if (is.na(max_pres) || max_pres <= 0) max_pres <- 2000.0
     
     grid_df <- if (nrow(df_valid) > 0) create_interpolated_grid_r(df_valid, var_name) else NULL
     
     # --------------------------------------------------------------------------
-    # Upper Plot: Interpolated Contour + Faded Grey 'x' Missing Overlay
+    # Upper Plot: Section Contour + Python-Identical Missing Overlay ('x' markers)
     # --------------------------------------------------------------------------
     p_data <- ggplot()
     
     if (!is.null(grid_df)) {
       if (is_chla) {
-        chla_breaks <- c(-0.1, 0.01, 0.03, 0.05, 0.1, 0.2, 0.35, 0.5, 0.8, 1.2, 2.0, 5.0)
+        z_min <- min(grid_df$z, na.rm = TRUE)
+        z_max <- max(grid_df$z, na.rm = TRUE)
+        base_breaks <- c(-0.1, 0.01, 0.03, 0.05, 0.1, 0.2, 0.35, 0.5, 0.8, 1.2, 2.0, 5.0)
+        chla_breaks <- unique(sort(c(min(z_min, -0.1), base_breaks[base_breaks > z_min & base_breaks < z_max], max(z_max, 5.0))))
+        
         p_data <- p_data + 
           geom_contour_filled(data = grid_df, aes(x = x, y = y, z = z), breaks = chla_breaks) +
           scale_fill_viridis_d(option = "turbo", name = unit_expr, drop = FALSE)
@@ -1079,15 +1408,14 @@ for (woko in float_ids) {
     } else if (nrow(df_valid) > 0) {
       p_data <- p_data + 
         geom_point(data = df_valid, aes(x = CYCLE_NUMBER, y = PRES, color = !!sym(var_name)), 
-                   size = 1.2, alpha = 0.8) +
+                   size = 1.2, alpha = 0.8, na.rm = TRUE) +
         scale_color_viridis_c(option = col_palette, name = unit_expr)
     }
     
-    # Python-exact missing data overlay: marker='x', c='#7f7f7f', s=12, alpha=0.35, linewidths=0.7
     if (nrow(df_missing) > 0) {
       p_data <- p_data + 
         geom_point(data = df_missing, aes(x = CYCLE_NUMBER, y = PRES, shape = "Missing Data (-99999)"), 
-                   color = "#7f7f7f", size = 1.2, stroke = 0.6, alpha = 0.35) +
+                   color = "#7f7f7f", size = 1.2, stroke = 0.7, alpha = 0.35, na.rm = TRUE) +
         scale_shape_manual(name = "", values = c("Missing Data (-99999)" = 4))
     }
     
@@ -1103,11 +1431,12 @@ for (woko in float_ids) {
         plot.title = element_text(face = "bold", size = 12),
         panel.grid.major = element_line(linetype = "dashed", color = "grey80", linewidth = 0.4),
         panel.grid.minor = element_blank(),
-        legend.position = "right"
+        legend.position = "right",
+        legend.background = element_rect(fill = alpha("white", 0.9), color = NA)
       )
     
     # --------------------------------------------------------------------------
-    # Lower Plot: QC Flags Scatter Map (Flag 9 shown as Black Dots #000000)
+    # Lower Plot: QC Flags Scatter Map (Python QC_COLOR_MAP)
     # --------------------------------------------------------------------------
     df_qc_plot <- df_plot %>% 
       filter(!is_argo_missing_val(PRES) & !is_argo_missing_val(CYCLE_NUMBER))
@@ -1121,7 +1450,7 @@ for (woko in float_ids) {
       sub_df <- df_qc_plot %>% filter(QC_VAL == q_flag)
       p_qc <- p_qc + 
         geom_point(data = sub_df, aes(x = CYCLE_NUMBER, y = PRES, color = QC_VAL), 
-                   size = 1.2, alpha = 0.7, shape = 16)
+                   size = 1.2, alpha = 0.7, shape = 16, na.rm = TRUE)
     }
     
     p_qc <- p_qc + 
@@ -1139,45 +1468,45 @@ for (woko in float_ids) {
         panel.grid.minor = element_blank(),
         legend.position = "right"
       ) +
-      guides(
-        color = guide_legend(
-          override.aes = list(size = 3.5, alpha = 1)
-        )
-      )
+      guides(color = guide_legend(override.aes = list(size = 3.5, alpha = 1)))
     
-    # Combined 2-panel vertical plot with shared X axis (heights 1:1)
     p_combined <- (p_data / p_qc) + 
       plot_layout(heights = c(1, 1), guides = "keep") +
       plot_annotation(
-        title = paste0("BGC-Argo Float ", float_id, " - ", title_prefix, " Section DMQC Summary"),
+        title = paste0("BGC-Argo Float ", float_id, " - ", title_prefix, " Section DMQC Summary (Verified BD Output)"),
         subtitle = paste0("Generated on: ", today_str),
         theme = theme(plot.title = element_text(face = "bold", size = 13))
       )
     
     out_file <- file.path(dir_qc_summary, sprintf("Float_%d_%s_Section_Summary.png", float_id, file_suffix))
     ggsave(out_file, plot = p_combined, width = 12, height = 8, dpi = 150)
-    message(sprintf("[%s] Saved QC Section Summary Plot -> %s", active_wmo, out_file))
+    message(sprintf("[%s] Saved Aligned BD-Verified QC Summary Plot -> %s", active_wmo, out_file))
   }
   
-  # Section Summary Plots Matching Python
   generate_section_qc_plot(df_summary_base, "DOXY", "DOXY_QC", "DOXY R_mode", "DOXY_R_mode", 
+                           col_palette = "plasma", unit_expr = expression(Oxygen ~ (mu * "mol/kg")))
+  generate_section_qc_plot(df_summary_base, "DOXY_ADJUSTED", "DOXY_ADJUSTED_QC", "DOXY A_mode", "DOXY_A_mode", 
                            col_palette = "plasma", unit_expr = expression(Oxygen ~ (mu * "mol/kg")))
   generate_section_qc_plot(df_summary_base, "DOXY_FINAL", "DOXY_FINAL_QC", "DOXY D_mode", "DOXY_D_mode", 
                            col_palette = "plasma", unit_expr = expression(Oxygen ~ (mu * "mol/kg")))
   
   generate_section_qc_plot(df_summary_base, "BBP700", "BBP700_QC", "BBP700 R_mode", "BBP700_R_mode", 
                            col_palette = "turbo", unit_expr = expression(b[bp](700) ~ (m^{-1})))
+  generate_section_qc_plot(df_summary_base, "BBP700_ADJUSTED", "BBP700_ADJUSTED_QC", "BBP700 A_mode", "BBP700_A_mode", 
+                           col_palette = "turbo", unit_expr = expression(b[bp](700) ~ (m^{-1})))
   generate_section_qc_plot(df_summary_base, "BBP700_FINAL", "BBP700_FINAL_QC", "BBP700 D_mode", "BBP700_D_mode", 
                            col_palette = "turbo", unit_expr = expression(b[bp](700) ~ (m^{-1})))
   
   generate_section_qc_plot(df_summary_base, "CHLA", "CHLA_QC", "CHLA R_mode", "CHLA_R_mode", 
+                           col_palette = "turbo", unit_expr = expression(Chlorophyll ~ a ~ (mg/m^3)), is_chla = TRUE)
+  generate_section_qc_plot(df_summary_base, "CHLA_ADJUSTED", "CHLA_ADJUSTED_QC", "CHLA A_mode", "CHLA_A_mode", 
                            col_palette = "turbo", unit_expr = expression(Chlorophyll ~ a ~ (mg/m^3)), is_chla = TRUE)
   generate_section_qc_plot(df_summary_base, "CHLA_FINAL", "CHLA_FINAL_QC", "CHLA D_mode", "CHLA_D_mode", 
                            col_palette = "turbo", unit_expr = expression(Chlorophyll ~ a ~ (mg/m^3)), is_chla = TRUE)
   
   generate_section_qc_plot(df_summary_base, "CHLA_FLUORESCENCE", "CHLA_FLUORESCENCE_QC", "CHLA_FLUORESCENCE R_mode", "CHLA_FLUORESCENCE_R_mode", 
                            col_palette = "mako", unit_expr = "Fluorescence (RU)")
-  generate_section_qc_plot(df_summary_base, "CHLA_FLUORESCENCE_ADJUSTED", "CHLA_FLUORESCENCE_ADJUSTED_QC", "CHLA_FLUORESCENCE D_mode", "CHLA_FLUORESCENCE_D_mode", 
+  generate_section_qc_plot(df_summary_base, "CHLA_FLUORESCENCE_FINAL", "CHLA_FLUORESCENCE_FINAL_QC", "CHLA_FLUORESCENCE D_mode", "CHLA_FLUORESCENCE_D_mode", 
                            col_palette = "mako", unit_expr = "Fluorescence (RU)")
   
   message("\n=== COMPLETE DMQC PROCESSING FOR FLOAT: ", float_id, " ===")
