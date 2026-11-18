@@ -73,6 +73,16 @@ safe_min <- function(x) {
   if (length(x_clean) > 0) min(x_clean) else NA_real_
 }
 
+# Safe linear interpolation wrapper preventing approx() crashes on <2 unique x or non-NA y
+safe_approx_y <- function(x, y, xout) {
+  valid <- !is.na(x) & is.finite(x) & !is.na(y) & is.finite(y)
+  if (sum(valid) < 2) return(NA_real_)
+  x_v <- x[valid]
+  y_v <- y[valid]
+  if (dplyr::n_distinct(x_v) < 2) return(mean(y_v, na.rm = TRUE))
+  as.numeric(stats::approx(x = x_v, y = y_v, xout = xout, rule = 2, ties = mean)$y)
+}
+
 compute_global_var_limits <- function(df, cols, extra_vals = NULL, pad_frac = 0.03) {
   all_vals <- numeric(0)
   for (col in cols) {
@@ -268,12 +278,14 @@ for (f in func.sources) {
   source(f)
 }
 
+# Excluded float 4903624 from dictionaries and DMQC processing
+excluded_floats <- c(4903624)
+
 launch_date_dict <- tibble::tribble(
   ~float_ids, ~launch_date_str,
   4903622,    "2021-10-04 23:36:00",
   2904010,    "2025-05-22 04:32:00",
   2904011,    "2025-05-19 12:15:00",
-  4903624,    "2021-09-25 09:51:00",
   4903625,    "2021-09-22 10:53:00",
   4903904,    "2025-06-24 07:00:00",
   6999992,    "2025-06-24 11:41:00",
@@ -291,7 +303,6 @@ float_type_dict <- tibble::tribble(
   4903622,    "aoml_apex",
   2904010,    "aoml_apex",
   2904011,    "aoml_apex",
-  4903624,    "aoml_apex",
   4903625,    "aoml_apex",
   4903904,    "aoml_navis",
   6999992,    "aoml_navis",
@@ -350,6 +361,7 @@ calib_csv_path <- file.path(dir_tables, "Jul2026_inair_output_binflags5.csv")
 
 calib_df <- read.csv(calib_csv_path) %>%
   mutate(float_ids = as.numeric(float_ids)) %>%
+  filter(!(float_ids %in% excluded_floats)) %>%
   select(-any_of("LAUNCH_DATE")) %>%
   left_join(launch_date_dict, by = "float_ids") %>%
   left_join(float_type_dict, by = "float_ids") %>%
@@ -362,8 +374,8 @@ calib_df <- read.csv(calib_csv_path) %>%
   ) %>%
   select(float_ids, doxy_slope, doxy_drift, launch_date, float_type)
 
-float_ids        <- calib_df$float_ids 
-target_floats    <- c(6999992, 4903904, 1902800, 5907206, 4903624)
+float_ids        <- setdiff(calib_df$float_ids, excluded_floats)
+target_floats    <- c(6999992, 4903904, 1902800, 5907206)
 hook_test_floats <- c(4903904, 6999992, 7901009, 7902327)
 today_str        <- format(Sys.Date(), format = "%Y-%m-%d")
 
@@ -524,23 +536,28 @@ generate_cycle_profile_plot <- function(df_cyc, var_cols, var_modes, var_title, 
 }
 
 # =========================================================================
-# 5B. PER-FLOAT DAY VS. NIGHT NPQ COMPARISON PLOT (0 - 100 m / dbar)
+# 5B. PER-FLOAT 6-PANEL DAY VS. NIGHT NPQ & MLD VALIDATION PLOT (0 - 100 dbar)
 # =========================================================================
 
 generate_day_night_npq_plot <- function(df_export, out_file, float_id, x_limits = NULL) {
-  req_cols <- c("CYCLE_NUMBER", "PRES", "CHLA_ADJUSTED", "CHLA_FINAL", "SUN_TEST", "MLD")
+  req_cols <- c("CYCLE_NUMBER", "PRES", "CHLA_FINAL", "SUN_TEST", "MLD")
   if (!all(req_cols %in% names(df_export))) {
     warning(sprintf("Skipping Day vs. Night NPQ plot for Float %s: missing required columns.", float_id))
     return(invisible(NULL))
   }
   
+  pre_col  <- if ("CHLA_PRE_NPQ" %in% names(df_export)) "CHLA_PRE_NPQ" else "CHLA_ADJUSTED"
+  post_col <- if ("CHLA_NOLUT" %in% names(df_export)) "CHLA_NOLUT" else if ("CHLA_NoLUT" %in% names(df_export)) "CHLA_NoLUT" else "CHLA_FINAL"
+  
   df_sub <- df_export %>%
     mutate(
-      PRES          = standardize_to_na(as.numeric(PRES)),
-      CHLA_ADJUSTED = standardize_to_na(as.numeric(CHLA_ADJUSTED)),
-      CHLA_FINAL    = standardize_to_na(as.numeric(CHLA_FINAL)),
-      MLD           = standardize_to_na(as.numeric(MLD)),
-      Diel_Period   = case_when(
+      PRES        = standardize_to_na(as.numeric(PRES)),
+      VAL_PRE     = standardize_to_na(as.numeric(.data[[pre_col]])),
+      VAL_POST    = standardize_to_na(as.numeric(.data[[post_col]])),
+      VAL_FINAL   = standardize_to_na(as.numeric(CHLA_FINAL)),
+      MLD         = standardize_to_na(as.numeric(MLD)),
+      IS_NPQ_QC5  = if ("CHLA_FINAL_QC" %in% names(.)) as.character(CHLA_FINAL_QC) == "5" else FALSE,
+      Diel_Period = case_when(
         tolower(as.character(SUN_TEST)) == "day"   ~ "Daytime",
         tolower(as.character(SUN_TEST)) == "night" ~ "Nighttime",
         TRUE ~ NA_character_
@@ -548,91 +565,126 @@ generate_day_night_npq_plot <- function(df_export, out_file, float_id, x_limits 
     ) %>%
     filter(!is.na(PRES) & PRES >= 0 & PRES <= 100 & !is.na(Diel_Period))
   
-  if (nrow(df_sub) == 0) return(invisible(NULL))
+  # Abort cleanly if no valid CHLA observations exist in 0-100 dbar (e.g., overridden cycles)
+  has_any_chla <- any(!is.na(df_sub$VAL_PRE) | !is.na(df_sub$VAL_POST) | !is.na(df_sub$VAL_FINAL))
+  if (nrow(df_sub) == 0 || !has_any_chla) {
+    message(sprintf("[%s] Skipping Day vs. Night NPQ plot: no valid CHLA values in 0-100 dbar.", float_id))
+    return(invisible(NULL))
+  }
   
   df_sub$Diel_Period <- factor(df_sub$Diel_Period, levels = c("Daytime", "Nighttime"))
   
-  # Compute mean Daytime MLD and 0.9 * MLD ceiling across cycles
-  cyc_mld_df <- df_sub %>%
-    distinct(CYCLE_NUMBER, Diel_Period, MLD) %>%
-    filter(!is.na(MLD) & is.finite(MLD) & MLD > 0)
-  
-  mean_day_mld   <- mean(cyc_mld_df$MLD[cyc_mld_df$Diel_Period == "Daytime"], na.rm = TRUE)
-  mean_night_mld <- mean(cyc_mld_df$MLD[cyc_mld_df$Diel_Period == "Nighttime"], na.rm = TRUE)
-  npq_ceiling    <- if (is.finite(mean_day_mld)) 0.9 * mean_day_mld else NA_real_
-  
-  # Binned median profiles (5-dbar depth bins) to highlight mean vertical structure
-  df_binned <- df_sub %>%
-    mutate(PRES_BIN = floor(PRES / 5) * 5 + 2.5) %>%
-    group_by(Diel_Period, PRES_BIN) %>%
-    summarise(
-      MED_PRE  = median(CHLA_ADJUSTED, na.rm = TRUE),
-      MED_POST = median(CHLA_FINAL, na.rm = TRUE),
-      .groups  = "drop"
+  # -------------------------------------------------------------------------
+  # Per-cycle MLD & 0.9 * MLD summary (to verify valid MLD > 5 m per profile)
+  # -------------------------------------------------------------------------
+  cyc_summary <- df_export %>%
+    mutate(
+      PRES = standardize_to_na(as.numeric(PRES)),
+      MLD  = standardize_to_na(as.numeric(MLD)),
+      Diel_Period = case_when(
+        tolower(as.character(SUN_TEST)) == "day"   ~ "Daytime",
+        tolower(as.character(SUN_TEST)) == "night" ~ "Nighttime",
+        TRUE ~ NA_character_
+      )
     ) %>%
-    arrange(Diel_Period, PRES_BIN)
+    filter(!is.na(Diel_Period)) %>%
+    group_by(CYCLE_NUMBER, Diel_Period) %>%
+    summarise(
+      MLD_VAL   = first(MLD[!is.na(MLD) & is.finite(MLD)]),
+      VALID_MLD = !is.na(MLD_VAL) && is.finite(MLD_VAL) && MLD_VAL > 5,
+      NPQ_DEPTH = ifelse(VALID_MLD, 0.9 * MLD_VAL, NA_real_),
+      NPQ_COUNT = if ("CHLA_FINAL_QC" %in% names(df_export)) sum(as.character(CHLA_FINAL_QC) == "5", na.rm = TRUE) else 0,
+      .groups   = "drop"
+    )
+  
+  # Interpolate CHLA concentration directly at each cycle's valid MLD depth safely
+  get_mld_points <- function(val_col_name, period_filter) {
+    df_joined <- df_sub %>%
+      filter(Diel_Period == period_filter) %>%
+      inner_join(
+        cyc_summary %>% filter(Diel_Period == period_filter & VALID_MLD & MLD_VAL <= 100),
+        by = c("CYCLE_NUMBER", "Diel_Period")
+      ) %>%
+      filter(!is.na(.data[[val_col_name]]) & is.finite(.data[[val_col_name]]) & !is.na(PRES) & is.finite(PRES))
+    
+    if (nrow(df_joined) == 0) {
+      return(data.frame(
+        CYCLE_NUMBER = numeric(0), Diel_Period = factor(character(0), levels = c("Daytime", "Nighttime")),
+        MLD_VAL = numeric(0), NPQ_DEPTH = numeric(0), NPQ_COUNT = numeric(0),
+        CHLA_AT_MLD = numeric(0), CHLA_AT_09MLD = numeric(0)
+      ))
+    }
+    
+    df_joined %>%
+      group_by(CYCLE_NUMBER, Diel_Period, MLD_VAL, NPQ_DEPTH, NPQ_COUNT) %>%
+      filter(n() >= 2 & dplyr::n_distinct(PRES) >= 2) %>%
+      summarise(
+        CHLA_AT_MLD   = safe_approx_y(PRES, .data[[val_col_name]], first(MLD_VAL)),
+        CHLA_AT_09MLD = safe_approx_y(PRES, .data[[val_col_name]], first(NPQ_DEPTH)),
+        .groups = "drop"
+      ) %>%
+      filter(!is.na(CHLA_AT_MLD) & is.finite(CHLA_AT_MLD))
+  }
   
   diel_colors <- c("Daytime" = "#D95F02", "Nighttime" = "#1F78B4")
   
   if (is.null(x_limits) || length(x_limits) != 2 || !all(is.finite(x_limits))) {
-    x_limits <- compute_global_var_limits(df_sub, c("CHLA_ADJUSTED", "CHLA_FINAL"))
+    x_limits <- compute_global_var_limits(df_sub, c("VAL_PRE", "VAL_POST", "VAL_FINAL"))
   }
   
-  build_panel <- function(val_col, med_col, panel_title, panel_sub) {
-    df_p <- df_sub %>%
-      filter(!is.na(.data[[val_col]])) %>%
+  build_panel <- function(period_filter, val_col, panel_title, panel_sub, show_qc5 = FALSE) {
+    df_p   <- df_sub %>%
+      filter(Diel_Period == period_filter & !is.na(.data[[val_col]])) %>%
       arrange(CYCLE_NUMBER, PRES)
+    df_pts <- get_mld_points(val_col, period_filter)
     
-    df_m <- df_binned %>%
-      filter(!is.na(.data[[med_col]]))
+    g <- ggplot()
     
-    g <- ggplot() +
-      geom_path(
-        data = df_p,
-        aes(x = .data[[val_col]], y = PRES, color = Diel_Period, group = CYCLE_NUMBER),
-        linewidth = 0.55, alpha = 0.35, na.rm = TRUE
-      ) +
-      geom_path(
-        data = df_m,
-        aes(x = .data[[med_col]], y = PRES_BIN, color = Diel_Period, group = Diel_Period),
-        linewidth = 1.6, alpha = 0.95, na.rm = TRUE
-      )
-    
-    # Overlay mean Daytime MLD & 0.9 * MLD reference lines if within 0-100 m
-    if (is.finite(mean_day_mld) && mean_day_mld <= 100) {
+    # Individual cycle profiles (no mean/median profile lines)
+    if (nrow(df_p) > 0) {
       g <- g +
-        geom_hline(yintercept = mean_day_mld, linetype = "dashed", color = "#D95F02", linewidth = 0.8) +
-        annotate("text", x = Inf, y = mean_day_mld,
-                 label = sprintf("Mean Day MLD (%.1f m) ", mean_day_mld),
-                 hjust = 1.02, vjust = -0.4, size = 3.1, fontface = "bold", color = "#D95F02")
+        geom_path(
+          data = df_p,
+          aes(x = .data[[val_col]], y = PRES, color = Diel_Period, group = CYCLE_NUMBER),
+          linewidth = 0.55, alpha = 0.45, na.rm = TRUE
+        )
     }
     
-    if (is.finite(npq_ceiling) && npq_ceiling <= 100) {
+    # Point marking each cycle's valid MLD (> 5 m) along its individual profile
+    if (nrow(df_pts) > 0) {
       g <- g +
-        geom_hline(yintercept = npq_ceiling, linetype = "dotted", color = "#7570B3", linewidth = 0.8) +
-        annotate("text", x = Inf, y = npq_ceiling,
-                 label = sprintf("0.9 x Day MLD (%.1f m) ", npq_ceiling),
-                 hjust = 1.02, vjust = 1.35, size = 3.0, color = "#7570B3")
+        geom_point(
+          data = df_pts,
+          aes(x = CHLA_AT_MLD, y = MLD_VAL, fill = Diel_Period),
+          shape = 21, color = "black", size = 2.2, stroke = 0.5, alpha = 0.9, na.rm = TRUE
+        )
     }
     
-    if (is.finite(mean_night_mld) && mean_night_mld <= 100) {
+    # Highlight depth points where NPQ correction was actively applied (QC = 5)
+    if (show_qc5 && nrow(df_p) > 0 && any(df_p$IS_NPQ_QC5, na.rm = TRUE)) {
       g <- g +
-        geom_hline(yintercept = mean_night_mld, linetype = "dashed", color = "#1F78B4", linewidth = 0.7, alpha = 0.8)
+        geom_point(
+          data = df_p %>% filter(IS_NPQ_QC5),
+          aes(x = .data[[val_col]], y = PRES, shape = "NPQ Applied (QC = 5)"),
+          color = "#7570B3", size = 1.35, alpha = 0.8, na.rm = TRUE
+        )
     }
     
     g <- g +
       scale_y_reverse(limits = c(100, 0), expand = c(0, 0), oob = scales::squish) +
       scale_color_manual(name = "Profile Period", values = diel_colors, drop = FALSE) +
+      scale_fill_manual(name = "Valid MLD Point (>5 m)", values = diel_colors, drop = FALSE) +
+      scale_shape_manual(name = "NPQ Flag", values = c("NPQ Applied (QC = 5)" = 16), drop = FALSE) +
       labs(
         title = panel_title,
         subtitle = panel_sub,
         x = expression(Chlorophyll ~ a ~ (mg/m^3)),
         y = "Pressure (dbar)"
       ) +
-      theme_bw(base_size = 11) +
+      theme_bw(base_size = 10.5) +
       theme(
-        plot.title = element_text(face = "bold", size = 11.5),
-        plot.subtitle = element_text(size = 9, color = "grey30"),
+        plot.title = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 8.5, color = "grey30"),
         panel.grid.major = element_line(linetype = "dashed", color = "grey85", linewidth = 0.4),
         panel.grid.minor = element_blank(),
         legend.position = "bottom"
@@ -645,38 +697,80 @@ generate_day_night_npq_plot <- function(df_export, out_file, float_id, x_limits 
     return(g)
   }
   
-  n_day   <- n_distinct(df_sub$CYCLE_NUMBER[df_sub$Diel_Period == "Daytime"])
-  n_night <- n_distinct(df_sub$CYCLE_NUMBER[df_sub$Diel_Period == "Nighttime"])
+  n_day_tot   <- sum(cyc_summary$Diel_Period == "Daytime")
+  n_day_mld   <- sum(cyc_summary$Diel_Period == "Daytime" & cyc_summary$VALID_MLD)
+  n_day_npq   <- sum(cyc_summary$Diel_Period == "Daytime" & cyc_summary$NPQ_COUNT > 0)
+  n_night_tot <- sum(cyc_summary$Diel_Period == "Nighttime")
+  n_night_mld <- sum(cyc_summary$Diel_Period == "Nighttime" & cyc_summary$VALID_MLD)
   
-  p_pre <- build_panel(
-    val_col     = "CHLA_ADJUSTED",
-    med_col     = "MED_PRE",
-    panel_title = "Before NPQ Correction (A-Mode)",
-    panel_sub   = "Quenched daytime surface profiles vs. unquenched nighttime profiles"
+  # Top Row: Daytime Panels (1 - 3)
+  p_day_pre <- build_panel(
+    period_filter = "Daytime",
+    val_col       = "VAL_PRE",
+    panel_title   = "Daytime 1. Pre-NPQ (Dark Corrected)",
+    panel_sub     = "Unadjusted daytime surface quenching",
+    show_qc5      = FALSE
   )
   
-  p_post <- build_panel(
-    val_col     = "CHLA_FINAL",
-    med_col     = "MED_POST",
-    panel_title = "After NPQ & LUT Correction (D-Mode)",
-    panel_sub   = "Cookbook 5-pt median + 0.9 x MLD upward surface extrapolation"
+  p_day_post <- build_panel(
+    period_filter = "Daytime",
+    val_col       = "VAL_POST",
+    panel_title   = "Daytime 2. Post-NPQ (Pre-LUT)",
+    panel_sub     = "Purple dots = QC 5 extrapolated to 0.9x MLD",
+    show_qc5      = TRUE
   )
   
-  p_combined <- (p_pre | p_post) +
+  p_day_final <- build_panel(
+    period_filter = "Daytime",
+    val_col       = "VAL_FINAL",
+    panel_title   = "Daytime 3. Final D-Mode (NPQ + LUT)",
+    panel_sub     = "Radiometric LUT ratio applied after NPQ",
+    show_qc5      = TRUE
+  )
+  
+  # Bottom Row: Nighttime Panels (4 - 6)
+  p_night_pre <- build_panel(
+    period_filter = "Nighttime",
+    val_col       = "VAL_PRE",
+    panel_title   = "Nighttime 4. Pre-NPQ (Dark Corrected)",
+    panel_sub     = "Unquenched nighttime reference profiles",
+    show_qc5      = FALSE
+  )
+  
+  p_night_post <- build_panel(
+    period_filter = "Nighttime",
+    val_col       = "VAL_POST",
+    panel_title   = "Nighttime 5. Post-NPQ (Pre-LUT)",
+    panel_sub     = "Verify no NPQ modification occurs at night",
+    show_qc5      = TRUE
+  )
+  
+  p_night_final <- build_panel(
+    period_filter = "Nighttime",
+    val_col       = "VAL_FINAL",
+    panel_title   = "Nighttime 6. Final D-Mode (LUT Applied)",
+    panel_sub     = "Radiometric LUT ratio applied to nighttime",
+    show_qc5      = TRUE
+  )
+  
+  p_combined <- ((p_day_pre | p_day_post | p_day_final) /
+                   (p_night_pre | p_night_post | p_night_final)) +
     plot_layout(guides = "collect") +
     plot_annotation(
-      title = sprintf("Float %s - Day vs. Night CHLA Profiles & NPQ Correction (0-100 dbar)", float_id),
-      subtitle = sprintf("Daytime cycles: %d | Nighttime cycles: %d | Thick lines = 5-dbar bin medians | Thin lines = individual cycles",
-                         n_day, n_night),
+      title = sprintf("Float %s - Separated Day & Night CHLA, NPQ Correction & Valid MLD Check (0-100 dbar)", float_id),
+      subtitle = sprintf(
+        "Daytime: %d cycles (%d valid MLD > 5m, %d NPQ-corrected) | Nighttime: %d cycles (%d valid MLD > 5m) | Circles = per-cycle valid MLD",
+        n_day_tot, n_day_mld, n_day_npq, n_night_tot, n_night_mld
+      ),
       theme = theme(
-        plot.title = element_text(face = "bold", size = 13),
-        plot.subtitle = element_text(size = 9.5, color = "grey25"),
+        plot.title = element_text(face = "bold", size = 12.5),
+        plot.subtitle = element_text(size = 9, color = "grey25"),
         legend.position = "bottom"
       )
     )
   
-  ggsave(out_file, plot = p_combined, width = 12, height = 7, dpi = 150)
-  message(sprintf("[%s] Saved Day vs. Night 0-100m NPQ Comparison Plot -> %s", float_id, out_file))
+  ggsave(out_file, plot = p_combined, width = 16, height = 11.5, dpi = 150)
+  message(sprintf("[%s] Saved 6-Panel Day & Night 0-100m NPQ & MLD Plot -> %s", float_id, out_file))
   return(invisible(TRUE))
 }
 
@@ -688,6 +782,11 @@ for (woko in float_ids) {
   
   float_id   <- as.numeric(woko)
   active_wmo <- as.character(woko)
+  
+  if (float_id %in% excluded_floats) {
+    message(sprintf("Skipping excluded float: %s", active_wmo))
+    next
+  }
   
   dir_date_base   <- file.path(dir_plot_base, today_str)
   dir_float_plots <- file.path(dir_date_base, active_wmo)
@@ -1062,6 +1161,9 @@ for (woko in float_ids) {
   
   float_data$sun_test <- ifelse(float_data$SOLAR_ANGLE >= 0, "day", "night")
   
+  # Preserve Pre-NPQ profile so the Day/Night diagnostic plot can isolate the NPQ step
+  float_data$CHLA_PRE_NPQ <- float_data$CHLA_NoLUT
+  
   float_data$NPQ_APPLIED <- FALSE
   for (i in unique(float_data$CYCLE_NUMBER)) {
     idx <- which(float_data$CYCLE_NUMBER == i)
@@ -1311,8 +1413,7 @@ for (woko in float_ids) {
   df_export_prep <- df_export_prep %>%
     mutate(
       override_condition = (
-        (float_num == "4903624") | 
-          (float_num == "2904010" & CYCLE_NUMBER >= 49) | 
+        (float_num == "2904010" & CYCLE_NUMBER >= 49) | 
           (float_num == "2904011" & CYCLE_NUMBER >= 24)
       ),
       CHLA                             = ifelse(override_condition, -99999.0, CHLA),
@@ -1336,6 +1437,7 @@ for (woko in float_ids) {
       CHLA_FLUORESCENCE_FINAL          = ifelse(override_condition, -99999.0, CHLA_FLUORESCENCE_FINAL),
       CHLA_FLUORESCENCE_FINAL_QC       = ifelse(override_condition, "9", as.character(CHLA_FLUORESCENCE_FINAL_QC)),
       
+      CHLA_PRE_NPQ                     = ifelse(override_condition, -99999.0, CHLA_PRE_NPQ),
       CHLA_NoLUT                       = ifelse(override_condition, -99999.0, CHLA_NoLUT),
       SCALE_CHLA                       = ifelse(override_condition, -99999.0, SCALE_CHLA),
       DARK_CHLA                        = ifelse(override_condition, -99999.0, DARK_CHLA)
@@ -1432,8 +1534,8 @@ for (woko in float_ids) {
   message(sprintf("[%s] Removed %d depth levels consistently missing across all BGC parameters and modes (%d levels retained).", 
                   active_wmo, n_rows_removed, nrow(df_combo_export)))
   
-  # Save CSV without internal SUN_TEST helper column
-  write.csv(df_combo_export %>% select(-any_of("SUN_TEST")), combo_output_path, row.names = FALSE)
+  # Save CSV without internal helper columns
+  write.csv(df_combo_export %>% select(-any_of(c("SUN_TEST", "CHLA_PRE_NPQ"))), combo_output_path, row.names = FALSE)
   message(sprintf("\n>>> SUCCESSFULLY EXPORTED ALL MODES COMBINED CSV -> %s", combo_output_path))
   
   # ==============================================================================
@@ -1547,7 +1649,7 @@ for (woko in float_ids) {
   }
   
   # ==============================================================================
-  # STEP 7.5: PER-FLOAT DAY VS. NIGHT NPQ & MLD SUMMARY PLOT (0 - 100 m)
+  # STEP 7.5: PER-FLOAT 6-PANEL DAY & NIGHT NPQ & MLD SUMMARY PLOT (0 - 100 m)
   # ==============================================================================
   day_night_npq_file <- file.path(dir_chla_plots, sprintf("Float_%s_Day_vs_Night_NPQ_0_100m.png", active_wmo))
   generate_day_night_npq_plot(
