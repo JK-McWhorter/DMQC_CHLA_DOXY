@@ -122,15 +122,143 @@ VALID_QC_CHARS = {"0", "1", "2", "3", "4", "5", "8", "9"}
 VALID_DATA_MODES = {"R", "A", "D"}
 MISSING_VAL = 99999.0
 
+TARGET_R_TO_D_SYNC_PARAMS = {
+    "CHLA",
+    "CHLA_FLUORESCENCE",
+    "FLUORESCENCE_CHLA",
+    "DOXY",
+    "BBP700",
+}
+
+
+def write_nc_char_1d(var, iprof, char_str):
+    """Safely writes a 1D string of length N_LEVELS / N_PARAM into a 2D NC_CHAR variable."""
+    n_len = var.shape[1]
+    padded = char_str.ljust(n_len)[:n_len]
+    if var.dtype.kind == "S":
+        var[iprof, :] = nc.stringtochar(np.array(padded, dtype=f"S{n_len}"))
+    else:
+        var[iprof, :] = list(padded)
+
 
 def is_missing_value(val):
-    if val is None or pd.isna(val):
+    if val is None or np.ma.is_masked(val) or pd.isna(val):
         return True
     try:
         f = float(val)
-        return f == -99999.0 or f == 99999.0
+        return np.isnan(f) or np.isinf(f) or f == -99999.0 or f == 99999.0 or f == -999.0
     except (ValueError, TypeError):
         return False
+
+
+def is_missing_qc(qc_val):
+    if qc_val is None or np.ma.is_masked(qc_val):
+        return True
+    if isinstance(qc_val, (bytes, np.bytes_)):
+        s = qc_val.decode("utf-8", errors="ignore").strip()
+    else:
+        s = str(qc_val).strip()
+    return s in ["", " ", "9"] or s not in VALID_QC_CHARS
+
+
+def is_blank_qc(qc_val):
+    """Returns True if the QC character is a blank (' ' or '') or masked."""
+    if qc_val is None or np.ma.is_masked(qc_val):
+        return True
+    if isinstance(qc_val, (bytes, np.bytes_)):
+        s = qc_val.decode("utf-8", errors="ignore").strip()
+    else:
+        s = str(qc_val).strip()
+    return s == ""
+
+
+def get_r_mode_missing_mask(ds, iprof, base_param, n_levels):
+    """
+    Returns a boolean array of length `n_levels` where True indicates that
+    the R-mode variable (<PARAM>) OR its R-mode QC (<PARAM>_QC) at that
+    pressure level is missing / fill value.
+    """
+    missing_mask = np.zeros(n_levels, dtype=bool)
+
+    candidate_names = [base_param]
+    if base_param in ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"]:
+        candidate_names = ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"]
+
+    raw_var_name = next((c for c in candidate_names if c in ds.variables), None)
+    raw_qc_name = f"{raw_var_name}_QC" if raw_var_name and f"{raw_var_name}_QC" in ds.variables else None
+
+    if raw_var_name is not None:
+        v = ds.variables[raw_var_name]
+        arr = v[iprof, :] if v.ndim > 1 else v[:]
+        vals = arr.filled(MISSING_VAL) if hasattr(arr, "filled") else np.array(arr, dtype="float64")
+        val_miss = (
+            np.isnan(vals)
+            | np.isinf(vals)
+            | (vals == MISSING_VAL)
+            | (vals == -99999.0)
+            | (vals == 99999.0)
+            | (vals == -999.0)
+        )
+        missing_mask |= val_miss[:n_levels]
+    else:
+        missing_mask[:] = True
+
+    if raw_qc_name is not None:
+        qv = ds.variables[raw_qc_name]
+        q_arr = qv[iprof, :] if qv.ndim > 1 else qv[:]
+        if hasattr(q_arr, "filled"):
+            q_arr = q_arr.filled(b"9")
+        for k in range(min(n_levels, len(q_arr))):
+            if is_missing_qc(q_arr[k]):
+                missing_mask[k] = True
+
+    return missing_mask
+
+
+def get_profile_max_level_idx(ds, iprof, base_param=None):
+    """
+    Finds the 0-based index (`max_k`) of the deepest actual level (`nlev - 1`)
+    for `iprof` across PRES and all parameters on that profile.
+    - Levels `0 .. max_k` are inside the profile depth range (missing values -> '9').
+    - Levels `max_k + 1 .. N_LEVELS - 1` are array padding beyond nlev (must be blank ' ').
+    """
+    n_levels = ds.dimensions["N_LEVELS"].size
+    pres_vals, pres_qcs = get_pres_and_qc_for_profile(ds, iprof)
+
+    # 1. Valid PRES values or non-blank PRES_QC
+    combined_active = (
+        (~np.isnan(pres_vals))
+        & (pres_vals != MISSING_VAL)
+        & (pres_vals != -99999.0)
+        & (pres_vals != 99999.0)
+        & (pres_vals != -999.0)
+    )
+    for k in range(min(n_levels, len(pres_qcs))):
+        if not is_blank_qc(pres_qcs[k]):
+            combined_active[k] = True
+
+    # 2. Check non-blank R-mode <PARAM>_QC flags across ALL parameters in this iprof
+    prof_params = get_station_parameters_for_profile(ds, iprof)
+    if base_param and base_param not in prof_params:
+        prof_params.append(base_param)
+
+    for p in prof_params:
+        candidates = (
+            ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"]
+            if p in ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"]
+            else [p]
+        )
+        for cand in candidates:
+            qc_name = f"{cand}_QC"
+            if qc_name in ds.variables:
+                qv = ds.variables[qc_name]
+                q_arr = qv[iprof, :] if qv.ndim > 1 else qv[:]
+                for k in range(min(n_levels, len(q_arr))):
+                    if not is_blank_qc(q_arr[k]):
+                        combined_active[k] = True
+
+    active_indices = np.where(combined_active)[0]
+    return int(active_indices[-1]) if len(active_indices) > 0 else -1
 
 
 # ==============================================================================
@@ -162,7 +290,7 @@ def detect_parameter_profile(ds, param_prefix):
     prof = get_profile_for_parameter(ds, param_prefix)
     if prof is not None:
         return prof
-    
+
     # Secondary fallback: inspect actual variable arrays if STATION_PARAMETERS is missing/incomplete
     target_prefixes = [param_prefix]
     if param_prefix in ["CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"]:
@@ -180,9 +308,10 @@ def detect_parameter_profile(ds, param_prefix):
                     for iprof in range(var.shape[0]):
                         sl = var[iprof, :]
                         vals = sl.filled(MISSING_VAL) if hasattr(sl, "filled") else np.array(sl)
-                        if (~pd.isna(vals) & (vals != MISSING_VAL) & (vals != 99999.0)).any():
+                        if (~pd.isna(vals) & (vals != MISSING_VAL) & (vals != 99999.0) & (vals != -999.0)).any():
                             return iprof
     return 0
+
 
 def has_valid_measurements(bgc_file, param, iprof=None):
     if iprof is None:
@@ -209,7 +338,7 @@ def has_valid_measurements(bgc_file, param, iprof=None):
             var = bgc_file.variables[p]
             p_slice = var[iprof, :] if var.ndim > 1 else var[:]
             p_vals = p_slice.filled(MISSING_VAL) if hasattr(p_slice, "filled") else np.array(p_slice)
-            valid_mask = (~pd.isna(p_vals)) & (p_vals != MISSING_VAL) & (p_vals != 99999.0)
+            valid_mask = (~pd.isna(p_vals)) & (p_vals != MISSING_VAL) & (p_vals != 99999.0) & (p_vals != -999.0)
             if valid_mask.any():
                 return True
     return False
@@ -227,8 +356,8 @@ def get_param_data_mode(bgc_file, iprof, param_base):
         if dm_var is not None:
             m = dm_var[iprof] if dm_var.ndim > 0 else dm_var[:]
             mode_str = m.decode("utf-8").strip() if isinstance(m, (bytes, np.bytes_)) else str(m).strip()
-            return mode_str if mode_str in VALID_DATA_MODES else "99999"
-        return "99999"
+            return mode_str if mode_str in VALID_DATA_MODES else "R"
+        return "R"
 
     station_params = bgc_file.variables["STATION_PARAMETERS"][iprof]
     pdm_array = bgc_file.variables["PARAMETER_DATA_MODE"][iprof]
@@ -251,14 +380,45 @@ def get_param_data_mode(bgc_file, iprof, param_base):
         if p_str in target_names or any(p_str.startswith(tn) for tn in target_names):
             m_val = pdm_array[j]
             mode_str = m_val.decode("utf-8").strip() if isinstance(m_val, (bytes, np.bytes_)) else str(m_val).strip()
-            return mode_str if mode_str in VALID_DATA_MODES else "99999"
+            return mode_str if mode_str in VALID_DATA_MODES else "R"
 
-    dm_var = bgc_file.variables.get("DATA_MODE")
-    if dm_var is not None:
-        m = dm_var[iprof] if dm_var.ndim > 0 else dm_var[:]
-        mode_str = m.decode("utf-8").strip() if isinstance(m, (bytes, np.bytes_)) else str(m).strip()
-        return mode_str if mode_str in VALID_DATA_MODES else "99999"
-    return "99999"
+    # Parameter is not listed in STATION_PARAMETERS[iprof] -> must be treated as R/FillValue on this iprof
+    return "R"
+
+
+def sync_data_mode_from_parameter_data_mode(bgc_file):
+    """
+    Ensures DATA_MODE[iprof] is strictly consistent with PARAMETER_DATA_MODE[iprof, :]:
+    - If any parameter on iprof is 'D' -> DATA_MODE[iprof] = 'D'
+    - Else if any parameter on iprof is 'A' -> DATA_MODE[iprof] = 'A'
+    - Else -> DATA_MODE[iprof] = 'R'
+    """
+    if "PARAMETER_DATA_MODE" not in bgc_file.variables or "DATA_MODE" not in bgc_file.variables:
+        return
+
+    n_prof = bgc_file.dimensions["N_PROF"].size
+    pdm_var = bgc_file.variables["PARAMETER_DATA_MODE"]
+    dm_var = bgc_file.variables["DATA_MODE"]
+    pdm = pdm_var[:]
+
+    for iprof in range(n_prof):
+        row_modes = []
+        for m in np.ravel(pdm[iprof]):
+            s = m.decode("utf-8", errors="ignore").strip() if isinstance(m, (bytes, np.bytes_)) else str(m).strip()
+            if s in VALID_DATA_MODES:
+                row_modes.append(s)
+
+        if "D" in row_modes:
+            best = "D"
+        elif "A" in row_modes:
+            best = "A"
+        else:
+            best = "R"
+
+        if dm_var.dtype.kind == "S":
+            dm_var[iprof] = nc.stringtochar(np.array(best, dtype="S1"))
+        else:
+            dm_var[iprof] = best
 
 
 def write_parameter_data_modes(bgc_file, WMOfloatid=None, cycle_df=None):
@@ -266,8 +426,8 @@ def write_parameter_data_modes(bgc_file, WMOfloatid=None, cycle_df=None):
     n_prof = bgc_file.dimensions["N_PROF"].size
     skip_doxy = WMOfloatid in DOXY_EXCLUDE_FLOAT_IDS if WMOfloatid is not None else False
 
-    pdm = bgc_file.variables["PARAMETER_DATA_MODE"][:]
-    data_mode = bgc_file.variables["DATA_MODE"][:]
+    pdm_var = bgc_file.variables["PARAMETER_DATA_MODE"]
+    pdm = np.array(pdm_var[:], copy=True)
 
     csv_col_map = {
         "CHLA": ["CHLA_FINAL"],
@@ -284,7 +444,7 @@ def write_parameter_data_modes(bgc_file, WMOfloatid=None, cycle_df=None):
         for c in cols:
             if c in cycle_df.columns:
                 vals = cycle_df[c].dropna()
-                if not vals.empty and (~vals.isin([-99999.0, 99999.0])).any():
+                if not vals.empty and (~vals.isin([-99999.0, 99999.0, -999.0])).any():
                     return True
         return False
 
@@ -293,6 +453,7 @@ def write_parameter_data_modes(bgc_file, WMOfloatid=None, cycle_df=None):
         if isinstance(param_mat, np.ma.MaskedArray):
             param_mat = param_mat.filled(b" ")
 
+        row_chars = []
         for j in range(n_param):
             p_bytes = param_mat[j]
             p_str = "".join([
@@ -300,25 +461,33 @@ def write_parameter_data_modes(bgc_file, WMOfloatid=None, cycle_df=None):
                 for c in p_bytes
             ]).strip()
 
+            cur_m = pdm[iprof, j]
+            cur_char = cur_m.decode("utf-8", errors="ignore") if isinstance(cur_m, (bytes, np.bytes_)) else str(cur_m)
+            if not cur_char:
+                cur_char = " "
+
             if not p_str or "PH" in p_str or "NITRATE" in p_str:
+                row_chars.append(cur_char[0])
                 continue
 
             if skip_doxy and p_str == "DOXY":
+                row_chars.append(cur_char[0])
                 continue
 
             if p_str == "PRES" or p_str.startswith("DOWN_IRRADIANCE") or p_str.startswith("UP_RADIANCE"):
-                pdm[iprof, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
+                row_chars.append("R")
             elif p_str in ["CHLA", "CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA", "BBP700", "DOXY"]:
                 # Only switch to 'D' if both the NetCDF profile AND the CSV contain valid data
                 if has_valid_measurements(bgc_file, p_str, iprof) and has_csv_calibration(p_str):
-                    pdm[iprof, j] = b"D" if pdm.dtype.kind in ["S", "U", "O"] else "D"
-                    data_mode[iprof] = b"D" if data_mode.dtype.kind in ["S", "U", "O"] else "D"
+                    row_chars.append("D")
                 else:
-                    pdm[iprof, j] = b"R" if pdm.dtype.kind in ["S", "U", "O"] else "R"
+                    row_chars.append("R")
+            else:
+                row_chars.append(cur_char[0])
 
-    bgc_file.variables["PARAMETER_DATA_MODE"][:] = pdm
-    bgc_file.variables["DATA_MODE"][:] = data_mode
+        write_nc_char_1d(pdm_var, iprof, "".join(row_chars))
 
+    sync_data_mode_from_parameter_data_mode(bgc_file)
 
 
 def get_profile_qc_grade(qc_array, parameter_present=True):
@@ -354,6 +523,7 @@ def get_profile_qc_grade(qc_array, parameter_present=True):
     else:
         return "F"
 
+
 def get_station_parameters_for_profile(ds, iprof):
     """
     Extracts cleaned parameter name strings for a specific profile (N_PROF index)
@@ -361,11 +531,11 @@ def get_station_parameters_for_profile(ds, iprof):
     """
     if "STATION_PARAMETERS" not in ds.variables:
         return []
-    
+
     param_mat = ds.variables["STATION_PARAMETERS"][iprof]
     if isinstance(param_mat, np.ma.MaskedArray):
         param_mat = param_mat.filled(b" ")
-        
+
     param_names = []
     n_param = ds.dimensions["N_PARAM"].size
     for j in range(n_param):
@@ -404,6 +574,7 @@ def get_profile_for_parameter(ds, param_base):
                 return iprof
     return None
 
+
 def get_pres_and_qc_for_profile(ds, iprof):
     """
     Retrieves PRES strictly for `iprof`.
@@ -424,7 +595,7 @@ def get_pres_and_qc_for_profile(ds, iprof):
         arr = v[iprof, :] if v.ndim > 1 else v[:]
         p_raw = arr.filled(np.nan) if hasattr(arr, "filled") else np.array(arr, dtype="float32")
         # Ensure NetCDF fill values are converted to NaN
-        mask = (p_raw == MISSING_VAL) | (p_raw == 99999.0) | np.isinf(p_raw)
+        mask = (p_raw == MISSING_VAL) | (p_raw == 99999.0) | (p_raw == -99999.0) | (p_raw == -999.0) | np.isinf(p_raw)
         p_raw[mask] = np.nan
         pres_vals = np.float32(p_raw)
 
@@ -437,6 +608,7 @@ def get_pres_and_qc_for_profile(ds, iprof):
         pres_qcs = np.array(q_slice).astype("|S1")
 
     return pres_vals, pres_qcs
+
 
 def match_csv_row_by_pres(cycle_df, nc_pres):
     """
@@ -463,6 +635,7 @@ def match_csv_row_by_pres(cycle_df, nc_pres):
     if diffs[min_idx] <= tol:
         return cycle_df.iloc[min_idx]
     return None
+
 
 def sanitize_qc_char(val, default="1"):
     if pd.isna(val) or val is None or val == "":
@@ -567,12 +740,13 @@ def write_scientific_calib_chla(bgc_file, WMOfloatid, idx_profile, df_bio):
                 bgc_file.variables["SCIENTIFIC_CALIB_COEFFICIENT"][iprof_idx, 0, j, :] = SciCalCoeArray_BBP
                 bgc_file.variables["SCIENTIFIC_CALIB_DATE"][iprof_idx, 0, j, :] = SciCalDateArray
 
-#def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx=0):
+
 def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio):
     cycle_df = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
     if cycle_df.empty:
         return
 
+    n_levels = bgc_file.dimensions["N_LEVELS"].size
     is_broken = is_broken_sensor_float(WMOfloatid, idx_profile)
     fluo_csv_col = next((c for c in ["CHLA_FLUORESCENCE_ADJUSTED", "FLUORESCENCE_CHLA_ADJUSTED", "CHLA_FLUORESCENCE", "FLUORESCENCE_CHLA"] if c in df_bio.columns), None)
     fluo_qc_csv_col = next((c for c in ["CHLA_FLUORESCENCE_ADJUSTED_QC", "FLUORESCENCE_CHLA_ADJUSTED_QC", "CHLA_FLUORESCENCE_QC", "FLUORESCENCE_CHLA_QC"] if c in df_bio.columns), None)
@@ -582,19 +756,23 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio):
         mode = get_param_data_mode(bgc_file, prof_chla, "CHLA")
         if mode in ["D", "A"]:
             nc_pres_all, _ = get_pres_and_qc_for_profile(bgc_file, prof_chla)
-            # Find the last valid level where PRES actually exists
-            valid_p_idx = np.where(~np.isnan(nc_pres_all) & (nc_pres_all != MISSING_VAL) & (nc_pres_all != 99999.0))[0]
-            max_k = valid_p_idx[-1] if len(valid_p_idx) > 0 else -1
+            r_miss_mask = get_r_mode_missing_mask(bgc_file, prof_chla, "CHLA", n_levels)
+            max_k = get_profile_max_level_idx(bgc_file, prof_chla, "CHLA")
 
             if max_k >= 0:
                 CHLA_Adjusted_Array = np.array(bgc_file.variables["CHLA_ADJUSTED"][prof_chla, :], copy=True) if "CHLA_ADJUSTED" in bgc_file.variables else None
                 CHLA_AdjustedQC_Array = np.array(bgc_file.variables["CHLA_ADJUSTED_QC"][prof_chla, :], copy=True) if "CHLA_ADJUSTED_QC" in bgc_file.variables else None
                 CHLA_Adjusted_ERROR_Array = np.array(bgc_file.variables["CHLA_ADJUSTED_ERROR"][prof_chla, :], copy=True) if "CHLA_ADJUSTED_ERROR" in bgc_file.variables else None
 
-                # ONLY iterate up to max_k
                 for i in range(max_k + 1):
                     nc_pres = nc_pres_all[i]
-                    if is_missing_value(nc_pres) or np.isnan(nc_pres):
+                    if is_missing_value(nc_pres) or np.isnan(nc_pres) or r_miss_mask[i]:
+                        if CHLA_Adjusted_Array is not None:
+                            CHLA_Adjusted_Array[i] = np.float32(MISSING_VAL)
+                        if CHLA_AdjustedQC_Array is not None:
+                            CHLA_AdjustedQC_Array[i] = b"9"
+                        if CHLA_Adjusted_ERROR_Array is not None:
+                            CHLA_Adjusted_ERROR_Array[i] = np.float32(MISSING_VAL)
                         continue
 
                     matched_row = match_csv_row_by_pres(cycle_df, nc_pres)
@@ -603,8 +781,15 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio):
 
                     if "CHLA_FINAL" in matched_row and pd.notna(matched_row.get("CHLA_FINAL")):
                         chla_val = matched_row.get("CHLA_FINAL")
-                        if not is_missing_value(chla_val):
-                            csv_qc = "4" if is_broken else sanitize_qc_char(matched_row.get("CHLA_FINAL_QC"), default="1")
+                        csv_qc = "4" if is_broken else sanitize_qc_char(matched_row.get("CHLA_FINAL_QC"), default="1")
+                        if is_missing_value(chla_val) or csv_qc in ["4", "9"]:
+                            if CHLA_Adjusted_Array is not None:
+                                CHLA_Adjusted_Array[i] = np.float32(MISSING_VAL)
+                            if CHLA_AdjustedQC_Array is not None:
+                                CHLA_AdjustedQC_Array[i] = (csv_qc if csv_qc in ["4", "9"] else "9").encode("utf-8")
+                            if CHLA_Adjusted_ERROR_Array is not None:
+                                CHLA_Adjusted_ERROR_Array[i] = np.float32(MISSING_VAL)
+                        else:
                             if CHLA_Adjusted_Array is not None:
                                 CHLA_Adjusted_Array[i] = np.float32(chla_val)
                             if CHLA_AdjustedQC_Array is not None:
@@ -615,18 +800,22 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio):
                 if CHLA_Adjusted_Array is not None:
                     bgc_file.variables["CHLA_ADJUSTED"][prof_chla, :] = CHLA_Adjusted_Array
                 if CHLA_AdjustedQC_Array is not None:
-                    bgc_file.variables["CHLA_ADJUSTED_QC"][prof_chla, :] = CHLA_AdjustedQC_Array
+                    qc_str = "".join([
+                        (c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c))[:1] or " "
+                        for c in CHLA_AdjustedQC_Array
+                    ])
+                    write_nc_char_1d(bgc_file.variables["CHLA_ADJUSTED_QC"], prof_chla, qc_str)
                 if CHLA_Adjusted_ERROR_Array is not None:
                     bgc_file.variables["CHLA_ADJUSTED_ERROR"][prof_chla, :] = CHLA_Adjusted_ERROR_Array
 
-    # Same pattern for FLUORESCENCE_CHLA
+    # Same pattern for FLUORESCENCE_CHLA / CHLA_FLUORESCENCE
     prof_fluo = get_profile_for_parameter(bgc_file, "CHLA_FLUORESCENCE")
     if prof_fluo is not None and fluo_csv_col is not None:
         mode = get_param_data_mode(bgc_file, prof_fluo, "CHLA_FLUORESCENCE")
         if mode in ["D", "A"]:
             nc_pres_all, _ = get_pres_and_qc_for_profile(bgc_file, prof_fluo)
-            valid_p_idx = np.where(~np.isnan(nc_pres_all) & (nc_pres_all != MISSING_VAL) & (nc_pres_all != 99999.0))[0]
-            max_k = valid_p_idx[-1] if len(valid_p_idx) > 0 else -1
+            r_miss_mask = get_r_mode_missing_mask(bgc_file, prof_fluo, "CHLA_FLUORESCENCE", n_levels)
+            max_k = get_profile_max_level_idx(bgc_file, prof_fluo, "CHLA_FLUORESCENCE")
 
             if max_k >= 0:
                 for var_prefix in ["FLUORESCENCE_CHLA", "CHLA_FLUORESCENCE"]:
@@ -641,30 +830,45 @@ def write_chla_BBP_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio):
 
                         for i in range(max_k + 1):
                             nc_pres = nc_pres_all[i]
-                            if is_missing_value(nc_pres) or np.isnan(nc_pres):
+                            if is_missing_value(nc_pres) or np.isnan(nc_pres) or r_miss_mask[i]:
+                                fluo_adj[i] = np.float32(MISSING_VAL)
+                                if fluo_qc is not None:
+                                    fluo_qc[i] = b"9"
+                                if fluo_err is not None:
+                                    fluo_err[i] = np.float32(MISSING_VAL)
                                 continue
+
                             matched_row = match_csv_row_by_pres(cycle_df, nc_pres)
                             if matched_row is None:
                                 continue
 
                             val = matched_row.get(fluo_csv_col)
-                            if pd.notna(val) and not is_missing_value(val):
+                            if pd.notna(val):
                                 q = "4" if is_broken else sanitize_qc_char(matched_row.get(fluo_qc_csv_col), default="1")
-                                fluo_adj[i] = np.float32(val)
-                                if fluo_qc is not None:
-                                    fluo_qc[i] = q.encode("utf-8")
-                                if fluo_err is not None:
-                                    fluo_err[i] = np.float32(CHLA_Adjusted_ERROR_est)
+                                if is_missing_value(val) or q in ["4", "9"]:
+                                    fluo_adj[i] = np.float32(MISSING_VAL)
+                                    if fluo_qc is not None:
+                                        fluo_qc[i] = (q if q in ["4", "9"] else "9").encode("utf-8")
+                                    if fluo_err is not None:
+                                        fluo_err[i] = np.float32(MISSING_VAL)
+                                else:
+                                    fluo_adj[i] = np.float32(val)
+                                    if fluo_qc is not None:
+                                        fluo_qc[i] = q.encode("utf-8")
+                                    if fluo_err is not None:
+                                        fluo_err[i] = np.float32(CHLA_Adjusted_ERROR_est)
 
                         bgc_file.variables[adj_var][prof_fluo, :] = fluo_adj
                         if fluo_qc is not None:
-                            bgc_file.variables[adj_qc_var][prof_fluo, :] = fluo_qc
+                            qc_str = "".join([
+                                (c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c))[:1] or " "
+                                for c in fluo_qc
+                            ])
+                            write_nc_char_1d(bgc_file.variables[adj_qc_var], prof_fluo, qc_str)
                         if fluo_err is not None:
                             bgc_file.variables[adj_err_var][prof_fluo, :] = fluo_err
 
 
-
-#def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio, iprof_idx=0):
 def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio):
     prof_bbp = get_profile_for_parameter(bgc_file, "BBP700")
     if prof_bbp is None or "BBP700_ADJUSTED" not in bgc_file.variables:
@@ -681,8 +885,8 @@ def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio):
     n_levels = bgc_file.dimensions["N_LEVELS"].size
     is_broken = is_broken_sensor_float(WMOfloatid, idx_profile)
     nc_pres_all, _ = get_pres_and_qc_for_profile(bgc_file, prof_bbp)
-    valid_p_idx = np.where(~np.isnan(nc_pres_all) & (nc_pres_all != MISSING_VAL) & (nc_pres_all != 99999.0))[0]
-    max_k = valid_p_idx[-1] if len(valid_p_idx) > 0 else -1
+    r_miss_mask = get_r_mode_missing_mask(bgc_file, prof_bbp, "BBP700", n_levels)
+    max_k = get_profile_max_level_idx(bgc_file, prof_bbp, "BBP700")
 
     if max_k < 0:
         return
@@ -691,9 +895,14 @@ def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio):
     bbp_qc = np.array(bgc_file.variables["BBP700_ADJUSTED_QC"][prof_bbp, :], copy=True) if "BBP700_ADJUSTED_QC" in bgc_file.variables else None
     bbp_err = np.array(bgc_file.variables["BBP700_ADJUSTED_ERROR"][prof_bbp, :], copy=True) if "BBP700_ADJUSTED_ERROR" in bgc_file.variables else None
 
-    for i in range(n_levels):
+    for i in range(max_k + 1):
         nc_pres = nc_pres_all[i]
-        if is_missing_value(nc_pres):
+        if is_missing_value(nc_pres) or r_miss_mask[i]:
+            bbp_adj[i] = np.float32(MISSING_VAL)
+            if bbp_qc is not None:
+                bbp_qc[i] = b"9"
+            if bbp_err is not None:
+                bbp_err[i] = np.float32(MISSING_VAL)
             continue
 
         matched_row = match_csv_row_by_pres(cycle_df, nc_pres)
@@ -702,8 +911,14 @@ def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio):
 
         if "BBP700_FINAL" in matched_row and pd.notna(matched_row.get("BBP700_FINAL")):
             val = matched_row.get("BBP700_FINAL")
-            if not is_missing_value(val):
-                q = "4" if is_broken else sanitize_qc_char(matched_row.get("BBP700_FINAL_QC"), default="1")
+            q = "4" if is_broken else sanitize_qc_char(matched_row.get("BBP700_FINAL_QC"), default="1")
+            if is_missing_value(val) or q in ["4", "9"]:
+                bbp_adj[i] = np.float32(MISSING_VAL)
+                if bbp_qc is not None:
+                    bbp_qc[i] = (q if q in ["4", "9"] else "9").encode("utf-8")
+                if bbp_err is not None:
+                    bbp_err[i] = np.float32(MISSING_VAL)
+            else:
                 bbp_adj[i] = np.float32(val)
                 if bbp_qc is not None:
                     bbp_qc[i] = q.encode("utf-8")
@@ -712,11 +927,15 @@ def write_BBP700_adjusted(bgc_file, WMOfloatid, idx_profile, df_bio):
 
     bgc_file.variables["BBP700_ADJUSTED"][prof_bbp, :] = bbp_adj
     if bbp_qc is not None:
-        bgc_file.variables["BBP700_ADJUSTED_QC"][prof_bbp, :] = bbp_qc
+        qc_str = "".join([
+            (c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c))[:1] or " "
+            for c in bbp_qc
+        ])
+        write_nc_char_1d(bgc_file.variables["BBP700_ADJUSTED_QC"], prof_bbp, qc_str)
     if bbp_err is not None:
         bgc_file.variables["BBP700_ADJUSTED_ERROR"][prof_bbp, :] = bbp_err
 
-#def write_DOXY_slope_drift(ds, profile_idx, float_df, target_cycle, WMOfloatid=None):
+
 def write_DOXY_slope_drift(ds, float_df, target_cycle, WMOfloatid=None):
     if WMOfloatid in DOXY_EXCLUDE_FLOAT_IDS:
         return
@@ -766,6 +985,7 @@ def write_DOXY_slope_drift(ds, float_df, target_cycle, WMOfloatid=None):
             if "SCIENTIFIC_CALIB_DATE" in ds.variables:
                 ds.variables["SCIENTIFIC_CALIB_DATE"][prof_doxy, 0, j, :] = char_date
 
+
 def write_DOXY_from_csv(ds, float_df, target_cycle, WMOfloatid=None):
     if WMOfloatid in DOXY_EXCLUDE_FLOAT_IDS:
         return
@@ -784,8 +1004,8 @@ def write_DOXY_from_csv(ds, float_df, target_cycle, WMOfloatid=None):
 
     n_levels = ds.dimensions["N_LEVELS"].size
     nc_pres_all, _ = get_pres_and_qc_for_profile(ds, prof_doxy)
-    valid_p_idx = np.where(~np.isnan(nc_pres_all) & (nc_pres_all != MISSING_VAL) & (nc_pres_all != 99999.0))[0]
-    max_k = valid_p_idx[-1] if len(valid_p_idx) > 0 else -1
+    r_miss_mask = get_r_mode_missing_mask(ds, prof_doxy, "DOXY", n_levels)
+    max_k = get_profile_max_level_idx(ds, prof_doxy, "DOXY")
 
     if max_k < 0:
         return
@@ -794,9 +1014,15 @@ def write_DOXY_from_csv(ds, float_df, target_cycle, WMOfloatid=None):
     doxy_qc = np.array(ds.variables["DOXY_ADJUSTED_QC"][prof_doxy, :], copy=True) if "DOXY_ADJUSTED_QC" in ds.variables else None
     doxy_err = np.array(ds.variables["DOXY_ADJUSTED_ERROR"][prof_doxy, :], copy=True) if "DOXY_ADJUSTED_ERROR" in ds.variables else None
 
-    for i in range(n_levels):
+    for i in range(max_k + 1):
         nc_pres = nc_pres_all[i]
-        if is_missing_value(nc_pres):
+        if is_missing_value(nc_pres) or r_miss_mask[i]:
+            if doxy_adj is not None:
+                doxy_adj[i] = np.float32(MISSING_VAL)
+            if doxy_qc is not None:
+                doxy_qc[i] = b"9"
+            if doxy_err is not None:
+                doxy_err[i] = np.float32(MISSING_VAL)
             continue
 
         matched_row = match_csv_row_by_pres(cycle_df, nc_pres)
@@ -805,8 +1031,15 @@ def write_DOXY_from_csv(ds, float_df, target_cycle, WMOfloatid=None):
 
         if "DOXY_FINAL" in matched_row and pd.notna(matched_row.get("DOXY_FINAL")):
             val = matched_row.get("DOXY_FINAL")
-            if not is_missing_value(val):
-                q = sanitize_qc_char(matched_row.get("DOXY_FINAL_QC"), default="1")
+            q = sanitize_qc_char(matched_row.get("DOXY_FINAL_QC"), default="1")
+            if is_missing_value(val) or q in ["4", "9"]:
+                if doxy_adj is not None:
+                    doxy_adj[i] = np.float32(MISSING_VAL)
+                if doxy_qc is not None:
+                    doxy_qc[i] = (q if q in ["4", "9"] else "9").encode("utf-8")
+                if doxy_err is not None:
+                    doxy_err[i] = np.float32(MISSING_VAL)
+            else:
                 if doxy_adj is not None:
                     doxy_adj[i] = np.float32(val)
                 if doxy_qc is not None:
@@ -818,9 +1051,14 @@ def write_DOXY_from_csv(ds, float_df, target_cycle, WMOfloatid=None):
     if doxy_adj is not None:
         ds.variables["DOXY_ADJUSTED"][prof_doxy, :] = doxy_adj
     if doxy_qc is not None:
-        ds.variables["DOXY_ADJUSTED_QC"][prof_doxy, :] = doxy_qc
+        qc_str = "".join([
+            (c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c))[:1] or " "
+            for c in doxy_qc
+        ])
+        write_nc_char_1d(ds.variables["DOXY_ADJUSTED_QC"], prof_doxy, qc_str)
     if doxy_err is not None:
         ds.variables["DOXY_ADJUSTED_ERROR"][prof_doxy, :] = doxy_err
+
 
 def update_profile_qc_grades(bgc_file, WMOfloatid=None):
     n_prof = bgc_file.dimensions["N_PROF"].size
@@ -858,13 +1096,13 @@ def update_profile_qc_grades(bgc_file, WMOfloatid=None):
                 target_qc_var[target_prof, :] if target_qc_var.ndim > 1 else target_qc_var[:]
             )
             prof_grade = get_profile_qc_grade(target_qc_array, parameter_present=param_is_present)
-            grade_bytes = prof_grade.encode("utf-8")
+            grade_char = nc.stringtochar(np.array(prof_grade, dtype="S1"))
 
             for iprof in range(n_prof):
                 if bgc_file.variables[var_name].ndim == 1:
-                    bgc_file.variables[var_name][iprof] = grade_bytes
+                    bgc_file.variables[var_name][iprof] = grade_char if bgc_file.variables[var_name].dtype.kind == "S" else prof_grade
                 elif bgc_file.variables[var_name].ndim == 2:
-                    bgc_file.variables[var_name][iprof, 0] = grade_bytes
+                    bgc_file.variables[var_name][iprof, 0] = grade_char if bgc_file.variables[var_name].dtype.kind == "S" else prof_grade
 
 
 def add_missing_valid_range_attributes(bgc_file):
@@ -888,24 +1126,40 @@ def remove_forbidden_attributes(bgc_file):
 
 def standardize_missing_data_and_qc(ds):
     """
-    Standardizes data ONLY within the active sampling range defined by PRES,
-    and ONLY for parameters whose PARAMETER_DATA_MODE is 'A' or 'D'.
-    - If a parameter is in 'R' mode: its _ADJUSTED, _ADJUSTED_QC, and _ADJUSTED_ERROR
-      arrays are completely skipped and left untouched as default NetCDF fill.
+    Standardizes data and QC flags for all _ADJUSTED variables using nc.stringtochar
+    for NC_CHAR variables:
+    - Syncs DATA_MODE[iprof] with PARAMETER_DATA_MODE[iprof, :].
+    - If DATA_MODE[iprof] is 'R' OR PARAMETER_DATA_MODE for (iprof, base_param) is NOT
+      'D' or 'A': forces <PARAM>_ADJUSTED and <PARAM>_ADJUSTED_ERROR to _FillValue
+      (99999.0), and <PARAM>_ADJUSTED_QC to blank (' ') across ALL N_LEVELS.
+    - If PARAMETER_DATA_MODE for (iprof, base_param) IS 'D' or 'A':
+      - k <= max_k (within profile nlev): missing/blank -> '9' and 99999.0; QC '4'/'9' -> 99999.0
+      - k >  max_k (beyond profile nlev): padding -> ' ' and 99999.0
     - RAW variables (PRES, DOXY, CHLA, BBP700, etc.) and their _QC flags are NEVER modified.
     """
-    n_prof = ds.dimensions["N_PROF"].size
-    prof_param_map = {iprof: get_station_parameters_for_profile(ds, iprof) for iprof in range(n_prof)}
+    ds.set_auto_mask(False)
+    sync_data_mode_from_parameter_data_mode(ds)
 
-    # Determine the exact last valid PRES index for each nprof
-    prof_max_pres_idx = {}
+    n_prof = ds.dimensions["N_PROF"].size
+    n_levels = ds.dimensions["N_LEVELS"].size
+
+    # Precompute valid PRES masks per iprof
     prof_pres_valid = {}
     for iprof in range(n_prof):
         pres_vals, _ = get_pres_and_qc_for_profile(ds, iprof)
-        valid_mask = (~np.isnan(pres_vals)) & (pres_vals != -99999.0) & (pres_vals != 99999.0)
-        valid_indices = np.where(valid_mask)[0]
-        prof_max_pres_idx[iprof] = valid_indices[-1] if len(valid_indices) > 0 else -1
-        prof_pres_valid[iprof] = valid_mask
+        prof_pres_valid[iprof] = (
+            (~np.isnan(pres_vals))
+            & (pres_vals != MISSING_VAL)
+            & (pres_vals != -99999.0)
+            & (pres_vals != 99999.0)
+            & (pres_vals != -999.0)
+        )
+
+    # Precompute R-mode missing masks per (iprof, base_param)
+    r_mode_missing_cache = {}
+    for iprof in range(n_prof):
+        for p in TARGET_R_TO_D_SYNC_PARAMS:
+            r_mode_missing_cache[(iprof, p)] = get_r_mode_missing_mask(ds, iprof, p, n_levels)
 
     for v_name in ds.variables.keys():
         # Strictly only operate on _ADJUSTED variables; never touch raw data, raw QC, or metadata
@@ -923,79 +1177,141 @@ def standardize_missing_data_and_qc(ds):
         )
 
         # -------------------------------------------------------------
-        # 1. Level QC flags: ONLY touch _ADJUSTED_QC when mode is 'A' or 'D'
+        # 1. Level QC flags (<PARAM>_ADJUSTED_QC):
+        #    - DATA_MODE == 'R' OR Parameter mode not in ('D', 'A'): ALL levels -> ' '
+        #    - Parameter mode 'D'/'A':
+        #      - k <= max_k (within nlev): missing/blank -> '9'
+        #      - k >  max_k (deeper than nlev): padding -> ' '
         # -------------------------------------------------------------
         if v_name.endswith("_ADJUSTED_QC"):
             for iprof in range(var.shape[0]):
-                if base_param not in prof_param_map[iprof] and not any(p.startswith(base_param) for p in prof_param_map[iprof]):
-                    continue
-
-                # If parameter is in 'R' mode (or unassigned), do NOT populate _ADJUSTED_QC
                 mode = get_param_data_mode(ds, iprof, base_param)
-                if mode not in ["D", "A"]:
+                prof_dm = ""
+                if "DATA_MODE" in ds.variables:
+                    dm_raw = ds.variables["DATA_MODE"][iprof]
+                    prof_dm = (
+                        dm_raw.decode("utf-8", errors="ignore").strip()
+                        if isinstance(dm_raw, (bytes, np.bytes_))
+                        else str(dm_raw).strip()
+                    )
+
+                # If DATA_MODE[iprof] is 'R' OR parameter mode is not 'D'/'A', ALL levels MUST be blank (' ')
+                if prof_dm == "R" or mode not in ["D", "A"]:
+                    write_nc_char_1d(var, iprof, " " * var.shape[1])
                     continue
 
-                max_k = prof_max_pres_idx[iprof]
-                if max_k < 0:
-                    continue
-
+                q_slice = np.array(var[iprof, :], copy=True)
+                max_k = get_profile_max_level_idx(ds, iprof, base_param)
                 pres_mask = prof_pres_valid[iprof]
-                arr = var[iprof, :]
-                if hasattr(arr, "filled"):
-                    arr = arr.filled(b" ")
+                r_miss = r_mode_missing_cache.get((iprof, base_param))
 
-                # Standardize ONLY within the active PRES range
-                for k in range(max_k + 1):
-                    if pres_mask[k]:
-                        c = arr[k].decode("utf-8", errors="ignore").strip() if isinstance(arr[k], (bytes, np.bytes_)) else str(arr[k]).strip()
-                        if c not in VALID_QC_CHARS or c in ["", " "]:
-                            var[iprof, k] = b"9" if var.dtype.kind == "S" else "9"
+                out_chars = []
+                for k in range(var.shape[1]):
+                    if max_k < 0 or k > max_k:
+                        # Deeper than deepest pressure (nlev) of this nprof -> blank padding
+                        out_chars.append(" ")
+                    elif not pres_mask[k] or (r_miss is not None and r_miss[k]):
+                        # Shallower than or at deepest pressure, but missing -> '9'
+                        out_chars.append("9")
                     else:
-                        var[iprof, k] = b"9" if var.dtype.kind == "S" else "9"
+                        c = (
+                            q_slice[k].decode("utf-8", errors="ignore").strip()
+                            if isinstance(q_slice[k], (bytes, np.bytes_))
+                            else str(q_slice[k]).strip()
+                        )
+                        out_chars.append(c if (c in VALID_QC_CHARS and c != "") else "9")
 
-                # BEYOND max_k: Must remain unmeasured blank padding (' ')
-                for k in range(max_k + 1, var.shape[1]):
-                    var[iprof, k] = b" " if var.dtype.kind == "S" else " "
+                write_nc_char_1d(var, iprof, "".join(out_chars))
             continue
 
         # -------------------------------------------------------------
-        # 2. Numeric Adjusted variables: ONLY _ADJUSTED and _ADJUSTED_ERROR when mode is 'A' or 'D'
+        # 2. Numeric Adjusted variables: _ADJUSTED and _ADJUSTED_ERROR
         # -------------------------------------------------------------
         if var.dtype.kind in ["f", "i"]:
-            fill_val = getattr(var, "_FillValue", 99999.0)
-            
+            raw_fill = getattr(var, "_FillValue", MISSING_VAL)
+            fill_val = float(np.ravel(raw_fill)[0]) if isinstance(raw_fill, (np.ndarray, list)) else float(raw_fill)
+            adj_qc_var_name = f"{base_param}_ADJUSTED_QC"
+            adj_qc_var = ds.variables.get(adj_qc_var_name)
+
             for iprof in range(var.shape[0]):
-                if base_param not in prof_param_map[iprof] and not any(p.startswith(base_param) for p in prof_param_map[iprof]):
-                    continue
-
-                # If parameter is in 'R' mode (or unassigned), do NOT populate _ADJUSTED or _ADJUSTED_ERROR
                 mode = get_param_data_mode(ds, iprof, base_param)
-                if mode not in ["D", "A"]:
+                prof_dm = ""
+                if "DATA_MODE" in ds.variables:
+                    dm_raw = ds.variables["DATA_MODE"][iprof]
+                    prof_dm = (
+                        dm_raw.decode("utf-8", errors="ignore").strip()
+                        if isinstance(dm_raw, (bytes, np.bytes_))
+                        else str(dm_raw).strip()
+                    )
+
+                # If DATA_MODE[iprof] is 'R' OR parameter mode is not 'D'/'A', ALL levels MUST be _FillValue
+                if prof_dm == "R" or mode not in ["D", "A"]:
+                    var[iprof, :] = np.full(var.shape[1], fill_val, dtype=var.dtype)
                     continue
 
-                max_k = prof_max_pres_idx[iprof]
-                if max_k < 0:
-                    continue
-
+                max_k = get_profile_max_level_idx(ds, iprof, base_param)
                 pres_mask = prof_pres_valid[iprof]
-                arr = var[iprof, :]
-                data_slice = arr.filled(np.nan) if hasattr(arr, "filled") else np.array(arr, dtype="float32", copy=True)
+                r_miss = r_mode_missing_cache.get((iprof, base_param))
+                data_slice = np.array(var[iprof, :], dtype=var.dtype, copy=True)
+                qc_slice = np.array(adj_qc_var[iprof, :], copy=True) if adj_qc_var is not None else None
+                qc_modified = False
 
-                # Standardize ONLY within the active PRES range
-                for k in range(max_k + 1):
-                    if pres_mask[k]:
-                        val = data_slice[k]
-                        if np.isnan(val) or np.isinf(val) or val == -99999.0 or val == 99999.0:
-                            data_slice[k] = np.float32(MISSING_VAL)
+                for k in range(len(data_slice)):
+                    qc_char = ""
+                    if qc_slice is not None and k < len(qc_slice):
+                        qc_char = (
+                            qc_slice[k].decode("utf-8", errors="ignore").strip()
+                            if isinstance(qc_slice[k], (bytes, np.bytes_))
+                            else str(qc_slice[k]).strip()
+                        )
+
+                    # Argo rule: QC = '4' (bad) or '9' (missing) MUST have _FillValue in _ADJUSTED & _ADJUSTED_ERROR
+                    if (
+                        max_k < 0
+                        or k > max_k
+                        or not pres_mask[k]
+                        or (r_miss is not None and r_miss[k])
+                        or qc_char in ["4", "9", ""]
+                    ):
+                        data_slice[k] = fill_val
                     else:
-                        data_slice[k] = np.float32(MISSING_VAL)
-
-                # BEYOND max_k: Must remain default unmeasured NetCDF fill (99999.0)
-                for k in range(max_k + 1, var.shape[1]):
-                    data_slice[k] = np.float32(fill_val)
+                        val = float(data_slice[k])
+                        if np.isnan(val) or np.isinf(val) or val == -99999.0 or val == 99999.0 or val == -999.0:
+                            data_slice[k] = fill_val
+                            if qc_slice is not None and k <= max_k and qc_char not in ["4", "9"]:
+                                qc_slice[k] = b"9"
+                                qc_modified = True
 
                 var[iprof, :] = data_slice
+                if qc_modified and adj_qc_var is not None:
+                    qc_str = "".join([
+                        (c.decode("utf-8", errors="ignore") if isinstance(c, (bytes, np.bytes_)) else str(c))[:1] or " "
+                        for c in qc_slice
+                    ])
+                    write_nc_char_1d(adj_qc_var, iprof, qc_str)
 
+
+def enforce_r_to_d_fill_in_final_bd_files(final_bd_files, WMOfloatid=None):
+    """
+    Final post-write pass directly on the finalized BD*.nc files in final_out_dir.
+    Ensures DATA_MODE[iprof] matches PARAMETER_DATA_MODE[iprof, :], wipes all
+    _ADJUSTED* variables to FillValue when DATA_MODE or PARAMETER_DATA_MODE is 'R',
+    and enforces '9' inside nlev / ' ' past nlev when PARAMETER_DATA_MODE is 'D' or 'A'.
+    """
+    for fpath in final_bd_files:
+        try:
+            ds = nc.Dataset(fpath, "r+")
+            ds.set_auto_mask(False)
+
+            standardize_missing_data_and_qc(ds)
+            update_profile_qc_grades(ds, WMOfloatid=WMOfloatid)
+
+            ds.sync()
+            ds.close()
+        except Exception:
+            traceback.print_exc()
+            if "ds" in locals() and ds.isopen():
+                ds.close()
 
 
 def create_working_bd_file(filename, dest_dir=None):
@@ -1098,12 +1414,17 @@ def check_bd_missing_data_mismatches(processed_bd_files, WMOfloatid):
     """
     Audits final BD NetCDF files by PRES level per float and cycle.
     Detects and reports mismatches between:
-      - CHLA and CHLA_ADJUSTED, CHLA_QC and CHLA_ADJUSTED_QC
-      - BBP700 and BBP700_ADJUSTED, BBP700_QC and BBP700_ADJUSTED_QC
-      - DOXY and DOXY_ADJUSTED, DOXY_QC and DOXY_ADJUSTED_QC
+    - CHLA and CHLA_ADJUSTED, CHLA_QC and CHLA_ADJUSTED_QC
+    - CHLA_FLUORESCENCE and CHLA_FLUORESCENCE_ADJUSTED, CHLA_FLUORESCENCE_QC and CHLA_FLUORESCENCE_ADJUSTED_QC
+    - BBP700 and BBP700_ADJUSTED, BBP700_QC and BBP700_ADJUSTED_QC
+    - DOXY and DOXY_ADJUSTED, DOXY_QC and DOXY_ADJUSTED_QC
+    - QC = 4 or 9 where _ADJUSTED is not FillValue
+    - Trailing padding levels (k > max_k) where QC must be blank (' ') rather than '9'
+    - R-mode profiles where _ADJUSTED and _ADJUSTED_QC must be 100% FillValue
     """
     pairs_to_check = [
         ("CHLA", "CHLA_ADJUSTED", "CHLA_QC", "CHLA_ADJUSTED_QC"),
+        ("CHLA_FLUORESCENCE", "CHLA_FLUORESCENCE_ADJUSTED", "CHLA_FLUORESCENCE_QC", "CHLA_FLUORESCENCE_ADJUSTED_QC"),
         ("BBP700", "BBP700_ADJUSTED", "BBP700_QC", "BBP700_ADJUSTED_QC"),
         ("DOXY", "DOXY_ADJUSTED", "DOXY_QC", "DOXY_ADJUSTED_QC"),
     ]
@@ -1124,11 +1445,19 @@ def check_bd_missing_data_mismatches(processed_bd_files, WMOfloatid):
     for fpath in processed_bd_files:
         try:
             ds = nc.Dataset(fpath, "r")
+            ds.set_auto_mask(False)
             cycle_num = int(fpath[-6:-3])
 
             for raw_var, adj_var, raw_qc_var, adj_qc_var in pairs_to_check:
+                # Handle FLUORESCENCE_CHLA naming alias if present
+                if raw_var == "CHLA_FLUORESCENCE" and raw_var not in ds.variables and "FLUORESCENCE_CHLA" in ds.variables:
+                    raw_var = "FLUORESCENCE_CHLA"
+                    adj_var = "FLUORESCENCE_CHLA_ADJUSTED"
+                    raw_qc_var = "FLUORESCENCE_CHLA_QC"
+                    adj_qc_var = "FLUORESCENCE_CHLA_ADJUSTED_QC"
+
                 iprof = detect_parameter_profile(ds, raw_var)
-                pres_vals, _ = get_pres_and_qc_for_profile(ds, iprof)
+                mode = get_param_data_mode(ds, iprof, raw_var)
 
                 def get_slice(v_name):
                     if v_name not in ds.variables:
@@ -1146,29 +1475,97 @@ def check_bd_missing_data_mismatches(processed_bd_files, WMOfloatid):
 
                 if raw_data is None and adj_data is None:
                     continue
-                 
-                # Inside check_bd_missing_data_mismatches:
+
+                pres_vals, _ = get_pres_and_qc_for_profile(ds, iprof)
                 n_levels = len(pres_vals)
+
+                # In R-mode, _ADJUSTED must be FillValue and _ADJUSTED_QC must be blank (' ') everywhere
+                if mode not in ["D", "A"]:
+                    for k in range(n_levels):
+                        a_val = adj_data[k] if adj_data is not None and k < len(adj_data) else MISSING_VAL
+                        a_qc_str = decode_qc(adj_qc_data[k]) if adj_qc_data is not None and k < len(adj_qc_data) else ""
+                        if not is_missing_value(a_val) or a_qc_str != "":
+                            mismatches.append({
+                                "WMO": WMOfloatid,
+                                "CYCLE": cycle_num,
+                                "PRES": float(pres_vals[k]) if not is_missing_value(pres_vals[k]) else np.nan,
+                                "LEVEL_IDX": k,
+                                "COMPARISON_TYPE": "R_MODE_FILL",
+                                "PAIR": f"{adj_var} / {adj_qc_var}",
+                                "RAW_VAL": a_val,
+                                "ADJ_VAL": a_qc_str,
+                                "RAW_IS_MISSING": is_missing_value(a_val),
+                                "ADJ_IS_MISSING": a_qc_str == "",
+                            })
+                    continue
+
+                max_k = get_profile_max_level_idx(ds, iprof, raw_var)
+
                 for k in range(n_levels):
-                    pres = pres_vals[k]
-                    # If this level has no PRES in this profile, it's just padding! Skip it!
-                    if is_missing_value(pres) or np.isnan(pres):
+                    r_qc = raw_qc_data[k] if raw_qc_data is not None and k < len(raw_qc_data) else b" "
+                    a_qc = adj_qc_data[k] if adj_qc_data is not None and k < len(adj_qc_data) else b" "
+                    a_qc_str = decode_qc(a_qc)
+
+                    # Check trailing padding levels beyond nlev (k > max_k): must be blank (' ')
+                    if max_k < 0 or k > max_k:
+                        if a_qc_str != "":
+                            mismatches.append({
+                                "WMO": WMOfloatid,
+                                "CYCLE": cycle_num,
+                                "PRES": np.nan,
+                                "LEVEL_IDX": k,
+                                "COMPARISON_TYPE": "PADDING_QC",
+                                "PAIR": f"{raw_qc_var} vs {adj_qc_var}",
+                                "RAW_VAL": decode_qc(r_qc),
+                                "ADJ_VAL": a_qc_str,
+                                "RAW_IS_MISSING": True,
+                                "ADJ_IS_MISSING": False,
+                            })
                         continue
 
-
+                    # Inside profile depth range (k <= max_k): missing levels must have QC == '9'
+                    pres = pres_vals[k]
+                    if is_missing_value(pres) or np.isnan(pres):
+                        if a_qc_str != "9":
+                            mismatches.append({
+                                "WMO": WMOfloatid,
+                                "CYCLE": cycle_num,
+                                "PRES": np.nan,
+                                "LEVEL_IDX": k,
+                                "COMPARISON_TYPE": "INTERIOR_QC",
+                                "PAIR": f"{raw_qc_var} vs {adj_qc_var}",
+                                "RAW_VAL": decode_qc(r_qc),
+                                "ADJ_VAL": a_qc_str,
+                                "RAW_IS_MISSING": True,
+                                "ADJ_IS_MISSING": False,
+                            })
+                        continue
 
                     r_val = raw_data[k] if raw_data is not None and k < len(raw_data) else MISSING_VAL
                     a_val = adj_data[k] if adj_data is not None and k < len(adj_data) else MISSING_VAL
-                    r_qc = raw_qc_data[k] if raw_qc_data is not None and k < len(raw_qc_data) else b" "
-                    a_qc = adj_qc_data[k] if adj_qc_data is not None and k < len(adj_qc_data) else b" "
 
                     r_val_miss = is_missing_value(r_val)
                     a_val_miss = is_missing_value(a_val)
                     r_qc_miss = is_qc_missing(r_qc)
                     a_qc_miss = is_qc_missing(a_qc)
 
-                    # Check value missingness mismatch
-                    if r_val_miss != a_val_miss:
+                    # Check Argo rule: QC == '4' or '9' must have missing/FillValue in _ADJUSTED
+                    if a_qc_str in ["4", "9"] and not a_val_miss:
+                        mismatches.append({
+                            "WMO": WMOfloatid,
+                            "CYCLE": cycle_num,
+                            "PRES": float(pres),
+                            "LEVEL_IDX": k,
+                            "COMPARISON_TYPE": "QC_4_OR_9_VAL",
+                            "PAIR": f"{adj_var} vs {adj_qc_var}",
+                            "RAW_VAL": a_qc_str,
+                            "ADJ_VAL": a_val,
+                            "RAW_IS_MISSING": True,
+                            "ADJ_IS_MISSING": a_val_miss,
+                        })
+
+                    # Check value missingness mismatch (excluding valid QC '4' bad-flagged levels)
+                    if a_qc_str != "4" and r_val_miss != a_val_miss:
                         mismatches.append({
                             "WMO": WMOfloatid,
                             "CYCLE": cycle_num,
@@ -1192,7 +1589,7 @@ def check_bd_missing_data_mismatches(processed_bd_files, WMOfloatid):
                             "COMPARISON_TYPE": "QC_FLAG",
                             "PAIR": f"{raw_qc_var} vs {adj_qc_var}",
                             "RAW_VAL": decode_qc(r_qc),
-                            "ADJ_VAL": decode_qc(a_qc),
+                            "ADJ_VAL": a_qc_str,
                             "RAW_IS_MISSING": r_qc_miss,
                             "ADJ_IS_MISSING": a_qc_miss,
                         })
@@ -1213,9 +1610,10 @@ def check_bd_missing_data_mismatches(processed_bd_files, WMOfloatid):
         print(f"[{WMOfloatid}] Found {len(df_mismatches)} level-by-level mismatches.\n")
 
         for _, row in df_mismatches.iterrows():
+            pres_str = f"{row['PRES']:7.1f}" if pd.notna(row["PRES"]) else "  FILL "
             print(
-                f"  Float {row['WMO']} | Cycle {row['CYCLE']:03d} | PRES: {row['PRES']:7.1f} dbar (lvl {row['LEVEL_IDX']:03d}) | "
-                f"Type: {row['COMPARISON_TYPE']:<8} | Pair: {row['PAIR']:<28} | "
+                f"  Float {row['WMO']} | Cycle {row['CYCLE']:03d} | PRES: {pres_str} dbar (lvl {row['LEVEL_IDX']:03d}) | "
+                f"Type: {row['COMPARISON_TYPE']:<13} | Pair: {row['PAIR']:<28} | "
                 f"Raw: {str(row['RAW_VAL']):<10} (Miss: {row['RAW_IS_MISSING']}) vs "
                 f"Adj: {str(row['ADJ_VAL']):<10} (Miss: {row['ADJ_IS_MISSING']})"
             )
@@ -1236,11 +1634,10 @@ def check_bd_missing_data_mismatches(processed_bd_files, WMOfloatid):
 # SECTION 3: Plotly DMQC Status Plot Generation
 # ==============================================================================
 
-# Added -99999 as grey to represent missing Data Mode in the summary plot
 data_type_color_map = {
-    "D": "#647ed5", 
-    "A": "#c07ab8", 
-    "R": "#ff4d6d", 
+    "D": "#647ed5",
+    "A": "#c07ab8",
+    "R": "#ff4d6d",
     "99999": "#808080",
     " ": "#808080"
 }
@@ -1267,10 +1664,9 @@ label_qc_color_map = {
     "9 - Missing": "#808080",
 }
 
-# Retained grade letter maps while ensuring missing profile entries show as grey
 param_qc_color_map = {
     "A": "#1b7837", "B": "#a6dba0", "C": "#ffffbf",
-    "D": "#fdae61", "E": "#f46d43", "F": "#d73027", 
+    "D": "#fdae61", "E": "#f46d43", "F": "#d73027",
     "9": "#808080", " ": "#e0e0e0"
 }
 label_param_qc_color_map = {
@@ -1298,8 +1694,7 @@ def add_Data_mode_sp(fig, float_map_inst, std_fig_width=1000):
         y_dataType.append(" ")
         df_sub = float_map_inst["NPROF_NPARAM_df"]
         modes = df_sub[df_sub["N_PROF"] == n_prof]["PARAMETER_DATA_MODE"].tolist()
-        
-        # Rank by best available mode; if none or all missing/unassigned, show -99999 (grey)
+
         valid_modes = [m for m in modes if m in ["R", "A", "D"]]
         best_mode = max(valid_modes, key=lambda x: data_mode_rank_map.get(x, 0)) if valid_modes else "99999"
         color_dataType.append(data_type_color_map.get(best_mode, "#808080"))
@@ -1464,7 +1859,6 @@ def add_param_QC_sp(fig, float_map_inst, PARAM, subplotNum, std_fig_width=1000):
         elif PARAM in ["PH", "PH_IN_SITU_TOTAL"]:
             possible_pdm_keys.extend(["PH_IN_SITU_TOTAL", "PH"])
 
-        # Default to -99999 if mode is missing
         param_data_mode = "-99999"
         for key in possible_pdm_keys:
             if key in float_map_inst["PDM_MAP"] and n_prof in float_map_inst["PDM_MAP"][key]:
@@ -1858,7 +2252,6 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
                 if var_exists:
                     present_params.add(p)
 
-                # Fetch parameter data mode and record -99999 if unassigned/missing
                 mode_val = get_param_data_mode(ds, p_prof, p)
                 pdm_map[p][prof_idx] = mode_val
                 nprof_nparam_records.append({"N_PROF": prof_idx, "PARAMETER_DATA_MODE": mode_val})
@@ -1866,7 +2259,6 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
                 has_data = has_valid_measurements(ds, p, p_prof)
                 grade = " "
 
-                # 1. Read existing PROFILE_<PARAM>_QC letter grade
                 qc_var_names = [f"PROFILE_{p}_QC"]
                 if p == "CHLA_FLUORESCENCE":
                     qc_var_names.append("PROFILE_FLUORESCENCE_CHLA_QC")
@@ -1878,7 +2270,7 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
                         raw_val = ds.variables[qvn][:]
                         if hasattr(raw_val, "filled"):
                             raw_val = raw_val.filled(b" ")
-                        
+
                         target_indices = [p_prof, 0] if p_prof < len(raw_val) else [0]
                         for idx_cand in target_indices:
                             if idx_cand < len(raw_val):
@@ -1892,7 +2284,6 @@ def generate_dmqc_status_plot(WMOfloatid, processed_bd_files, output_dir):
                     if grade != " ":
                         break
 
-                # 2. If not found or blank, dynamically compute from profile array without changing data mode
                 if grade == " ":
                     adj_qc_name = f"{p}_ADJUSTED_QC"
                     raw_qc_name = "PRES_QC" if p == "PRES" else f"{p}_QC"
@@ -1968,7 +2359,7 @@ QC_COLOR_MAP = {
 
 def create_interpolated_grid(df, val_col, grid_nx=100, grid_ny=100):
     clean_df = df.dropna(subset=[val_col, "CYCLE_NUMBER", "PRES"]).copy()
-    clean_df = clean_df[~clean_df[val_col].isin([MISSING_VAL, 99999.0])]
+    clean_df = clean_df[~clean_df[val_col].isin([MISSING_VAL, 99999.0, -999.0])]
 
     if clean_df.empty:
         return None
@@ -2020,6 +2411,7 @@ def generate_section_qc_plot(
         df_plot[var_name].isna()
         | (df_plot[var_name] == MISSING_VAL)
         | (df_plot[var_name] == 99999.0)
+        | (df_plot[var_name] == -999.0)
         | (df_plot["QC_VAL"] == "9")
     )
 
@@ -2027,17 +2419,17 @@ def generate_section_qc_plot(
     df_missing = df_plot[is_missing_mask].copy()
 
     df_valid = df_valid.dropna(subset=[var_name, "PRES", "CYCLE_NUMBER"]).copy()
-    df_valid = df_valid[(df_valid["PRES"] != MISSING_VAL) & (df_valid["PRES"] != 99999.0)]
+    df_valid = df_valid[(df_valid["PRES"] != MISSING_VAL) & (df_valid["PRES"] != 99999.0) & (df_valid["PRES"] != -999.0)]
 
     df_missing = df_missing.dropna(subset=["PRES", "CYCLE_NUMBER"]).copy()
-    df_missing = df_missing[(df_missing["PRES"] != MISSING_VAL) & (df_missing["PRES"] != 99999.0)]
+    df_missing = df_missing[(df_missing["PRES"] != MISSING_VAL) & (df_missing["PRES"] != 99999.0) & (df_missing["PRES"] != -999.0)]
 
     if df_valid.empty and df_missing.empty:
         return
 
     interp_res = create_interpolated_grid(df_valid, var_name) if not df_valid.empty else None
 
-    pres_all = df_plot["PRES"].replace([MISSING_VAL, 99999.0], np.nan)
+    pres_all = df_plot["PRES"].replace([MISSING_VAL, 99999.0, -999.0], np.nan)
     max_pres = np.nanmax(pres_all) if not pres_all.dropna().empty else 2000.0
     if np.isnan(max_pres) or max_pres <= 0:
         max_pres = 2000.0
@@ -2101,7 +2493,7 @@ def generate_section_qc_plot(
     unique_qcs = sorted(df_plot["QC_VAL"].unique(), key=lambda q: int(q) if q.isdigit() else 99)
     for q_flag in unique_qcs:
         sub = df_plot[df_plot["QC_VAL"] == q_flag]
-        sub = sub[(sub["PRES"] != MISSING_VAL) & (sub["PRES"] != 99999.0)]
+        sub = sub[(sub["PRES"] != MISSING_VAL) & (sub["PRES"] != 99999.0) & (sub["PRES"] != -999.0)]
         ax_qc.scatter(
             sub["CYCLE_NUMBER"], sub["PRES"],
             c=QC_COLOR_MAP.get(q_flag, "#000000"),
@@ -2121,12 +2513,12 @@ def generate_section_qc_plot(
         for q in unique_qcs
     ]
     ax_qc.legend(
-        handles=legend_handles, 
-        title="QC Flag", 
-        bbox_to_anchor=(0.0, 1.0), 
-        loc="upper left", 
-        bbox_transform=cax_qc.transAxes, 
-        frameon=True, 
+        handles=legend_handles,
+        title="QC Flag",
+        bbox_to_anchor=(0.0, 1.0),
+        loc="upper left",
+        bbox_transform=cax_qc.transAxes,
+        frameon=True,
         fontsize=9
     )
 
@@ -2148,6 +2540,7 @@ def extract_bd_parameter_dataframe(processed_bd_files, param_name, adj_param_nam
     for fpath in processed_bd_files:
         try:
             ds = nc.Dataset(fpath, "r")
+            ds.set_auto_mask(False)
             cycle_num = int(fpath[-6:-3])
             iprof = detect_parameter_profile(ds, param_name)
 
@@ -2330,13 +2723,13 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
 
         try:
             ds = nc.Dataset(w_bgc_filename, "r+")
+            ds.set_auto_mask(False)
 
             iprof_chla = get_profile_for_parameter(ds, "CHLA")
             iprof_bbp = get_profile_for_parameter(ds, "BBP700")
             iprof_doxy = get_profile_for_parameter(ds, "DOXY")
 
-            # 1. Update PARAMETER_DATA_MODE and DATA_MODE
-            #write_parameter_data_modes(ds, WMOfloatid=WMOfloatid)
+            # 1. Update PARAMETER_DATA_MODE and sync DATA_MODE
             cycle_df = df_bio.loc[df_bio["CYCLE_NUMBER"] == idx_profile]
             write_parameter_data_modes(ds, WMOfloatid=WMOfloatid, cycle_df=cycle_df)
 
@@ -2347,10 +2740,13 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
             write_DOXY_slope_drift(ds, df_bio, idx_profile, WMOfloatid=WMOfloatid)
             write_DOXY_from_csv(ds, df_bio, idx_profile, WMOfloatid=WMOfloatid)
 
-            # 3. Update PROFILE_<PARAM>_QC based on evaluated levels
+            # 3. Propagate R-mode fill values ('9' inside nlev, ' ' past nlev; FillValue if R-mode)
+            standardize_missing_data_and_qc(ds)
+
+            # 4. Update PROFILE_<PARAM>_QC based on evaluated & standardized levels
             update_profile_qc_grades(ds, WMOfloatid=WMOfloatid)
 
-            # 4. Metadata and attributes
+            # 5. Metadata and attributes
             write_history_metadata(ds, iprof_chla if iprof_chla is not None else 0,
                                    iprof_doxy if iprof_doxy is not None else 0,
                                    WMOfloatid=WMOfloatid)
@@ -2367,9 +2763,7 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
                         np.array("2C  ", dtype="S4")
                     )
 
-            # 4.5. Standardize only valid levels in measured profiles
-            standardize_missing_data_and_qc(ds)
-
+            ds.sync()
             ds.close()
             new_bd_files.append(w_bgc_filename)
 
@@ -2392,6 +2786,9 @@ for idx_f, WMOfloatid in enumerate(WMO_FLOAT_IDS, start=1):
         safe_rename(w_file, new_path)
         processed_output_paths.append(new_path)
         final_processed_files.append(new_path)
+
+    # Step 5.2: Enforce R-mode FillValue and D/A-mode ('9' inside nlev, ' ' past nlev) in final BD output
+    enforce_r_to_d_fill_in_final_bd_files(final_processed_files, WMOfloatid=WMOfloatid)
 
     # --------------------------------------------------------------------------
     # Step 5.5: Audit Missing Value / QC Alignment & Save CSV to BDfiller folder
